@@ -86,6 +86,6 @@ IN CONNECTION WITH THE *SOFTWARE* OR THE USE OR OTHER DEALINGS IN THE *SOFTWARE*
 The contents of the file ```utils/loss_utils.py``` are based on publicly available code authored by Evan Su, which falls under the permissive MIT license. 
 
 Title: pytorch-ssim\
-Project code: XXXX\
+Project code: https://github.com/Po-Hsun-Su/pytorch-ssim\
 Copyright Evan Su, 2017\
-License: XXXX (MIT)
+License: https://github.com/Po-Hsun-Su/pytorch-ssim/blob/master/LICENSE.txt (MIT)

@@ -25,7 +25,7 @@ Key features vs the previous version:
   - optionally tries PowerShell Get-Command to resolve "colmap" when PATH lookup fails
 
 Assumptions:
-- Put this file in the *root* of this review package,
+- Put this file in the repository root,
   next to: train.py, render.py, metrics.py, and the helper scripts:
   cfr.py / eval_crop_metrics.py / convert_uavfgs.py / blend_model_strict_endpoints.py / eval_blend_sweep.py
 - Run this script using the same Python environment you use for 3DGS.

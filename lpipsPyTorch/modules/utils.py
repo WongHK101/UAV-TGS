@@ -10,7 +10,7 @@ def normalize_activation(x, eps=1e-10):
 
 def get_state_dict(net_type: str = 'alex', version: str = '0.1'):
     # build url
-    url = 'XXXX' \
+    url = 'https://raw.githubusercontent.com/richzhang/PerceptualSimilarity/' \
         + f'master/lpips/weights/v{version}/{net_type}.pth'
 
     # download

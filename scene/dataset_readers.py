@@ -1,6 +1,6 @@
 #
 # Copyright (C) 2023, Inria
-# GRAPHDECO research group, XXXX
+# GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
 # This software is free for non-commercial, research and evaluation use 
@@ -142,7 +142,18 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
+def _read_camera_name_list(list_path, scene_path):
+    if not list_path:
+        return None
+    resolved = list_path if os.path.isabs(list_path) else os.path.join(scene_path, list_path)
+    with open(resolved, "r", encoding="utf-8-sig") as file:
+        names = [line.strip() for line in file if line.strip()]
+    if not names:
+        raise ValueError(f"Camera list is empty: {resolved}")
+    return names
+
+
+def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8, train_list="", test_list=""):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -176,7 +187,23 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
             print(f"An unexpected error occurred when trying to open depth_params.json file: {e}")
             sys.exit(1)
 
-    if eval:
+    explicit_train_names = _read_camera_name_list(train_list, path)
+    explicit_test_names = _read_camera_name_list(test_list, path)
+    known_camera_names = {cam.name for cam in cam_extrinsics.values()}
+    for label, names in (("train", explicit_train_names), ("test", explicit_test_names)):
+        if names is None:
+            continue
+        unknown = sorted(set(names) - known_camera_names)
+        if unknown:
+            raise ValueError(f"Unknown camera names in {label} list: {unknown[:8]}")
+    if explicit_train_names is not None and explicit_test_names is not None:
+        overlap = sorted(set(explicit_train_names) & set(explicit_test_names))
+        if overlap:
+            raise ValueError(f"Train/test camera lists overlap: {overlap[:8]}")
+
+    if explicit_test_names is not None:
+        test_cam_names_list = explicit_test_names
+    elif eval:
         if "360" in path:
             llffhold = 8
         if llffhold:
@@ -197,8 +224,14 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
         depths_folder=os.path.join(path, depths) if depths != "" else "", test_cam_names_list=test_cam_names_list)
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
-    train_cam_infos = [c for c in cam_infos if train_test_exp or not c.is_test]
+    if explicit_train_names is not None:
+        train_name_set = set(explicit_train_names)
+        train_cam_infos = [c for c in cam_infos if c.image_name in train_name_set]
+    else:
+        train_cam_infos = [c for c in cam_infos if train_test_exp or not c.is_test]
     test_cam_infos = [c for c in cam_infos if c.is_test]
+    if not train_cam_infos:
+        raise ValueError("No training cameras remain after applying the requested split")
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 

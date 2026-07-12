@@ -1,6 +1,6 @@
 #
 # Copyright (C) 2023, Inria
-# GRAPHDECO research group, XXXX
+# GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
 # This software is free for non-commercial, research and evaluation use 
@@ -41,7 +41,15 @@ class Scene:
         self.test_cameras = {}
 
         if os.path.exists(os.path.join(args.source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.depths, args.eval, args.train_test_exp)
+            scene_info = sceneLoadTypeCallbacks["Colmap"](
+                args.source_path,
+                args.images,
+                args.depths,
+                args.eval,
+                args.train_test_exp,
+                train_list=getattr(args, "train_list", ""),
+                test_list=getattr(args, "test_list", ""),
+            )
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.depths, args.eval)

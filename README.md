@@ -1,6 +1,6 @@
-# UAV-FGS Anonymous Review Code
+# UAV-FGS Research Code
 
-This package contains the anonymous review code for the paper's RGB-T UAV 3D Gaussian Splatting pipeline. It is a minimal, self-contained adaptation of the original 3D Gaussian Splatting codebase, with the additional scripts required for:
+This repository contains the research code for the UAV-FGS RGB-T UAV 3D Gaussian Splatting pipeline. It is a self-contained adaptation of the original 3D Gaussian Splatting codebase, with the additional scripts required for:
 
 - CFR-based raw RGB-T standardization from cross-FoV image pairs
 - RGB-stage 3DGS reconstruction
@@ -8,11 +8,11 @@ This package contains the anonymous review code for the paper's RGB-T UAV 3D Gau
 - controllable RGB-T fusion and sweep evaluation
 - GT-view and auxiliary evaluation used by the paper
 
-This review package intentionally omits non-essential viewer/build artifacts, internal campaign scripts, summary generators, and local experiment records.
+The repository intentionally omits non-essential viewer/build artifacts, generated outputs, and local experiment records.
 
-## Quick Start (Reviewer, Copy-Paste)
+## Quick Start
 
-This repository is derived from the original 3D Gaussian Splatting codebase, and the review-time setup steps and checks needed for reproduction are listed here.
+This repository is derived from the original 3D Gaussian Splatting codebase. The setup steps and checks needed for reproduction are listed here.
 
 ### 1) System prerequisites
 
@@ -97,7 +97,7 @@ python -m pip install --no-build-isolation submodules/diff-gaussian-rasterizatio
 python -m pip install --no-build-isolation submodules/fused-ssim
 ```
 
-Standard non-editable installs are intentional here. They are sufficient for review reproduction and are more robust than editable installs across different `pip` and `setuptools` versions.
+Standard non-editable installs are intentional here. They are sufficient for reproduction and are more robust than editable installs across different `pip` and `setuptools` versions.
 
 ### 4) Sanity checks
 
@@ -227,9 +227,9 @@ The environment spec is:
 - `environment.yml` for Conda + PyTorch/CUDA
 - `requirements.txt` for the remaining Python packages
 
-`requirements.txt` intentionally relies on the default PyPI index so that link-scrubbing on anonymous review platforms does not affect installation.
+`requirements.txt` intentionally relies on the default PyPI index for portable installation.
 
-The package uses `opencv-python-headless` because the review code does not require OpenCV GUI windows. `opencv-python` is also acceptable if preferred locally.
+The repository uses `opencv-python-headless` because the pipeline does not require OpenCV GUI windows. `opencv-python` is also acceptable if preferred locally.
 
 Important note for extension builds:
 
@@ -244,7 +244,7 @@ The full raw-pair pipeline expects:
 - COLMAP on `PATH`, or pass `--colmap <path>`
 - ExifTool on `PATH`, or pass `--exiftool <path>`
 
-`cfr.py` has fallback behavior when ExifTool is unavailable, but the full review pipeline should still be configured with COLMAP and ExifTool available.
+`cfr.py` has fallback behavior when ExifTool is unavailable, but the full pipeline should still be configured with COLMAP and ExifTool available.
 
 ## Data Assumptions
 
@@ -256,7 +256,7 @@ The end-to-end pipeline expects a dataset root of the form:
   thermal/
 ```
 
-The full benchmark and anonymous review access information should be provided separately in the review materials.
+Benchmark data is distributed separately from this source repository.
 
 ## Main Entry Point
 
@@ -266,7 +266,7 @@ The primary entry point used in this project is:
 python run_uavfgs_pipeline.py --data_root <DATA_ROOT> --out_root <OUT_ROOT>
 ```
 
-This orchestrates the review package pipeline in order:
+This orchestrates the pipeline in order:
 
 1. CFR standardization from raw RGB-T pairs
 2. crop/alignment evaluation
@@ -283,9 +283,27 @@ The script is resumable by default and writes per-step state files under:
 <DATA_ROOT>/_pipeline_state/
 ```
 
+## Depth-Reference Geometry Evaluation
+
+The reference-depth geometry consistency and front-intrusion tools are under
+`tools/geometric_repeatability/`. They support explicit train/test camera lists,
+training-side MVS/mesh references, native-camera alignment, per-view metrics,
+plots, visualizations, and result packaging.
+
+```bash
+python tools/geometric_repeatability/sanity_tests.py
+python tools/geometric_repeatability/evaluate_depth_reference.py -h
+python tools/geometric_repeatability/export_gaussian_probe_bundle.py -h
+```
+
+See `tools/geometric_repeatability/README.md` and
+`tools/geometric_repeatability/DEPTH_REFERENCE_PROTOCOL.md` for the protocol and
+full workflow. These metrics measure held-out geometry consistency against a
+training-side reference surface; they are not absolute ground-truth 3D accuracy.
+
 ## Important Defaults
 
-The review package follows the current code defaults, not older README snapshots.
+The repository follows the current code defaults, not older README snapshots.
 
 - `run_metrics_plus=true`
 - `run_novel_view_metrics=false`
@@ -319,6 +337,6 @@ python eval_blend_sweep.py -h
 
 ## Notes on Scope
 
-- This package is prepared for anonymous academic review.
-- It intentionally excludes non-core viewers, build caches, internal analysis scripts, and local result tables.
+- This repository is prepared for academic research and reproducibility.
+- It intentionally excludes non-core viewers, build caches, and local result tables.
 - It preserves third-party license headers and upstream attribution where required by inherited components.

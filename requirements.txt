@@ -2,6 +2,7 @@ numpy==1.26.4
 Pillow==11.1.0
 opencv-python-headless==4.10.0.84
 scipy==1.15.3
+numba==0.64.0
 scikit-image==0.25.2
 matplotlib==3.10.5
 tqdm==4.67.1

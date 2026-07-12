@@ -267,8 +267,8 @@ def _compute_zoom_updates_for_crop(
 
 # --- JPEG XMP packet helpers (v9) ---
 
-_XMP_STD_HEADER = b"XXXX\x00"
-_XMP_EXT_HEADER = b"XXXX\x00"
+_XMP_STD_HEADER = b"http://ns.adobe.com/xap/1.0/\x00"
+_XMP_EXT_HEADER = b"http://ns.adobe.com/xmp/extension/\x00"
 
 def _extract_xmp_packet_from_jpeg(jpeg_path: Path) -> Optional[bytes]:
     """Extract the main XMP packet (RDF/XML) from a JPEG APP1 segment.
@@ -580,7 +580,7 @@ def _write_exif_audit_jsonl(
     Audit focuses on correctness for COLMAP:
     - Orientation normalized (IFD0 + optionally XMP-tiff)
     - Width/Height fields match expected (thermal size)
-    - DigitalZoomRatio / FocalLengthIn35mmFormat present (recorded for review)
+    - DigitalZoomRatio / FocalLengthIn35mmFormat present (recorded for audit)
     """
     try:
         cmd = [

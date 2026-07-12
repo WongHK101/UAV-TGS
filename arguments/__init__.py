@@ -1,6 +1,6 @@
 #
 # Copyright (C) 2023, Inria
-# GRAPHDECO research group, XXXX
+# GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
 # This software is free for non-commercial, research and evaluation use 
@@ -56,6 +56,8 @@ class ModelParams(ParamGroup):
         self.train_test_exp = False
         self.data_device = "cuda"
         self.eval = False
+        self.train_list = ""
+        self.test_list = ""
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -73,6 +75,8 @@ class ModelParams(ParamGroup):
             "train_test_exp": self.train_test_exp,
             "data_device": self.data_device,
             "eval": self.eval,
+            "train_list": self.train_list,
+            "test_list": self.test_list,
         }
         for k, v in defaults.items():
             if not hasattr(g, k):

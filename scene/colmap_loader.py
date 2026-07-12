@@ -1,6 +1,6 @@
 #
 # Copyright (C) 2023, Inria
-# GRAPHDECO research group, XXXX
+# GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
 # This software is free for non-commercial, research and evaluation use 
@@ -157,7 +157,7 @@ def read_points3D_binary(path_to_model_file):
 
 def read_intrinsics_text(path):
     """
-    Taken from XXXX
+    Taken from https://github.com/colmap/colmap/blob/dev/scripts/python/read_write_model.py
     """
     cameras = {}
     with open(path, "r") as fid:
@@ -245,7 +245,7 @@ def read_intrinsics_binary(path_to_model_file):
 
 def read_extrinsics_text(path):
     """
-    Taken from XXXX
+    Taken from https://github.com/colmap/colmap/blob/dev/scripts/python/read_write_model.py
     """
     images = {}
     with open(path, "r") as fid:
@@ -274,7 +274,7 @@ def read_extrinsics_text(path):
 
 def read_colmap_bin_array(path):
     """
-    Taken from XXXX
+    Taken from https://github.com/colmap/colmap/blob/dev/scripts/python/read_dense.py
 
     :param path: path to the colmap binary file.
     :return: nd array with the floating point values in the value
