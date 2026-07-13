@@ -146,7 +146,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print("[WARN] SparseSupport enabled but initialization failed; disabling sparse support.")
     gaussians.training_setup(opt)
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+        # Checkpoints are generated locally by this training pipeline and
+        # contain NumPy/Python objects in addition to tensor weights.  PyTorch
+        # 2.6+ defaults to weights_only=True, which rejects that established
+        # checkpoint format before thermal fine-tuning can start.
+        (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
     if getattr(args, "ss_prune_before_thermal", False) and checkpoint:
         if not getattr(args, "ss_enable", False):
