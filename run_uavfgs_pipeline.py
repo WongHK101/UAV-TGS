@@ -34,6 +34,7 @@ Assumptions:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 import json
 import os
@@ -336,6 +337,31 @@ def list_images(dir_path: Path) -> List[Path]:
     return out
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _flat_image_inventory(dir_path: Path) -> Dict[str, object]:
+    entries = [
+        {
+            "name": path.name,
+            "size_bytes": int(path.stat().st_size),
+            "sha256": _sha256_file(path),
+        }
+        for path in list_images(dir_path)
+    ]
+    encoded = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {
+        "count": len(entries),
+        "entries_sha256": hashlib.sha256(encoded).hexdigest(),
+        "entries": entries,
+    }
+
+
 def _read_colmap_image_names(model_dir: Path) -> List[str]:
     """
     Return image names recorded in COLMAP model (images.bin/txt), or [] on failure.
@@ -422,6 +448,15 @@ def hardlink_or_copy(src: Path, dst: Path, mode: str) -> None:
       - hardlink: os.link when possible (same filesystem); fallback to copy
       - symlink: os.symlink when possible; fallback to copy
     """
+    # Never copy through an old symlink or overwrite an old hardlink in place.
+    # Either case could modify the previous source image rather than the
+    # derived input/ entry.  input/ is owned by this pipeline, so replacing the
+    # directory entry first is both safer and gives every mode the same exact-
+    # mirror semantics.
+    if os.path.lexists(str(dst)):
+        if dst.is_dir() and not dst.is_symlink():
+            raise RuntimeError(f"Refusing to replace a directory as an input image: {dst}")
+        dst.unlink()
     ensure_dir(dst.parent)
     if mode == "copy":
         shutil.copy2(src, dst)
@@ -429,8 +464,6 @@ def hardlink_or_copy(src: Path, dst: Path, mode: str) -> None:
 
     if mode == "hardlink":
         try:
-            if dst.exists():
-                dst.unlink()
             os.link(src, dst)
             return
         except Exception:
@@ -439,8 +472,6 @@ def hardlink_or_copy(src: Path, dst: Path, mode: str) -> None:
 
     if mode == "symlink":
         try:
-            if dst.exists():
-                dst.unlink()
             os.symlink(src, dst)
             return
         except Exception:
@@ -463,10 +494,33 @@ def prepare_input_dir(src_images_dir: Path, dataset_root: Path, clean: bool, lin
     if not src_imgs:
         raise FileNotFoundError(f"No images found under: {src_images_dir}")
 
-    # If input already has images and we're not cleaning, we still (re)sync only when needed.
+    src_names = [fp.name for fp in src_imgs]
+    if len(src_names) != len(set(src_names)):
+        raise RuntimeError(f"Source image basenames are not unique: {src_images_dir}")
+    expected_names = set(src_names)
+    stale_files = 0
+    for existing in list(input_dir.iterdir()):
+        if existing.name in expected_names:
+            continue
+        if existing.is_dir() and not existing.is_symlink():
+            raise RuntimeError(
+                f"Unexpected directory in derived input/: {existing}. Use --clean_input for an explicit reset."
+            )
+        existing.unlink()
+        stale_files += 1
+    if stale_files:
+        eprint(f"[INFO] Removed {stale_files} stale files from COLMAP input/ exact-sync")
+
+    # input/ is a derived, exact mirror: overwrite current names and reject any
+    # stale/unowned directory instead of silently mixing source generations.
     eprint(f"[INFO] Preparing COLMAP input/ from: {src_images_dir}  (count={len(src_imgs)}, mode={link_mode})")
     for fp in src_imgs:
         hardlink_or_copy(fp, input_dir / fp.name, mode=link_mode)
+    actual_names = {fp.name for fp in list_images(input_dir)}
+    if actual_names != expected_names:
+        raise RuntimeError(
+            f"COLMAP input exact-sync failed: expected={len(expected_names)} actual={len(actual_names)}"
+        )
     return input_dir
 
 
@@ -801,6 +855,26 @@ def main() -> None:
 
     ap.add_argument("--colmap", default="colmap", help="COLMAP executable (default: colmap). Can be colmap.exe / colmap.bat / full path.")
     ap.add_argument("--exiftool", default="exiftool", help="ExifTool executable (default: exiftool)")
+    ap.add_argument("--required_colmap_version", default="4.1.0",
+                    help="Required COLMAP version for SfM (default: 4.1.0).")
+    ap.add_argument("--required_colmap_sha256", default="",
+                    help="Optional exact COLMAP executable SHA256 pin (recommended for formal runs).")
+    ap.add_argument("--require_cuda_colmap", dest="require_cuda_colmap", action="store_true",
+                    help="Require CUDA-enabled COLMAP (default: on).")
+    ap.add_argument("--allow_non_cuda_colmap", dest="require_cuda_colmap", action="store_false",
+                    help="Explicitly allow non-CUDA COLMAP (not for formal experiments).")
+    ap.set_defaults(require_cuda_colmap=True)
+    ap.add_argument("--require_global_mapper_cudss", dest="require_global_mapper_cudss", action="store_true",
+                    help="On Linux, require the GlobalMapper runtime to resolve libcudss (default: on).")
+    ap.add_argument("--allow_global_mapper_without_cudss", dest="require_global_mapper_cudss", action="store_false",
+                    help="Allow GlobalMapper without libcudss (not for formal runs).")
+    ap.set_defaults(require_global_mapper_cudss=True)
+    ap.add_argument("--database_policy", choices=["reset", "reuse_verified", "adopt_legacy"], default="reset",
+                    help="COLMAP DB policy (formal default: reset; verified reuse and explicit legacy adoption are opt-in).")
+    ap.add_argument("--expected_legacy_database_sha256", default="",
+                    help="Required pre-adoption database.db SHA256 for --database_policy=adopt_legacy.")
+    ap.add_argument("--allow_replace_unverified_outputs", action="store_true",
+                    help="Explicitly replace existing derived COLMAP outputs without completion-manifest ownership.")
 
     ap.add_argument("--align", default="fit", choices=["auto", "fit", "exif", "ecc", "dual", "raw"],
                     help="Which RGB source to use for COLMAP: aligned candidate or raw RGB (default: fit)")
@@ -906,6 +980,14 @@ def main() -> None:
     ap.add_argument("--camera", default="SIMPLE_RADIAL")
     ap.add_argument("--matching", default="spatial", choices=["spatial", "exhaustive", "sequential", "vocab_tree"])
     ap.add_argument("--matcher_args", default="--SpatialMatching.max_num_neighbors=80 --SpatialMatching.max_distance=500")
+    ap.add_argument("--colmap_gpu_index", type=int, default=0,
+                    help="GPU index for COLMAP extraction, matching, and global SfM (default: 0).")
+    ap.add_argument("--sfm_mapper", default="global", choices=["global", "incremental"],
+                    help="COLMAP SfM mode (default: global; incremental requires explicit opt-in).")
+    ap.add_argument("--global_mapper_args", default="",
+                    help="Additional global_mapper options; locked GPU/seed options are configured separately.")
+    ap.add_argument("--global_mapper_random_seed", type=int, default=0,
+                    help="Deterministic COLMAP GlobalMapper seed (default: 0).")
     ap.add_argument("--mapper_multiple_models", type=int, default=1)
     ap.add_argument("--min_model_size", type=int, default=5)
     ap.add_argument("--init_min_num_inliers", type=int, default=50)
@@ -916,6 +998,8 @@ def main() -> None:
     ap.add_argument("--model_aligner_args", default="--ref_is_gps=1 --alignment_type=enu --alignment_max_error=30.0")
     ap.add_argument("--prior_position_std_m", type=float, default=1.0)
     ap.add_argument("--wgs84_code", type=int, default=0)
+    ap.add_argument("--swap_latlon", action="store_true",
+                    help="Swap latitude/longitude consistently in pose priors and the ENU audit (debug only).")
 
     # Stage 1 training defaults (RGB)
     ap.add_argument("--rgb_iter", type=int, default=30000)
@@ -1988,8 +2072,17 @@ def main() -> None:
         eprint(f"[INFO] Cleaning input dir: {input_dir}")
         shutil.rmtree(input_dir)
 
-    prep_cmd = [py, "-c", f"print('prepare_input: {chosen_tag} -> {input_dir}')"]  # marker cmd (informational)
-    prep_outputs_ok = input_dir.exists() and (len(list_images(input_dir)) > 0)
+    chosen_inventory = _flat_image_inventory(chosen_dir)
+    input_inventory_before = _flat_image_inventory(input_dir) if input_dir.is_dir() else None
+    prep_cmd = [
+        py,
+        "-c",
+        f"print('prepare_input: {chosen_tag} -> {input_dir}')",
+        f"source_inventory_sha256={chosen_inventory['entries_sha256']}",
+        f"source_image_count={chosen_inventory['count']}",
+        f"link_mode={args.link_mode}",
+    ]
+    prep_outputs_ok = input_inventory_before == chosen_inventory
 
     if not _in_step_range(3):
 
@@ -2011,7 +2104,7 @@ def main() -> None:
                 _maybe_raise_file_not_found(str(e))
             finally:
                 _profile_step_end("03_prepare_input", t0, returncode=rc)
-            prep_outputs_ok = input_dir.exists() and (len(list_images(input_dir)) > 0)
+            prep_outputs_ok = input_dir.is_dir() and _flat_image_inventory(input_dir) == chosen_inventory
             if not prep_outputs_ok:
                 _maybe_raise_file_not_found(f"input dir has no images: {input_dir}")
             _record_step("03_prepare_input", "run", prep_cmd, outputs_ok=prep_outputs_ok)
@@ -2020,31 +2113,78 @@ def main() -> None:
     # -------- 4) COLMAP (convert_uavfgs.py)
     sparse_aligned = data_root / "distorted" / "sparse_aligned"
     sparse_fallback = data_root / "sparse" / "0"
-
-    def _pick_sparse_model_for_ud() -> Optional[Path]:
-        """Prefer aligned sparse model; fallback to sparse/0 when model aligner is disabled."""
-        if sparse_aligned.exists() and contains_any_file(sparse_aligned, ("cameras.bin", "cameras.txt"), max_depth=3):
-            return sparse_aligned
-        if sparse_fallback.exists() and contains_any_file(sparse_fallback, ("cameras.bin", "cameras.txt"), max_depth=1):
-            return sparse_fallback
-        return None
+    conversion_manifest = data_root / "distorted" / "conversion_completion_manifest.json"
     convert_cmd = [
         py, "convert_uavfgs.py",
         "-s", str(data_root),
         "--colmap_executable", str(args.colmap),
         "--exiftool_executable", str(args.exiftool),
+        "--required_colmap_version", str(args.required_colmap_version),
+        "--required_colmap_sha256", str(args.required_colmap_sha256),
+        "--database_policy", str(args.database_policy),
+        "--expected_legacy_database_sha256", str(args.expected_legacy_database_sha256),
         "--wgs84_code", str(args.wgs84_code),
         "--prior_position_std_m", str(args.prior_position_std_m),
         "--camera", str(args.camera),
         "--matching", str(args.matching),
         "--matcher_args", str(args.matcher_args),
+        "--colmap_gpu_index", str(args.colmap_gpu_index),
+        "--sfm_mapper", str(args.sfm_mapper),
+        "--global_mapper_args", str(args.global_mapper_args),
+        "--global_mapper_random_seed", str(args.global_mapper_random_seed),
         "--mapper_multiple_models", str(args.mapper_multiple_models),
         "--min_model_size", str(args.min_model_size),
         "--init_min_num_inliers", str(args.init_min_num_inliers),
         "--abs_pose_min_num_inliers", str(args.abs_pose_min_num_inliers),
     ]
+    if bool(args.swap_latlon):
+        convert_cmd.append("--swap_latlon")
+    convert_cmd.append("--require_cuda_colmap" if bool(args.require_cuda_colmap) else "--allow_non_cuda_colmap")
+    convert_cmd.append(
+        "--require_global_mapper_cudss"
+        if bool(args.require_global_mapper_cudss)
+        else "--allow_global_mapper_without_cudss"
+    )
+    if bool(args.allow_replace_unverified_outputs):
+        convert_cmd.append("--allow_replace_unverified_outputs")
     if bool(args.use_model_aligner):
         convert_cmd.extend(["--use_model_aligner", "--model_aligner_args", str(args.model_aligner_args)])
+    else:
+        convert_cmd.append("--no_use_model_aligner")
+
+    conversion_validation_cache: Optional[Tuple[bool, str, Optional[Dict[str, object]], str]] = None
+
+    def _pick_sparse_model_for_ud(*, refresh: bool = False) -> Optional[Path]:
+        """Accept step 4 only through the atomic completion-manifest contract."""
+        nonlocal conversion_validation_cache
+        if refresh:
+            conversion_validation_cache = None
+        if conversion_validation_cache is None:
+            try:
+                import convert_uavfgs as converter
+
+                resolved_colmap = Path(converter._resolve_executable(str(args.colmap)))
+                if not resolved_colmap.is_file():
+                    raise FileNotFoundError(f"COLMAP executable is missing: {resolved_colmap}")
+                current_colmap_sha = converter._sha256_file(resolved_colmap)
+                verified, reason, manifest = converter.validate_conversion_completion_manifest(
+                    data_root,
+                    expected_arguments=[str(value) for value in convert_cmd[2:]],
+                    expected_colmap_sha256=current_colmap_sha,
+                    expected_min_registered_images=int(args.min_model_size),
+                )
+                conversion_validation_cache = (verified, reason, manifest, current_colmap_sha)
+            except Exception as exc:
+                conversion_validation_cache = (False, str(exc), None, "")
+        verified, reason, manifest, _ = conversion_validation_cache
+        if not verified or manifest is None:
+            if conversion_manifest.exists():
+                eprint(f"[WARN] Step 04 completion manifest rejected: {reason}")
+            return None
+        alignment = manifest.get("alignment", {})
+        if isinstance(alignment, dict) and bool(alignment.get("enabled", False)):
+            return sparse_aligned
+        return sparse_fallback
 
     sparse_model_for_ud = _pick_sparse_model_for_ud()
     convert_outputs_ok = sparse_model_for_ud is not None
@@ -2061,16 +2201,17 @@ def main() -> None:
             _record_step("04_convert_uavfgs", "skip", convert_cmd, outputs_ok=convert_outputs_ok)
         else:
             maybe_run(convert_cmd, cwd=gs_root, step_name="04_convert_uavfgs")
-            sparse_model_for_ud = _pick_sparse_model_for_ud()
+            sparse_model_for_ud = _pick_sparse_model_for_ud(refresh=True)
             convert_outputs_ok = sparse_model_for_ud is not None
             if not convert_outputs_ok:
                 _maybe_raise_file_not_found(
-                    "Sparse model not found/invalid after convert step.\n"
+                    "Atomic conversion completion manifest is missing or invalid after convert step.\n"
+                    f"Manifest: {conversion_manifest}\n"
                     f"Checked aligned: {sparse_aligned}\n"
                     f"Checked fallback: {sparse_fallback}"
                 )
             elif sparse_model_for_ud != sparse_aligned:
-                eprint(f"[WARN] sparse_aligned missing; fallback to sparse model: {sparse_model_for_ud}")
+                eprint(f"[WARN] model alignment was explicitly disabled; using sparse model: {sparse_model_for_ud}")
             _record_step("04_convert_uavfgs", "run", convert_cmd, outputs_ok=convert_outputs_ok)
             write_marker(marker_path(state_dir, "04_convert_uavfgs"), "04_convert_uavfgs", convert_cmd, cwd=gs_root)
 

@@ -11,6 +11,10 @@ This folder contains the v1 tooling for:
 - `PROTOCOL.md`: fixed paper-facing protocol definition
 - `evaluator.py`: ROI builder and scene evaluator
 - `sanity_tests.py`: synthetic checks for determinism and metric behavior
+- `build_depth_reference.py`: build the training-only OpenMVS dense cloud/refined mesh and render probe reference depth
+- `openmvs_backend_sanity.py`: validate the OpenMVS command plan, cache ownership, code provenance, and fatal no-fallback behavior
+- `openmvs-2.4.0-refine-cuda-fail-closed.patch`: prevent OpenMVS 2.4 RefineMesh from silently falling back to CPU after CUDA initialization
+- `materialize_strict_pose_controlled_dataset.py`: disabled legacy implementation retained only for forensic comparison; it is not a supported execution path
 - `materialize_colmap_odd_even_split.py`: generate explicit `train_odd/train_even/probe_test` lists from a COLMAP scene
 - `export_gaussian_probe_bundle.py`: export probe-view `depth + opacity` bundles from Gaussian models in this repo
 - `build_scene_manifest.py`: merge odd/even split bundles into one evaluator scene manifest

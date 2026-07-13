@@ -20,6 +20,12 @@ from utils.read_write_model import read_model
 
 
 PROTOCOL_NAME = "pose-controlled-cross-subset-geometric-repeatability-v1"
+LEGACY_DISABLED_REASON = (
+    "This legacy strict-pose materializer is disabled because it invokes a removed converter "
+    "and does not satisfy the repository's COLMAP 4.1.0 CUDA/cuDSS, immutable-database, and "
+    "content-addressed completion requirements. Use convert_uavfgs.py plus the audited formal "
+    "depth-reference workflow instead."
+)
 
 
 def _json_default(obj: Any) -> Any:
@@ -295,6 +301,10 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    raise RuntimeError(LEGACY_DISABLED_REASON)
+
+    # The historical implementation is intentionally retained below for
+    # forensic comparison only; the executable entry point cannot reach it.
     args = _parse_args()
 
     source_root = Path(args.source_root).resolve()

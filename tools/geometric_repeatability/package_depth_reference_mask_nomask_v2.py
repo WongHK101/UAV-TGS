@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import functools
+import hashlib
 import json
 import math
 import re
@@ -23,6 +25,48 @@ TOOL_DIR = Path(__file__).resolve().parent
 REPO = TOOL_DIR.parent.parent
 sys.path.insert(0, str(TOOL_DIR))
 
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _same_resolved_path(left: str | Path, right: str | Path) -> bool:
+    return (
+        str(Path(left).resolve()).replace("\\", "/").casefold()
+        == str(Path(right).resolve()).replace("\\", "/").casefold()
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _current_git_commit() -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(REPO), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    commit = completed.stdout.strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", commit):
+        raise RuntimeError(f"Invalid repository commit: {commit!r}")
+    return commit
+
+
+def _assert_producer_identity(identity: Any, *, script_path: Path, label: str) -> None:
+    if not isinstance(identity, dict):
+        raise RuntimeError(f"Missing producer identity for {label}")
+    if (
+        not _same_resolved_path(str(identity.get("script_path", "")), script_path)
+        or str(identity.get("script_sha256", "")) != _sha256_file(script_path)
+        or str(identity.get("git_commit", "")) != _current_git_commit()
+        or identity.get("git_dirty") is not False
+        or str(identity.get("git_error", ""))
+    ):
+        raise RuntimeError(f"Producer identity does not match the current clean-code contract for {label}")
+
 from visualize_depth_reference_views import (  # noqa: E402
     _compute_depth_display_range,
     _depth_to_rgb,
@@ -38,10 +82,8 @@ from visualize_depth_reference_views import (  # noqa: E402
 
 FORMAL = Path(".")
 MESHFIX = Path(".")
-V1 = Path(".")
 OUT = Path("depth_reference_package")
 ZIP = OUT.with_suffix(".zip")
-RECOMPUTE_METRICS = False
 REQUIRE_NATIVE_ALIGN = False
 DEPRECATED_TARGETS: List[Path] = []
 
@@ -91,12 +133,15 @@ DISPLAY = {
     },
 }
 THRESHOLDS = [0.10, 0.25, 0.50, 1.00, 2.00, 5.00, 10.00, 20.00, 30.00]
+OPENMVS_REFINE_CUDA_FAIL_CLOSED_MARKER = (
+    "CUDA mesh refinement path completed; CPU fallback disabled"
+)
 MASKED_REFS = {
-    "Building": FORMAL / "Building" / "reference" / "reference_depth_manifest.json",
-    "Orchard": FORMAL / "Orchard" / "reference" / "reference_depth_manifest.json",
-    "PVpanel": MESHFIX / "PVpanel" / "reference" / "reference_depth_manifest.json",
-    "Road": MESHFIX / "Road" / "reference" / "reference_depth_manifest.json",
-    "TransmissionTower": MESHFIX / "TransmissionTower" / "reference" / "reference_depth_manifest.json",
+    "Building": FORMAL / "Building" / "reference_openmvs_v1" / "reference_depth_manifest.json",
+    "Orchard": FORMAL / "Orchard" / "reference_openmvs_v1" / "reference_depth_manifest.json",
+    "PVpanel": MESHFIX / "PVpanel" / "reference_openmvs_v1" / "reference_depth_manifest.json",
+    "Road": MESHFIX / "Road" / "reference_openmvs_v1" / "reference_depth_manifest.json",
+    "TransmissionTower": MESHFIX / "TransmissionTower" / "reference_openmvs_v1" / "reference_depth_manifest.json",
 }
 
 INVALID_RGB = (1.0, 1.0, 1.0)
@@ -124,13 +169,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build a mask/no-mask depth-reference result package")
     parser.add_argument("--formal_root", required=True, help="Root containing method model bundles and Building/Orchard references")
     parser.add_argument("--meshfix_root", required=True, help="Root containing repaired PVpanel/Road/TransmissionTower references")
-    parser.add_argument("--previous_package_root", default="", help="Previous package root used when copying metrics")
+    parser.add_argument(
+        "--previous_package_root",
+        default="",
+        help="Deprecated compatibility option; metrics are always recomputed for the selected OpenMVS references.",
+    )
     parser.add_argument("--out", required=True, help="Output package directory")
     parser.add_argument("--zip", default="", help="Output zip path; defaults to <out>.zip")
     parser.add_argument(
         "--recompute_metrics",
         action="store_true",
-        help="Re-evaluate masked/no-mask metrics from the selected references and model bundles instead of copying previous metrics.",
+        help="Compatibility flag; metrics are always recomputed from the selected OpenMVS references.",
     )
     parser.add_argument(
         "--require_native_align",
@@ -144,27 +193,25 @@ def parse_args() -> argparse.Namespace:
         help="Old package folder or zip path to mark as deprecated via sidecar marker files.",
     )
     args = parser.parse_args()
-    if not args.recompute_metrics and not str(args.previous_package_root).strip():
-        parser.error("--previous_package_root is required unless --recompute_metrics is set")
     return args
 
 
 def configure_from_args(args: argparse.Namespace) -> None:
-    global FORMAL, MESHFIX, V1, OUT, ZIP, MASKED_REFS, RECOMPUTE_METRICS, REQUIRE_NATIVE_ALIGN, DEPRECATED_TARGETS
+    global FORMAL, MESHFIX, OUT, ZIP, MASKED_REFS, REQUIRE_NATIVE_ALIGN, DEPRECATED_TARGETS
     FORMAL = Path(args.formal_root).resolve()
     MESHFIX = Path(args.meshfix_root).resolve()
-    V1 = Path(args.previous_package_root).resolve() if str(args.previous_package_root).strip() else Path()
     OUT = Path(args.out).resolve()
     ZIP = Path(args.zip).resolve() if str(args.zip).strip() else OUT.with_suffix(".zip")
-    RECOMPUTE_METRICS = bool(args.recompute_metrics)
+    # Backend changes invalidate all earlier depth metrics.  Never mix copied
+    # COLMAP-MVS-era metrics with the current OpenMVS references.
     REQUIRE_NATIVE_ALIGN = bool(args.require_native_align)
     DEPRECATED_TARGETS = [Path(p).resolve() for p in args.deprecated_target]
     MASKED_REFS = {
-        "Building": FORMAL / "Building" / "reference" / "reference_depth_manifest.json",
-        "Orchard": FORMAL / "Orchard" / "reference" / "reference_depth_manifest.json",
-        "PVpanel": MESHFIX / "PVpanel" / "reference" / "reference_depth_manifest.json",
-        "Road": MESHFIX / "Road" / "reference" / "reference_depth_manifest.json",
-        "TransmissionTower": MESHFIX / "TransmissionTower" / "reference" / "reference_depth_manifest.json",
+        "Building": FORMAL / "Building" / "reference_openmvs_v1" / "reference_depth_manifest.json",
+        "Orchard": FORMAL / "Orchard" / "reference_openmvs_v1" / "reference_depth_manifest.json",
+        "PVpanel": MESHFIX / "PVpanel" / "reference_openmvs_v1" / "reference_depth_manifest.json",
+        "Road": MESHFIX / "Road" / "reference_openmvs_v1" / "reference_depth_manifest.json",
+        "TransmissionTower": MESHFIX / "TransmissionTower" / "reference_openmvs_v1" / "reference_depth_manifest.json",
     }
 
 
@@ -234,6 +281,7 @@ def create_nomask_reference(scene: str, masked_manifest: Path) -> tuple[Path, in
         "valid_mask is finite(reference depth) & reference depth > 0; support_count and inside_roi are preserved for audit but not used as validity."
     )
     manifest["masked_source_reference_manifest"] = str(masked_manifest)
+    manifest["masked_source_reference_manifest_sha256"] = _sha256_file(masked_manifest)
     masked_valid_total = 0
     nomask_valid_total = 0
     for view in manifest["views"]:
@@ -254,6 +302,8 @@ def create_nomask_reference(scene: str, masked_manifest: Path) -> tuple[Path, in
             valid_mask=nomask_valid.astype(np.uint8),
             inside_roi=inside_roi,
         )
+        view["npz_size_bytes"] = int(dst_npz.stat().st_size)
+        view["npz_sha256"] = _sha256_file(dst_npz)
     manifest["nomask_total_valid_pixels"] = nomask_valid_total
     manifest["masked_source_total_valid_pixels"] = masked_valid_total
     out_manifest = dst_root / "reference_depth_manifest.json"
@@ -306,20 +356,172 @@ def copy_final_reference_meshes() -> List[Dict[str, Any]]:
     for scene in SCENES:
         build_manifest_path = MASKED_REFS[scene].parent / "reference_build_manifest.json"
         build_manifest = load_json(build_manifest_path)
+        overrides = build_manifest.get("reference_construction_overrides", {})
+        protocol = str(build_manifest.get("reference_construction_protocol", ""))
+        dense_backend = str(build_manifest.get("reference_dense_backend", ""))
+        mesh_backend = str(build_manifest.get("reference_mesh_backend", ""))
+        if protocol != "openmvs-reference-mesh-v1":
+            raise RuntimeError(
+                f"Refusing to package a non-OpenMVS reference for {scene}: "
+                f"reference_construction_protocol={protocol!r}"
+            )
+        if dense_backend != "openmvs_densify_point_cloud":
+            raise RuntimeError(
+                f"Refusing to package an unexpected dense backend for {scene}: {dense_backend!r}"
+            )
+        if mesh_backend not in {"openmvs_reconstruct_mesh", "openmvs_refine_mesh"}:
+            raise RuntimeError(
+                f"Refusing to package an unexpected mesh backend for {scene}: {mesh_backend!r}"
+            )
+        if str(overrides.get("reference_geometry_backend", "")) != "openmvs":
+            raise RuntimeError(f"OpenMVS backend declaration is missing for {scene}")
+        if bool(overrides.get("colmap_mvs_fallback_allowed", True)):
+            raise RuntimeError(f"COLMAP-MVS fallback must be explicitly forbidden for {scene}")
+        if int(overrides.get("openmvs_archive_type", 0)) != -1:
+            raise RuntimeError(f"OpenMVS archive_type must remain -1 for {scene}")
+        if bool(overrides.get("openmvs_interface_normalize", True)):
+            raise RuntimeError(f"OpenMVS InterfaceCOLMAP normalization must remain disabled for {scene}")
+        if not bool(overrides.get("openmvs_cuda_log_evidence_required", False)):
+            raise RuntimeError(f"Verified OpenMVS CUDA evidence must be required for {scene}")
+        refine_enabled = bool(overrides.get("openmvs_refine_mesh", False))
+        if refine_enabled and (
+            not bool(overrides.get("openmvs_refine_cuda_fail_closed_required", False))
+            or str(overrides.get("openmvs_refine_cuda_fail_closed_marker", ""))
+            != OPENMVS_REFINE_CUDA_FAIL_CLOSED_MARKER
+        ):
+            raise RuntimeError(f"Fail-closed CUDA RefineMesh must be required for {scene}")
         source_mesh = Path(str(build_manifest.get("reference_mesh_path", "")))
         if not source_mesh.exists() or source_mesh.stat().st_size <= 0:
             raise FileNotFoundError(f"Final reference mesh is missing or empty for {scene}: {source_mesh}")
+        expected_mesh_sha = str(build_manifest.get("reference_mesh_sha256", ""))
+        expected_mesh_size = int(build_manifest.get("reference_mesh_size_bytes", -1))
+        if _sha256_file(source_mesh) != expected_mesh_sha or int(source_mesh.stat().st_size) != expected_mesh_size:
+            raise RuntimeError(f"Final OpenMVS reference mesh identity changed for {scene}: {source_mesh}")
+        dense_path = Path(str(build_manifest.get("reference_dense_ply", "")))
+        if (
+            not dense_path.is_file()
+            or _sha256_file(dense_path) != str(build_manifest.get("reference_dense_ply_sha256", ""))
+            or int(dense_path.stat().st_size) != int(build_manifest.get("reference_dense_ply_size_bytes", -1))
+        ):
+            raise RuntimeError(f"Final OpenMVS dense reference identity changed for {scene}: {dense_path}")
+        plan_path = Path(str(build_manifest.get("openmvs_command_plan", "")))
+        if (
+            not plan_path.is_file()
+            or _sha256_file(plan_path) != str(build_manifest.get("openmvs_command_plan_sha256", ""))
+        ):
+            raise RuntimeError(f"OpenMVS command plan identity changed for {scene}: {plan_path}")
+        receipt_rows = build_manifest.get("openmvs_stage_receipts", {})
+        required_receipts = {"interface_colmap", "densify_point_cloud", "reconstruct_mesh"}
+        if refine_enabled:
+            required_receipts.add("refine_mesh")
+        if not isinstance(receipt_rows, dict) or not required_receipts.issubset(set(receipt_rows)):
+            raise RuntimeError(f"OpenMVS stage receipt set is incomplete for {scene}")
+        for stage_name, receipt in receipt_rows.items():
+            receipt_path = Path(str(receipt.get("path", "")))
+            if (
+                not receipt_path.is_file()
+                or _sha256_file(receipt_path) != str(receipt.get("sha256", ""))
+                or int(receipt_path.stat().st_size) != int(receipt.get("size_bytes", -1))
+            ):
+                raise RuntimeError(f"OpenMVS stage receipt changed for {scene}/{stage_name}")
+        reference_manifest = load_json(MASKED_REFS[scene])
+        if (
+            not _same_resolved_path(str(reference_manifest.get("reference_mesh_path", "")), source_mesh)
+            or str(reference_manifest.get("reference_mesh_sha256", "")) != expected_mesh_sha
+        ):
+            raise RuntimeError(f"Reference/build manifests disagree on the OpenMVS mesh for {scene}")
+        for view in reference_manifest.get("views", []):
+            view_path = MASKED_REFS[scene].parent / str(view.get("npz_file", ""))
+            if (
+                not view_path.is_file()
+                or _sha256_file(view_path) != str(view.get("npz_sha256", ""))
+                or int(view_path.stat().st_size) != int(view.get("npz_size_bytes", -1))
+            ):
+                raise RuntimeError(f"Reference view identity changed for {scene}: {view_path}")
         scene_dir = mesh_root / scene
         scene_dir.mkdir(parents=True, exist_ok=True)
         copied_mesh = scene_dir / source_mesh.name
         shutil.copy2(source_mesh, copied_mesh)
-        for name in ["reference_build_manifest.json", "reference_roi.json", "probe_camera_manifest.json", "reference_depth_manifest.json"]:
+        for name in [
+            "reference_build_manifest.json",
+            "reference_roi.json",
+            "probe_camera_manifest.json",
+            "reference_depth_manifest.json",
+            "openmvs_command_plan.json",
+            "openmvs_cuda_evidence.json",
+        ]:
             src = MASKED_REFS[scene].parent / name
             if src.exists():
                 shutil.copy2(src, scene_dir / name)
 
-        overrides = build_manifest.get("reference_construction_overrides", {})
         support_rule = build_manifest.get("support_rule", {})
+        cuda_evidence = build_manifest.get("openmvs_cuda_evidence", {})
+        cuda_evidence_required = bool(overrides.get("openmvs_cuda_log_evidence_required", False))
+        expected_cuda_device = int(overrides.get("openmvs_cuda_device", -1))
+        required_cuda_stages = {"densify_point_cloud", "reconstruct_mesh"}
+        if refine_enabled:
+            required_cuda_stages.add("refine_mesh")
+        evidence_stages = cuda_evidence.get("stages", {})
+        if cuda_evidence_required:
+            if cuda_evidence.get("status") != "verified" or not isinstance(evidence_stages, dict):
+                raise RuntimeError(
+                    f"Verified OpenMVS CUDA evidence is required for {scene}, but the build manifest "
+                    f"reports status={cuda_evidence.get('status')!r}."
+                )
+            missing_stages = sorted(required_cuda_stages - set(evidence_stages))
+            if missing_stages:
+                raise RuntimeError(
+                    f"Required OpenMVS CUDA evidence stages are missing for {scene}: {missing_stages}"
+                )
+        packaged_cuda_rows: Dict[str, Any] = {}
+        for stage_name, evidence_row in evidence_stages.items():
+            if int(evidence_row.get("expected_cuda_device", -1)) != expected_cuda_device:
+                raise RuntimeError(
+                    f"OpenMVS CUDA evidence device mismatch for {scene}/{stage_name}: "
+                    f"manifest={evidence_row.get('expected_cuda_device')!r} "
+                    f"override={expected_cuda_device}"
+                )
+            source_log = Path(str(evidence_row.get("log_path", "")))
+            expected_sha = str(evidence_row.get("log_sha256", ""))
+            if not source_log.is_file() or not expected_sha:
+                raise FileNotFoundError(
+                    f"OpenMVS CUDA evidence log is missing for {scene}/{stage_name}: {source_log}"
+                )
+            actual_sha = _sha256_file(source_log)
+            if actual_sha != expected_sha:
+                raise RuntimeError(
+                    f"OpenMVS CUDA evidence SHA mismatch for {scene}/{stage_name}: "
+                    f"expected={expected_sha} actual={actual_sha}"
+                )
+            expected_size = int(evidence_row.get("log_size_bytes", -1))
+            actual_size = int(source_log.stat().st_size)
+            if expected_size != actual_size:
+                raise RuntimeError(
+                    f"OpenMVS CUDA evidence size mismatch for {scene}/{stage_name}: "
+                    f"expected={expected_size} actual={actual_size}"
+                )
+            if stage_name == "refine_mesh":
+                if evidence_row.get("cuda_fallback_fail_closed") is not True:
+                    raise RuntimeError(f"RefineMesh CUDA fallback is not fail-closed for {scene}")
+                if OPENMVS_REFINE_CUDA_FAIL_CLOSED_MARKER not in source_log.read_text(
+                    encoding="utf-8", errors="replace"
+                ):
+                    raise RuntimeError(f"RefineMesh fail-closed completion marker is missing for {scene}")
+            packaged_log = scene_dir / "openmvs_cuda_logs" / f"{stage_name}.log"
+            packaged_log.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_log, packaged_log)
+            if _sha256_file(packaged_log) != expected_sha or packaged_log.stat().st_size != expected_size:
+                raise RuntimeError(f"Packaged OpenMVS CUDA evidence copy failed verification: {packaged_log}")
+            packaged_cuda_rows[str(stage_name)] = {
+                **evidence_row,
+                "source_log_path": str(source_log),
+                "packaged_log_path": str(packaged_log),
+            }
+        if packaged_cuda_rows:
+            save_json(
+                scene_dir / "packaged_openmvs_cuda_evidence.json",
+                {"status": "verified", "stages": packaged_cuda_rows},
+            )
         row = {
             "scene_name": scene,
             "mesh_backend": build_manifest.get("reference_mesh_backend", ""),
@@ -329,22 +531,35 @@ def copy_final_reference_meshes() -> List[Dict[str, Any]]:
             "reference_mesher_input_ply": build_manifest.get("reference_mesher_input_ply", ""),
             "reference_fused_ply": build_manifest.get("reference_fused_ply", ""),
             "roi_path": build_manifest.get("roi_path", ""),
-            "patch_match_max_image_size": overrides.get("patch_match_max_image_size", ""),
-            "patch_match_auto_source_count": overrides.get("patch_match_auto_source_count", ""),
-            "patch_match_window_radius": overrides.get("patch_match_window_radius", ""),
-            "patch_match_num_iterations": overrides.get("patch_match_num_iterations", ""),
-            "patch_match_geom_consistency": overrides.get("patch_match_geom_consistency", ""),
-            "patch_match_filter": overrides.get("patch_match_filter", ""),
-            "stereo_fusion_max_image_size": overrides.get("stereo_fusion_max_image_size", ""),
-            "stereo_fusion_min_num_pixels": overrides.get("stereo_fusion_min_num_pixels", ""),
-            "stereo_fusion_max_reproj_error": overrides.get("stereo_fusion_max_reproj_error", ""),
-            "stereo_fusion_max_depth_error": overrides.get("stereo_fusion_max_depth_error", ""),
-            "stereo_fusion_max_normal_error": overrides.get("stereo_fusion_max_normal_error", ""),
-            "mesh_backend_preference": overrides.get("mesh_backend_preference", ""),
-            "poisson_depth": overrides.get("poisson_depth", ""),
-            "poisson_trim": overrides.get("poisson_trim", ""),
-            "poisson_point_weight": overrides.get("poisson_point_weight", ""),
-            "mesh_crop_fused_to_roi": overrides.get("mesh_crop_fused_to_roi", ""),
+            "reference_construction_protocol": build_manifest.get("reference_construction_protocol", ""),
+            "reference_dense_backend": build_manifest.get("reference_dense_backend", ""),
+            "openmvs_archive_type": overrides.get("openmvs_archive_type", ""),
+            "openmvs_interface_normalize": overrides.get("openmvs_interface_normalize", ""),
+            "openmvs_cuda_device": overrides.get("openmvs_cuda_device", ""),
+            "openmvs_cuda_log_evidence_required": overrides.get("openmvs_cuda_log_evidence_required", ""),
+            "openmvs_resolution_level": overrides.get("openmvs_resolution_level", ""),
+            "openmvs_max_resolution": overrides.get("openmvs_max_resolution", ""),
+            "openmvs_min_resolution": overrides.get("openmvs_min_resolution", ""),
+            "openmvs_number_views": overrides.get("openmvs_number_views", ""),
+            "openmvs_number_views_fuse": overrides.get("openmvs_number_views_fuse", ""),
+            "openmvs_iterations": overrides.get("openmvs_iterations", ""),
+            "openmvs_estimate_roi": overrides.get("openmvs_estimate_roi", ""),
+            "openmvs_crop_to_roi": overrides.get("openmvs_crop_to_roi", ""),
+            "openmvs_refine_mesh": overrides.get("openmvs_refine_mesh", ""),
+            "openmvs_refine_resolution_level": overrides.get("openmvs_refine_resolution_level", ""),
+            "openmvs_refine_scales": overrides.get("openmvs_refine_scales", ""),
+            "texture_mesh_used": overrides.get("texture_mesh_used", ""),
+            "colmap_mvs_fallback_allowed": overrides.get("colmap_mvs_fallback_allowed", ""),
+            "openmvs_cuda_evidence_status": cuda_evidence.get("status", ""),
+            "openmvs_cuda_evidence_stage_count": len(packaged_cuda_rows),
+            "openmvs_cuda_evidence_devices": ";".join(
+                f"{name}:{value.get('expected_cuda_device', '')}"
+                for name, value in sorted(packaged_cuda_rows.items())
+            ),
+            "openmvs_cuda_evidence_log_sha256": ";".join(
+                f"{name}:{value.get('log_sha256', '')}"
+                for name, value in sorted(packaged_cuda_rows.items())
+            ),
             "support_min_count": support_rule.get("min_support_count", ""),
             "support_radius_px": support_rule.get("support_radius_px", ""),
             "support_depth_tolerance_m": support_rule.get("support_depth_tolerance_m", ""),
@@ -370,26 +585,15 @@ def copy_final_reference_meshes() -> List[Dict[str, Any]]:
     return rows
 
 
-def copy_metrics_from_v1() -> None:
-    if not V1.exists():
-        raise FileNotFoundError(f"Previous package not found: {V1}")
-    count = 0
-    for mask in ["masked", "nomask"]:
-        for scene in SCENES:
-            for method in METHODS:
-                src_dir = V1 / "metrics" / mask / scene / method
-                dst_dir = OUT / "metrics" / mask / scene / method
-                if not (src_dir / "metrics_summary.json").exists():
-                    raise FileNotFoundError(src_dir / "metrics_summary.json")
-                shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)
-                count += 1
-    log(f"Copied metrics JSON sets: {count}")
-
-
 def assert_model_bundle_ready(scene: str, method: str, manifest_path: Path) -> None:
     if not manifest_path.exists():
         raise FileNotFoundError(manifest_path)
     manifest = load_json(manifest_path)
+    _assert_producer_identity(
+        manifest.get("producer_identity"),
+        script_path=TOOL_DIR / "export_gaussian_probe_bundle.py",
+        label=f"model bundle {scene}/{method}",
+    )
     if REQUIRE_NATIVE_ALIGN and manifest.get("camera_frame_mode") != "probe_manifest_native_align":
         raise ValueError(f"Expected native-aligned model bundle for {scene}/{method}: {manifest_path}")
     if REQUIRE_NATIVE_ALIGN:
@@ -424,6 +628,49 @@ def assert_metrics_reference_native_align_bundles() -> None:
                 checked_metrics += 1
                 checked_models.add(str(model_manifest.resolve()))
     log(f"Validated native-aligned metric model manifests: {checked_metrics} metrics, {len(checked_models)} unique bundles")
+
+
+def assert_metrics_match_current_inputs(refs: Dict[str, Dict[str, Path]]) -> None:
+    checked = 0
+    for mask in ["masked", "nomask"]:
+        for scene in SCENES:
+            reference_manifest = Path(refs[mask][scene]).resolve()
+            for method in METHODS:
+                metrics_path = OUT / "metrics" / mask / scene / method / "metrics_summary.json"
+                model_manifest = (FORMAL / scene / method / "bundle" / "split_manifest.json").resolve()
+                adapter_manifest = (FORMAL / scene / method / "depth_adapter_manifest.json").resolve()
+                for required in (metrics_path, reference_manifest, model_manifest, adapter_manifest):
+                    if not required.is_file():
+                        raise FileNotFoundError(required)
+                metrics = load_json(metrics_path)
+                _assert_producer_identity(
+                    metrics.get("producer_identity"),
+                    script_path=TOOL_DIR / "evaluate_depth_reference.py",
+                    label=f"metrics {mask}/{scene}/{method}",
+                )
+                if metrics.get("protocol_name") != "reference-depth-based-geometric-evaluation-v1":
+                    raise RuntimeError(f"Metric protocol mismatch in {metrics_path}")
+                if str(metrics.get("scene_name", "")) != scene or str(metrics.get("method_name", "")) != method:
+                    raise RuntimeError(f"Metric scene/method mismatch in {metrics_path}")
+                for field, sha_field, expected in (
+                    ("reference_manifest", "reference_manifest_sha256", reference_manifest),
+                    ("model_manifest", "model_manifest_sha256", model_manifest),
+                    ("adapter_manifest", "adapter_manifest_sha256", adapter_manifest),
+                ):
+                    if not _same_resolved_path(str(metrics.get(field, "")), expected):
+                        raise RuntimeError(f"Metric {field} path mismatch in {metrics_path}")
+                    expected_sha = _sha256_file(expected)
+                    if str(metrics.get(sha_field, "")).lower() != expected_sha:
+                        raise RuntimeError(f"Metric {field} SHA mismatch in {metrics_path}")
+                if metrics.get("evaluation_options", {}).get("enable_agreement_metrics") is not True:
+                    raise RuntimeError(f"Agreement-metric contract mismatch in {metrics_path}")
+                thresholds = [float(row["threshold_m"]) for row in metrics.get("threshold_metrics", [])]
+                if thresholds != THRESHOLDS:
+                    raise RuntimeError(f"Metric threshold contract mismatch in {metrics_path}: {thresholds}")
+                checked += 1
+    if checked != 2 * len(SCENES) * len(METHODS):
+        raise RuntimeError(f"Unexpected validated metric count: {checked}")
+    log(f"Validated current reference/model/adapter hashes for {checked} recomputed metrics")
 
 
 def recompute_metrics_from_bundles(refs: Dict[str, Dict[str, Path]]) -> None:
@@ -1128,7 +1375,7 @@ def package_summary(
             "zip_path": str(ZIP),
             "model_bundle_root": str(FORMAL),
             "meshfix_reference_root": str(MESHFIX),
-            "metrics_source": "recomputed_from_selected_model_bundles_and_references" if RECOMPUTE_METRICS else str(V1),
+            "metrics_source": "recomputed_from_selected_openmvs_references_and_model_bundles",
             "require_native_align": REQUIRE_NATIVE_ALIGN,
             "scenes": SCENES,
             "thresholds_m": THRESHOLDS,
@@ -1195,12 +1442,10 @@ def main() -> None:
     refs, reference_rows = prepare_references()
     log("Copying final reference meshes and mesh parameters")
     mesh_rows = copy_final_reference_meshes()
-    if RECOMPUTE_METRICS:
-        log("Recomputing metrics from selected references and model bundles")
-        recompute_metrics_from_bundles(refs)
-    else:
-        log("Copying metrics from previous package")
-        copy_metrics_from_v1()
+    log("Recomputing metrics from selected OpenMVS references and model bundles")
+    recompute_metrics_from_bundles(refs)
+    log("Validating every metric against current reference/model/adapter hashes")
+    assert_metrics_match_current_inputs(refs)
     if REQUIRE_NATIVE_ALIGN:
         log("Validating native-aligned metric model manifests")
         assert_metrics_reference_native_align_bundles()

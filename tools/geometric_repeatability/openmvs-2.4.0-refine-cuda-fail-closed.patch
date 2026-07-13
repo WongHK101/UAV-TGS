@@ -1,0 +1,42 @@
+diff --git a/apps/RefineMesh/RefineMesh.cpp b/apps/RefineMesh/RefineMesh.cpp
+index 6b25673..1acc7e0 100644
+--- a/apps/RefineMesh/RefineMesh.cpp
++++ b/apps/RefineMesh/RefineMesh.cpp
+@@ -229,17 +229,23 @@ int main(int argc, LPCTSTR* argv)
+ 	}
+ 	TD_TIMER_START();
+ 	#ifdef _USE_CUDA
+-	if (SEACAVE::CUDA::desiredDeviceID < -1 ||
+-		!scene.RefineMeshCUDA(OPT::nResolutionLevel, OPT::nMinResolution, OPT::nMaxViews,
++	if (SEACAVE::CUDA::desiredDeviceID >= -1) {
++		if (!scene.RefineMeshCUDA(OPT::nResolutionLevel, OPT::nMinResolution, OPT::nMaxViews,
+ 							  OPT::fDecimateMesh, OPT::nCloseHoles, OPT::nEnsureEdgeSize,
+ 							  OPT::nMaxFaceArea,
+ 							  OPT::nScales, OPT::fScaleStep,
+ 							  OPT::nAlternatePair>10 ? OPT::nAlternatePair%10 : 0,
+ 							  OPT::fRegularityWeight,
+ 							  OPT::fRatioRigidityElasticity,
+-							  OPT::fGradientStep))
++							  OPT::fGradientStep)) {
++			VERBOSE("error: CUDA mesh refinement failed; CPU fallback disabled");
++			return EXIT_FAILURE;
++		}
++		VERBOSE("CUDA mesh refinement path completed; CPU fallback disabled");
++	} else
+ 	#endif
+-	if (!scene.RefineMesh(OPT::nResolutionLevel, OPT::nMinResolution, OPT::nMaxViews,
++	{
++		if (!scene.RefineMesh(OPT::nResolutionLevel, OPT::nMinResolution, OPT::nMaxViews,
+ 						  OPT::fDecimateMesh, OPT::nCloseHoles, OPT::nEnsureEdgeSize,
+ 						  OPT::nMaxFaceArea,
+ 						  OPT::nScales, OPT::fScaleStep,
+@@ -249,7 +255,8 @@ int main(int argc, LPCTSTR* argv)
+ 						  OPT::fGradientStep,
+ 						  OPT::fPlanarVertexRatio,
+ 						  OPT::nReduceMemory))
+-		return EXIT_FAILURE;
++			return EXIT_FAILURE;
++	}
+ 	VERBOSE("Mesh refinement completed: %u vertices, %u faces (%s)", scene.mesh.vertices.GetSize(), scene.mesh.faces.GetSize(), TD_TIMER_GET_FMT().c_str());
+ 
+ 	// save the final mesh

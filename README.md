@@ -29,7 +29,7 @@ Windows prerequisites:
 - CUDA toolkit with `nvcc` available on `PATH` (CUDA 11.8 is the intended match here)
 - Visual Studio 2019 or 2022 Build Tools with the MSVC x64 C/C++ toolchain
 - a shell where `cl` is available
-- COLMAP on `PATH` (or pass `--colmap <path>`)
+- COLMAP 4.1.0 built with CUDA on `PATH` (or pass `--colmap <path>`); GlobalMapper runs additionally require a CUDA-enabled Ceres build with cuDSS
 - ExifTool on `PATH` (or pass `--exiftool <path>`)
 
 Recommended Windows shell:
@@ -43,6 +43,7 @@ where.exe nvcc
 where.exe cl
 where.exe colmap
 where.exe exiftool
+colmap -h
 ```
 
 Linux prerequisites:
@@ -50,14 +51,14 @@ Linux prerequisites:
 - NVIDIA GPU and driver
 - CUDA toolkit with `nvcc` available on `PATH`
 - GCC/G++ toolchain
-- COLMAP on `PATH`
+- COLMAP 4.1.0 built with CUDA on `PATH`; GlobalMapper runs additionally require `ldd` to resolve `libcudss`
 - ExifTool on `PATH`
 
 Linux example (Ubuntu):
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential gcc g++ cmake ninja-build colmap libimage-exiftool-perl
+sudo apt-get install -y build-essential gcc g++ cmake ninja-build libimage-exiftool-perl
 ```
 
 Linux preflight checks:
@@ -67,7 +68,13 @@ which nvcc
 which g++
 which colmap
 which exiftool
+colmap -h
+ldd "$(readlink -f "$(which colmap)")" | grep libcudss
 ```
+
+The Ubuntu distribution `colmap` package is not a valid substitute for this
+CUDA/cuDSS runtime. The converter rejects a CPU-only or non-4.1.0 binary, and
+formal runs pin the accepted executable by SHA-256.
 
 ### 2) Create environment
 
@@ -241,10 +248,23 @@ Important note for extension builds:
 
 The full raw-pair pipeline expects:
 
-- COLMAP on `PATH`, or pass `--colmap <path>`
+- CUDA-enabled COLMAP 4.1.0 with Ceres/cuDSS on `PATH`, or pass `--colmap <path>`
 - ExifTool on `PATH`, or pass `--exiftool <path>`
 
 `cfr.py` has fallback behavior when ExifTool is unavailable, but the full pipeline should still be configured with COLMAP and ExifTool available.
+
+The default SfM command is COLMAP 4.1.0 `global_mapper`, with global positioning and bundle adjustment locked to GPU 0 and random seed 0. It does not fall back to incremental mapping. On Linux, the default preflight requires `ldd` to resolve `libcudss` with no missing libraries; formal runs should additionally pin the executable with `--required_colmap_sha256`. Internal Ceres failure or a CUDA/cuDSS-to-CPU solver fallback terminates the process group immediately. The default `model_aligner` then uses deterministic seed 0 and aligns registered camera centers from image-embedded WGS84-like values into a local ENU frame (`--ref_is_gps=1 --alignment_type=enu --alignment_max_error=30.0`). The audit also requires the centered-RMS camera-cloud scale ratio to remain in `[0.5, 2.0]`, preventing a compact or collapsed model from passing only because every camera lies within the absolute 30 m threshold. These embedded values are used verbatim: the audit verifies relative local-ENU consistency only and must not be cited as proof of the true city location or absolute elevation. Alignment failure is fatal; the pipeline does not relax the threshold automatically.
+
+`input/` is maintained as an exact content mirror. The formal database default is `--database_policy reset`; `reuse_verified` requires an exact input/runtime/argument/database provenance match. `adopt_legacy` requires `--expected_legacy_database_sha256`, skips feature extraction/matching instead of pretending to regenerate them, records their pinned but unverified origin, and remains ineligible for later `reuse_verified`. `model_aligner` receives a separate closed SQLite copy; its pre/post physical and semantic digests are recorded, the copy is discarded, and the publishable database keeps its pre-aligner identity. Immutable read-only database audits do not create WAL/SHM sidecars. Undistorted outputs are built in private staging directories, validated, and transactionally installed so a failed or interrupted rerun restores the previous complete outputs. Existing output paths without completion-manifest ownership are not replaced unless the caller explicitly supplies `--allow_replace_unverified_outputs`. Successful runs write:
+
+```text
+<DATA_ROOT>/distorted/model_alignment_transform.txt
+<DATA_ROOT>/distorted/model_alignment_audit.json
+<DATA_ROOT>/distorted/database_provenance.json
+<DATA_ROOT>/distorted/conversion_completion_manifest.json
+```
+
+Step 4 resume accepts only a verified completion manifest whose converter argv, COLMAP SHA, input content inventory, alignment evidence, final image inventory, registered sparse-model views, and point count still match. For formal scene runs, set `--min_model_size` to the protocol-required image count (for example, `614` for Building); the smaller generic default is only a usability floor.
 
 ## Data Assumptions
 
@@ -287,11 +307,16 @@ The script is resumable by default and writes per-step state files under:
 
 The reference-depth geometry consistency and front-intrusion tools are under
 `tools/geometric_repeatability/`. They support explicit train/test camera lists,
-training-side MVS/mesh references, native-camera alignment, per-view metrics,
-plots, visualizations, and result packaging.
+training-side OpenMVS dense/mesh references, native-camera alignment, per-view
+metrics, plots, visualizations, and result packaging. Reference geometry uses
+`InterfaceCOLMAP -> DensifyPointCloud -> ReconstructMesh -> RefineMesh`; COLMAP
+MVS/meshers are not fallback backends. Formal runs require the supplied
+OpenMVS 2.4 RefineMesh fail-closed CUDA patch and bind cached bundles/metrics to
+the clean Git commit plus exporter/evaluator SHA256 identities.
 
 ```bash
 python tools/geometric_repeatability/sanity_tests.py
+python tools/geometric_repeatability/openmvs_backend_sanity.py
 python tools/geometric_repeatability/evaluate_depth_reference.py -h
 python tools/geometric_repeatability/export_gaussian_probe_bundle.py -h
 ```

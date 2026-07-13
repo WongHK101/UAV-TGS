@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import functools
+import hashlib
 import json
 import math
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence
 
 import matplotlib.pyplot as plt
 import pandas as pd
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+TOOL_DIR = Path(__file__).resolve().parent
 
 SCENE_ORDER = ["Building", "PVpanel", "Orchard", "Road", "TransmissionTower"]
 METHOD_ORDER = [
@@ -50,6 +55,9 @@ SECONDARY_METRICS = [
     "AbsDepthError_Median",
     "SignedDepthBias_Mean",
 ]
+OPENMVS_REFINE_CUDA_FAIL_CLOSED_MARKER = (
+    "CUDA mesh refinement path completed; CPU fallback disabled"
+)
 
 
 def _build_argparser() -> argparse.ArgumentParser:
@@ -81,6 +89,41 @@ def _build_argparser() -> argparse.ArgumentParser:
 def _load_json(path: Path) -> Dict:
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+@functools.lru_cache(maxsize=1)
+def _current_git_commit() -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    commit = completed.stdout.strip()
+    if len(commit) != 40 or any(char not in "0123456789abcdefABCDEF" for char in commit):
+        raise RuntimeError(f"Invalid repository commit: {commit!r}")
+    return commit
+
+
+def _assert_producer_identity(identity: object, *, script_path: Path, label: str) -> None:
+    if not isinstance(identity, dict):
+        raise RuntimeError(f"Missing producer identity for {label}")
+    if (
+        not _same_resolved_path(str(identity.get("script_path", "")), script_path)
+        or str(identity.get("script_sha256", "")) != _sha256_file(script_path)
+        or str(identity.get("git_commit", "")) != _current_git_commit()
+        or identity.get("git_dirty") is not False
+        or str(identity.get("git_error", ""))
+    ):
+        raise RuntimeError(f"Producer identity does not match the current clean-code contract for {label}")
 
 
 def _ensure_clean_dir(path: Path) -> None:
@@ -116,7 +159,132 @@ def _collect_scene_roots(building_root: Path, formal4_root: Path) -> Dict[str, P
     return scene_roots
 
 
-def _collect_metrics(scene_roots: Dict[str, Path]) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _validate_openmvs_reference(scene_name: str, scene_root: Path) -> Path:
+    reference_root = scene_root / "reference_openmvs_v1"
+    build_path = reference_root / "reference_build_manifest.json"
+    reference_path = reference_root / "reference_depth_manifest.json"
+    if not build_path.is_file() or not reference_path.is_file():
+        raise FileNotFoundError(
+            f"Missing isolated OpenMVS reference manifests for {scene_name}: {reference_root}"
+        )
+    build = _load_json(build_path)
+    overrides = build.get("reference_construction_overrides", {})
+    if str(build.get("scene_name", "")) != scene_name:
+        raise RuntimeError(f"OpenMVS reference scene mismatch for {scene_name}: {build_path}")
+    if str(build.get("reference_construction_protocol", "")) != "openmvs-reference-mesh-v1":
+        raise RuntimeError(f"Non-OpenMVS reference protocol for {scene_name}: {build_path}")
+    if str(build.get("reference_dense_backend", "")) != "openmvs_densify_point_cloud":
+        raise RuntimeError(f"Unexpected dense backend for {scene_name}: {build_path}")
+    if str(build.get("reference_mesh_backend", "")) not in {
+        "openmvs_reconstruct_mesh",
+        "openmvs_refine_mesh",
+    }:
+        raise RuntimeError(f"Unexpected mesh backend for {scene_name}: {build_path}")
+    if str(overrides.get("reference_geometry_backend", "")) != "openmvs":
+        raise RuntimeError(f"OpenMVS backend declaration missing for {scene_name}: {build_path}")
+    if bool(overrides.get("colmap_mvs_fallback_allowed", True)):
+        raise RuntimeError(f"COLMAP-MVS fallback is not explicitly forbidden for {scene_name}")
+    if int(overrides.get("openmvs_archive_type", 0)) != -1:
+        raise RuntimeError(f"OpenMVS interface-archive contract is not frozen for {scene_name}")
+    if bool(overrides.get("openmvs_interface_normalize", True)):
+        raise RuntimeError(f"OpenMVS coordinate normalization must remain disabled for {scene_name}")
+    if not bool(overrides.get("openmvs_cuda_log_evidence_required", False)):
+        raise RuntimeError(f"Verified OpenMVS CUDA evidence is not required for {scene_name}")
+    refine_enabled = bool(overrides.get("openmvs_refine_mesh", False))
+    if refine_enabled and (
+        not bool(overrides.get("openmvs_refine_cuda_fail_closed_required", False))
+        or str(overrides.get("openmvs_refine_cuda_fail_closed_marker", ""))
+        != OPENMVS_REFINE_CUDA_FAIL_CLOSED_MARKER
+    ):
+        raise RuntimeError(f"Fail-closed CUDA RefineMesh is not required for {scene_name}")
+    evidence = build.get("openmvs_cuda_evidence", {})
+    stages = evidence.get("stages", {})
+    required_stages = {"densify_point_cloud", "reconstruct_mesh"}
+    if refine_enabled:
+        required_stages.add("refine_mesh")
+    if evidence.get("status") != "verified" or not isinstance(stages, dict):
+        raise RuntimeError(f"OpenMVS CUDA evidence is not verified for {scene_name}")
+    missing_stages = sorted(required_stages - set(stages))
+    if missing_stages:
+        raise RuntimeError(f"OpenMVS CUDA evidence is incomplete for {scene_name}: {missing_stages}")
+    expected_device = int(overrides.get("openmvs_cuda_device", -1))
+    for stage_name in required_stages:
+        row = stages[stage_name]
+        if int(row.get("expected_cuda_device", -1)) != expected_device:
+            raise RuntimeError(f"OpenMVS CUDA-device evidence mismatch for {scene_name}/{stage_name}")
+        log_path = Path(str(row.get("log_path", "")))
+        expected_sha = str(row.get("log_sha256", ""))
+        expected_size = int(row.get("log_size_bytes", -1))
+        if not log_path.is_file() or not expected_sha:
+            raise FileNotFoundError(f"OpenMVS CUDA evidence log is missing: {scene_name}/{stage_name}")
+        if _sha256_file(log_path) != expected_sha or int(log_path.stat().st_size) != expected_size:
+            raise RuntimeError(f"OpenMVS CUDA evidence changed for {scene_name}/{stage_name}")
+        if stage_name == "refine_mesh":
+            if row.get("cuda_fallback_fail_closed") is not True:
+                raise RuntimeError(f"RefineMesh CUDA fallback is not fail-closed for {scene_name}")
+            log_text = log_path.read_text(encoding="utf-8", errors="replace")
+            if OPENMVS_REFINE_CUDA_FAIL_CLOSED_MARKER not in log_text:
+                raise RuntimeError(f"RefineMesh fail-closed completion marker is missing for {scene_name}")
+    mesh_path = Path(str(build.get("reference_mesh_path", "")))
+    if not mesh_path.is_file() or mesh_path.stat().st_size <= 0:
+        raise FileNotFoundError(f"OpenMVS reference mesh is missing or empty for {scene_name}: {mesh_path}")
+    if (
+        str(build.get("reference_mesh_sha256", "")) != _sha256_file(mesh_path)
+        or int(build.get("reference_mesh_size_bytes", -1)) != int(mesh_path.stat().st_size)
+    ):
+        raise RuntimeError(f"OpenMVS reference mesh identity changed for {scene_name}: {mesh_path}")
+    dense_path = Path(str(build.get("reference_dense_ply", "")))
+    if (
+        not dense_path.is_file()
+        or str(build.get("reference_dense_ply_sha256", "")) != _sha256_file(dense_path)
+        or int(build.get("reference_dense_ply_size_bytes", -1)) != int(dense_path.stat().st_size)
+    ):
+        raise RuntimeError(f"OpenMVS dense reference identity changed for {scene_name}: {dense_path}")
+    plan_path = Path(str(build.get("openmvs_command_plan", "")))
+    if not plan_path.is_file():
+        raise FileNotFoundError(f"OpenMVS command plan is missing for {scene_name}: {plan_path}")
+    if str(build.get("openmvs_command_plan_sha256", "")) != _sha256_file(plan_path):
+        raise RuntimeError(f"OpenMVS command plan identity changed for {scene_name}: {plan_path}")
+    receipt_rows = build.get("openmvs_stage_receipts", {})
+    required_receipts = {"interface_colmap", "densify_point_cloud", "reconstruct_mesh"}
+    if bool(overrides.get("openmvs_refine_mesh", False)):
+        required_receipts.add("refine_mesh")
+    if not isinstance(receipt_rows, dict) or not required_receipts.issubset(set(receipt_rows)):
+        raise RuntimeError(f"OpenMVS stage receipts are incomplete for {scene_name}")
+    for stage_name, row in receipt_rows.items():
+        receipt_path = Path(str(row.get("path", "")))
+        if (
+            not receipt_path.is_file()
+            or str(row.get("sha256", "")) != _sha256_file(receipt_path)
+            or int(row.get("size_bytes", -1)) != int(receipt_path.stat().st_size)
+        ):
+            raise RuntimeError(f"OpenMVS stage receipt changed for {scene_name}/{stage_name}")
+    reference = _load_json(reference_path)
+    if str(reference.get("reference_construction_protocol", "")) != "openmvs-reference-mesh-v1":
+        raise RuntimeError(f"Reference-depth manifest is not OpenMVS-backed for {scene_name}")
+    if not _same_resolved_path(reference.get("reference_mesh_path", ""), mesh_path):
+        raise RuntimeError(f"Reference-depth/build manifests disagree on the mesh for {scene_name}")
+    if str(reference.get("reference_mesh_sha256", "")) != str(build.get("reference_mesh_sha256", "")):
+        raise RuntimeError(f"Reference-depth/build manifests disagree on mesh SHA for {scene_name}")
+    for view in reference.get("views", []):
+        view_path = reference_root / str(view.get("npz_file", ""))
+        if (
+            not view_path.is_file()
+            or str(view.get("npz_sha256", "")) != _sha256_file(view_path)
+            or int(view.get("npz_size_bytes", -1)) != int(view_path.stat().st_size)
+        ):
+            raise RuntimeError(f"Reference view identity changed for {scene_name}: {view_path}")
+    return reference_path.resolve()
+
+
+def _same_resolved_path(left: str | Path, right: str | Path) -> bool:
+    return str(Path(left).resolve()).replace("\\", "/").casefold() == str(Path(right).resolve()).replace("\\", "/").casefold()
+
+
+def _collect_metrics(
+    scene_roots: Dict[str, Path],
+    reference_manifests: Dict[str, Path],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     threshold_rows: List[Dict] = []
     secondary_rows: List[Dict] = []
 
@@ -127,6 +295,60 @@ def _collect_metrics(scene_roots: Dict[str, Path]) -> tuple[pd.DataFrame, pd.Dat
             if not metrics_path.exists():
                 raise FileNotFoundError(f"Missing metrics_summary.json: {metrics_path}")
             payload = _load_json(metrics_path)
+            if str(payload.get("scene_name", "")) != scene_name:
+                raise RuntimeError(f"Metric scene mismatch: {metrics_path}")
+            if str(payload.get("method_name", "")) != method_name:
+                raise RuntimeError(f"Metric method mismatch: {metrics_path}")
+            if str(payload.get("protocol_name", "")) != "reference-depth-based-geometric-evaluation-v1":
+                raise RuntimeError(f"Metric protocol mismatch: {metrics_path}")
+            _assert_producer_identity(
+                payload.get("producer_identity"),
+                script_path=TOOL_DIR / "evaluate_depth_reference.py",
+                label=f"metrics {scene_name}/{method_name}",
+            )
+            model_manifest_path = scene_root / method_name / "bundle" / "split_manifest.json"
+            model_manifest_payload = _load_json(model_manifest_path)
+            _assert_producer_identity(
+                model_manifest_payload.get("producer_identity"),
+                script_path=TOOL_DIR / "export_gaussian_probe_bundle.py",
+                label=f"model bundle {scene_name}/{method_name}",
+            )
+            expected_inputs = (
+                (
+                    "reference_manifest",
+                    "reference_manifest_sha256",
+                    reference_manifests[scene_name],
+                ),
+                (
+                    "model_manifest",
+                    "model_manifest_sha256",
+                    model_manifest_path,
+                ),
+                (
+                    "adapter_manifest",
+                    "adapter_manifest_sha256",
+                    scene_root / method_name / "depth_adapter_manifest.json",
+                ),
+            )
+            for path_field, sha_field, expected_path in expected_inputs:
+                expected_path = expected_path.resolve()
+                if not expected_path.is_file():
+                    raise FileNotFoundError(
+                        f"Current {path_field} is missing for {scene_name}/{method_name}: {expected_path}"
+                    )
+                actual_path = str(payload.get(path_field, ""))
+                if not actual_path or not _same_resolved_path(actual_path, expected_path):
+                    raise RuntimeError(
+                        f"Metrics were not produced from the current {path_field}: "
+                        f"{metrics_path} -> {actual_path!r}"
+                    )
+                if str(payload.get(sha_field, "")).lower() != _sha256_file(expected_path):
+                    raise RuntimeError(
+                        f"Metrics {sha_field} does not match the current input for "
+                        f"{scene_name}/{method_name}: {metrics_path}"
+                    )
+            if payload.get("evaluation_options", {}).get("enable_agreement_metrics") is not True:
+                raise RuntimeError(f"Agreement metrics are not enabled in {metrics_path}")
             counts = payload["counts"]
             secondary = payload["secondary_metrics"]
             secondary_row = {
@@ -381,13 +603,38 @@ def _copy_scene_artifacts(scene_name: str, scene_root: Path, dst_root: Path) -> 
         if summary_file.is_file():
             _copy_file(summary_file, target_scene_root / "summary" / summary_file.name)
 
+    reference_root = scene_root / "reference_openmvs_v1"
     for reference_file in [
-        scene_root / "reference" / "reference_depth_manifest.json",
-        scene_root / "reference" / "probe_camera_manifest.json",
-        scene_root / "reference" / "reference_roi.json",
+        reference_root / "reference_depth_manifest.json",
+        reference_root / "reference_build_manifest.json",
+        reference_root / "probe_camera_manifest.json",
+        reference_root / "reference_roi.json",
+        reference_root / "openmvs_command_plan.json",
+        reference_root / "openmvs_cuda_evidence.json",
     ]:
         if reference_file.exists():
-            _copy_file(reference_file, target_scene_root / "reference" / reference_file.name)
+            _copy_file(reference_file, target_scene_root / "reference_openmvs_v1" / reference_file.name)
+    build_manifest_path = reference_root / "reference_build_manifest.json"
+    if build_manifest_path.is_file():
+        build_manifest = _load_json(build_manifest_path)
+        stages = build_manifest.get("openmvs_cuda_evidence", {}).get("stages", {})
+        for stage_name, row in stages.items():
+            source_log = Path(str(row.get("log_path", "")))
+            expected_sha = str(row.get("log_sha256", ""))
+            expected_size = int(row.get("log_size_bytes", -1))
+            if (
+                not source_log.is_file()
+                or _sha256_file(source_log) != expected_sha
+                or int(source_log.stat().st_size) != expected_size
+            ):
+                raise RuntimeError(f"Cannot package verified CUDA log for {scene_name}/{stage_name}")
+            _copy_file(
+                source_log,
+                target_scene_root
+                / "reference_openmvs_v1"
+                / "openmvs_cuda_logs"
+                / f"{stage_name}.log",
+            )
 
     for method_name in METHOD_ORDER:
         method_root = scene_root / method_name
@@ -438,6 +685,7 @@ def _copy_root_artifacts(building_root: Path, formal4_root: Path, dst_root: Path
 def _copy_code_snapshot(repo_root: Path, dst_root: Path) -> None:
     file_list = [
         repo_root / "tools" / "geometric_repeatability" / "build_depth_reference.py",
+        repo_root / "tools" / "geometric_repeatability" / "openmvs_backend_sanity.py",
         repo_root / "tools" / "geometric_repeatability" / "evaluate_depth_reference.py",
         repo_root / "tools" / "geometric_repeatability" / "summarize_depth_reference_methods.py",
         repo_root / "tools" / "geometric_repeatability" / "depth_reference_common.py",
@@ -509,13 +757,13 @@ Reference-valid pixels are the denominator for the main rates:
 The reference is built from training-side RGB data only:
 
 1. Use the strict protocol manifest for each scene.
-2. Use the training-union RGB views to define the shared frame and dense stereo
-   workspace.
-3. Run COLMAP dense stereo and fusion.
-4. Build a reference mesh:
-   - try `delaunay_mesher` first
-   - fall back to `poisson_mesher` if Delaunay is unavailable or fails
-5. Render held-out probe-view reference depths from that mesh.
+2. Use the aligned training-union RGB COLMAP model to define the shared frame.
+3. Import that model with OpenMVS `InterfaceCOLMAP` using `normalize=0`.
+4. Run OpenMVS `DensifyPointCloud`, `ReconstructMesh`, and `RefineMesh`.
+5. Render held-out probe-view reference depths from the refined OpenMVS mesh.
+
+COLMAP MVS and COLMAP meshers are not fallback backends. `TextureMesh` is not
+needed because the evaluator consumes geometry rather than mesh texture.
 
 ### ROI construction
 
@@ -843,7 +1091,14 @@ def main() -> None:
 
     _ensure_clean_dir(out_root)
     scene_roots = _collect_scene_roots(building_root=building_root, formal4_root=formal4_root)
-    threshold_df, secondary_df = _collect_metrics(scene_roots=scene_roots)
+    reference_manifests = {
+        scene_name: _validate_openmvs_reference(scene_name, scene_root)
+        for scene_name, scene_root in scene_roots.items()
+    }
+    threshold_df, secondary_df = _collect_metrics(
+        scene_roots=scene_roots,
+        reference_manifests=reference_manifests,
+    )
     macro_threshold_df = _macro_average_thresholds(threshold_df=threshold_df)
     macro_secondary_df = _macro_average_secondary(secondary_df=secondary_df)
     rankings = _make_rankings(

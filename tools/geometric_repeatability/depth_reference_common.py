@@ -4,7 +4,6 @@ import contextlib
 import io
 import json
 import math
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
@@ -17,10 +16,6 @@ from scipy.ndimage import maximum_filter
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-
-from scene.dataset_readers import readColmapSceneInfo
-from utils.graphics_utils import fov2focal, getWorld2View2
-
 
 def save_json(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -56,6 +51,8 @@ def compute_scaled_resolution(orig_w: int, orig_h: int, resolution_arg: int) -> 
 
 
 def _camera_to_world_from_caminfo(cam_info) -> np.ndarray:
+    from utils.graphics_utils import getWorld2View2
+
     w2c = getWorld2View2(cam_info.R, cam_info.T, np.array([0.0, 0.0, 0.0], dtype=np.float64), 1.0).astype(np.float64)
     return np.linalg.inv(w2c)
 
@@ -69,6 +66,11 @@ def build_probe_view_manifest(
     test_list: Path,
     scene_name: str,
 ) -> Dict[str, Any]:
+    # Keep heavy training/runtime imports lazy so --help and --dry_run do not
+    # require compiled Gaussian-splatting CUDA extensions.
+    from scene.dataset_readers import readColmapSceneInfo
+    from utils.graphics_utils import fov2focal
+
     # The repo reader prints per-camera progress; suppress it so long dense runs can
     # safely continue even when stdout is redirected or detached.
     with contextlib.redirect_stdout(io.StringIO()):
@@ -442,13 +444,6 @@ def relative_or_abs(path: Path, root: Path) -> str:
         return str(path.resolve().relative_to(root.resolve())).replace("\\", "/")
     except Exception:
         return str(path.resolve())
-
-
-def run_colmap(colmap_exe: str, args: Sequence[str], cwd: Path | None = None) -> None:
-    cmd = [str(colmap_exe)] + [str(x) for x in args]
-    completed = subprocess.run(cmd, cwd=str(cwd) if cwd is not None else None, check=False)
-    if completed.returncode != 0:
-        raise RuntimeError(f"COLMAP command failed with exit code {completed.returncode}: {' '.join(cmd)}")
 
 
 def write_simple_csv(path: Path, header: Sequence[str], rows: Iterable[Sequence[Any]]) -> None:

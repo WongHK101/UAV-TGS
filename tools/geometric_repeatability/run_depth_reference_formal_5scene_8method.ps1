@@ -4,14 +4,17 @@ param(
     [Parameter(Mandatory = $true)][string]$InventoryCsv,
     [Parameter(Mandatory = $true)][string]$GeoRoot,
     [Parameter(Mandatory = $true)][string]$OutRoot,
-    [string]$ColmapCmd = "colmap",
+    [string]$OpenMvsInterfaceColmapCmd = "InterfaceCOLMAP",
+    [string]$OpenMvsDensifyCmd = "DensifyPointCloud",
+    [string]$OpenMvsReconstructMeshCmd = "ReconstructMesh",
+    [string]$OpenMvsRefineMeshCmd = "RefineMesh",
+    [int]$OpenMvsCudaDevice = 0,
     [string[]]$Scenes = @("Building", "PVpanel", "Orchard", "Road", "TransmissionTower"),
     [string]$ThresholdsM = "0.10,0.25,0.50,1.00,2.00,5.00,10.00,20.00,30.00",
     [int]$ResolutionArg = 4,
     [double]$RankThresholdM = 1.00,
     [switch]$EnableAgreementMetrics,
-    [switch]$EnableReferenceMeshHoleFix,
-    [switch]$UseProbeManifestNativeAlign
+    [switch]$UseProbeManifestNativeAlign = $true
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,6 +29,21 @@ function Assert-Exists {
     }
 }
 
+function Resolve-Executable {
+    param(
+        [Parameter(Mandatory = $true)][string]$CommandValue,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+    if (Test-Path -LiteralPath $CommandValue -PathType Leaf) {
+        return (Resolve-Path -LiteralPath $CommandValue).Path
+    }
+    $resolved = Get-Command $CommandValue -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $resolved) {
+        throw "$Label not found: $CommandValue"
+    }
+    return [string]$resolved.Source
+}
+
 function Write-JsonUtf8 {
     param(
         [Parameter(Mandatory = $true)]$Object,
@@ -35,7 +53,12 @@ function Write-JsonUtf8 {
     if ($parent) {
         New-Item -ItemType Directory -Force -Path $parent | Out-Null
     }
-    $Object | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $PathValue -Encoding UTF8
+    $json = $Object | ConvertTo-Json -Depth 10
+    [System.IO.File]::WriteAllText(
+        $PathValue,
+        $json + [Environment]::NewLine,
+        (New-Object System.Text.UTF8Encoding($false))
+    )
 }
 
 function Ensure-PointCloudJunction {
@@ -91,6 +114,13 @@ function Normalize-PathForCompare {
     catch {
         return ([string]$PathValue).TrimEnd("\").ToLowerInvariant()
     }
+}
+
+function Get-FileSha256Lower {
+    param(
+        [Parameter(Mandatory = $true)][string]$PathValue
+    )
+    return ([string](Get-FileHash -LiteralPath $PathValue -Algorithm SHA256).Hash).ToLowerInvariant()
 }
 
 function Get-NativeCamerasJson {
@@ -180,6 +210,14 @@ function Test-BundleManifestMatches {
     param(
         [Parameter(Mandatory = $true)][string]$ManifestPath,
         [Parameter(Mandatory = $true)][int]$ExpectedResolutionArg,
+        [Parameter(Mandatory = $true)][string]$ExpectedModelPath,
+        [Parameter(Mandatory = $true)][string]$ExpectedSourcePath,
+        [Parameter(Mandatory = $true)][int]$ExpectedIteration,
+        [Parameter(Mandatory = $true)][string]$ExpectedTrainList,
+        [Parameter(Mandatory = $true)][string]$ExpectedTestList,
+        [Parameter(Mandatory = $true)][string]$ExpectedRepoCommit,
+        [Parameter(Mandatory = $true)][string]$ExpectedExporterPath,
+        [Parameter(Mandatory = $true)][string]$ExpectedExporterSha256,
         [string]$ExpectedCameraFrameMode = "scene_test",
         [string]$ExpectedProbeCameraManifest = "",
         [string]$ExpectedNativeCamerasJson = ""
@@ -196,10 +234,60 @@ function Test-BundleManifestMatches {
         if ([int]$actualResolution -ne [int]$ExpectedResolutionArg) {
             return $false
         }
-        if ($ExpectedCameraFrameMode -eq "probe_manifest_native_align") {
-            if ([string]$manifest.camera_frame_mode -ne $ExpectedCameraFrameMode) {
+        $producer = $manifest.producer_identity
+        if (
+            (Normalize-PathForCompare $producer.script_path) -ne (Normalize-PathForCompare $ExpectedExporterPath) -or
+            [string]$producer.script_sha256 -ne $ExpectedExporterSha256 -or
+            [string]$producer.git_commit -ne $ExpectedRepoCommit -or
+            [bool]$producer.git_dirty -or
+            -not [string]::IsNullOrWhiteSpace([string]$producer.git_error)
+        ) {
+            return $false
+        }
+        if ((Normalize-PathForCompare $manifest.model_path) -ne (Normalize-PathForCompare $ExpectedModelPath)) {
+            return $false
+        }
+        if ((Normalize-PathForCompare $manifest.source_path) -ne (Normalize-PathForCompare $ExpectedSourcePath)) {
+            return $false
+        }
+        if ([int]$manifest.iteration -ne [int]$ExpectedIteration) {
+            return $false
+        }
+        foreach ($pair in @(
+            @($manifest.train_list, $ExpectedTrainList),
+            @($manifest.test_list, $ExpectedTestList)
+        )) {
+            if ((Normalize-PathForCompare $pair[0].path) -ne (Normalize-PathForCompare $pair[1])) {
                 return $false
             }
+            if ([string]$pair[0].sha256 -ne (Get-FileSha256Lower $pair[1])) {
+                return $false
+            }
+        }
+        $expectedPointCloud = Join-Path $ExpectedModelPath "point_cloud\iteration_$ExpectedIteration\point_cloud.ply"
+        if (-not (Test-Path -LiteralPath $expectedPointCloud -PathType Leaf)) {
+            return $false
+        }
+        if ((Normalize-PathForCompare $manifest.model_point_cloud.path) -ne (Normalize-PathForCompare $expectedPointCloud)) {
+            return $false
+        }
+        if ([string]$manifest.model_point_cloud.sha256 -ne (Get-FileSha256Lower $expectedPointCloud)) {
+            return $false
+        }
+        $manifestRoot = Split-Path -Parent $ManifestPath
+        foreach ($view in @($manifest.views)) {
+            $viewPath = Join-Path $manifestRoot ([string]$view.npz_file)
+            if (-not (Test-Path -LiteralPath $viewPath -PathType Leaf)) {
+                return $false
+            }
+            if ([string]$view.npz_sha256 -ne (Get-FileSha256Lower $viewPath)) {
+                return $false
+            }
+        }
+        if ([string]$manifest.camera_frame_mode -ne $ExpectedCameraFrameMode) {
+            return $false
+        }
+        if ($ExpectedCameraFrameMode -eq "probe_manifest_native_align") {
             if ($null -eq $manifest.strict_to_native_alignment) {
                 return $false
             }
@@ -213,6 +301,12 @@ function Test-BundleManifestMatches {
                 return $false
             }
             if ((Normalize-PathForCompare $manifest.native_cameras_json) -ne (Normalize-PathForCompare $ExpectedNativeCamerasJson)) {
+                return $false
+            }
+            if ([string]$manifest.probe_camera_manifest_identity.sha256 -ne (Get-FileSha256Lower $ExpectedProbeCameraManifest)) {
+                return $false
+            }
+            if ([string]$manifest.native_cameras_json_identity.sha256 -ne (Get-FileSha256Lower $ExpectedNativeCamerasJson)) {
                 return $false
             }
             $views = @($manifest.views)
@@ -230,10 +324,99 @@ function Test-BundleManifestMatches {
     }
 }
 
+function Test-MetricsManifestMatches {
+    param(
+        [Parameter(Mandatory = $true)][string]$ManifestPath,
+        [Parameter(Mandatory = $true)][string]$ExpectedSceneName,
+        [Parameter(Mandatory = $true)][string]$ExpectedMethodName,
+        [Parameter(Mandatory = $true)][string]$ExpectedReferenceManifest,
+        [Parameter(Mandatory = $true)][string]$ExpectedModelManifest,
+        [Parameter(Mandatory = $true)][string]$ExpectedAdapterManifest,
+        [Parameter(Mandatory = $true)][string]$ExpectedRepoCommit,
+        [Parameter(Mandatory = $true)][string]$ExpectedEvaluatorPath,
+        [Parameter(Mandatory = $true)][string]$ExpectedEvaluatorSha256,
+        [Parameter(Mandatory = $true)][bool]$ExpectedAgreementMetrics
+    )
+    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+        return $false
+    }
+    try {
+        foreach ($required in @($ExpectedReferenceManifest, $ExpectedModelManifest, $ExpectedAdapterManifest)) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+                return $false
+            }
+        }
+        $metrics = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
+        if ([string]$metrics.protocol_name -ne "reference-depth-based-geometric-evaluation-v1") {
+            return $false
+        }
+        if ([string]$metrics.scene_name -ne $ExpectedSceneName -or [string]$metrics.method_name -ne $ExpectedMethodName) {
+            return $false
+        }
+        $producer = $metrics.producer_identity
+        if (
+            (Normalize-PathForCompare $producer.script_path) -ne (Normalize-PathForCompare $ExpectedEvaluatorPath) -or
+            [string]$producer.script_sha256 -ne $ExpectedEvaluatorSha256 -or
+            [string]$producer.git_commit -ne $ExpectedRepoCommit -or
+            [bool]$producer.git_dirty -or
+            -not [string]::IsNullOrWhiteSpace([string]$producer.git_error)
+        ) {
+            return $false
+        }
+        foreach ($pair in @(
+            @([string]$metrics.reference_manifest, $ExpectedReferenceManifest, [string]$metrics.reference_manifest_sha256),
+            @([string]$metrics.model_manifest, $ExpectedModelManifest, [string]$metrics.model_manifest_sha256),
+            @([string]$metrics.adapter_manifest, $ExpectedAdapterManifest, [string]$metrics.adapter_manifest_sha256)
+        )) {
+            if ((Normalize-PathForCompare $pair[0]) -ne (Normalize-PathForCompare $pair[1])) {
+                return $false
+            }
+            if ([string]::IsNullOrWhiteSpace($pair[2]) -or $pair[2].ToLowerInvariant() -ne (Get-FileSha256Lower $pair[1])) {
+                return $false
+            }
+        }
+        if ([bool]$metrics.evaluation_options.enable_agreement_metrics -ne $ExpectedAgreementMetrics) {
+            return $false
+        }
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
 Assert-Exists -PathValue $RepoRoot -Label "Repo root"
-Assert-Exists -PathValue $PythonExe -Label "FGS python"
 Assert-Exists -PathValue $InventoryCsv -Label "Inventory CSV"
-Assert-Exists -PathValue $ColmapCmd -Label "COLMAP command"
+$GitExe = Resolve-Executable -CommandValue "git" -Label "Git executable"
+$gitCommitOutput = @(& $GitExe -C $RepoRoot rev-parse HEAD 2>&1)
+if ($LASTEXITCODE -ne 0 -or $gitCommitOutput.Count -ne 1) {
+    throw "Cannot resolve a single Git commit for formal depth evaluation: $($gitCommitOutput -join ' ')"
+}
+$CoreGitCommit = ([string]$gitCommitOutput[0]).Trim()
+if ($CoreGitCommit -notmatch '^[0-9a-fA-F]{40}$') {
+    throw "Invalid Git commit for formal depth evaluation: $CoreGitCommit"
+}
+$gitStatusOutput = @(& $GitExe -C $RepoRoot status --porcelain=v1 --untracked-files=all 2>&1)
+if ($LASTEXITCODE -ne 0) {
+    throw "Cannot inspect Git worktree for formal depth evaluation: $($gitStatusOutput -join ' ')"
+}
+if ($gitStatusOutput.Count -ne 0) {
+    throw "Formal depth evaluation requires a clean Git worktree; dirty entries: $($gitStatusOutput -join ' | ')"
+}
+$ExporterPath = Join-Path $RepoRoot "tools\geometric_repeatability\export_gaussian_probe_bundle.py"
+$EvaluatorPath = Join-Path $RepoRoot "tools\geometric_repeatability\evaluate_depth_reference.py"
+Assert-Exists -PathValue $ExporterPath -Label "Probe-bundle exporter"
+Assert-Exists -PathValue $EvaluatorPath -Label "Depth evaluator"
+$ExporterSha256 = Get-FileSha256Lower $ExporterPath
+$EvaluatorSha256 = Get-FileSha256Lower $EvaluatorPath
+if ($OpenMvsCudaDevice -lt 0) {
+    throw "OpenMvsCudaDevice must be an explicit non-negative CUDA device index"
+}
+$PythonExe = Resolve-Executable -CommandValue $PythonExe -Label "FGS python"
+$OpenMvsInterfaceColmapExe = Resolve-Executable -CommandValue $OpenMvsInterfaceColmapCmd -Label "OpenMVS InterfaceCOLMAP command"
+$OpenMvsDensifyExe = Resolve-Executable -CommandValue $OpenMvsDensifyCmd -Label "OpenMVS DensifyPointCloud command"
+$OpenMvsReconstructMeshExe = Resolve-Executable -CommandValue $OpenMvsReconstructMeshCmd -Label "OpenMVS ReconstructMesh command"
+$OpenMvsRefineMeshExe = Resolve-Executable -CommandValue $OpenMvsRefineMeshCmd -Label "OpenMVS RefineMesh command"
 
 New-Item -ItemType Directory -Force -Path $OutRoot | Out-Null
 $TranscriptPath = Join-Path $OutRoot "run_transcript.txt"
@@ -241,13 +424,25 @@ $script:BatchStatusPath = Join-Path $OutRoot "status.json"
 Start-Transcript -Path $TranscriptPath -Append -Force | Out-Null
 Write-JsonUtf8 -Object ([ordered]@{
     enable_agreement_metrics = [bool]$EnableAgreementMetrics
-    enable_reference_mesh_hole_fix = [bool]$EnableReferenceMeshHoleFix
     use_probe_manifest_native_align = [bool]$UseProbeManifestNativeAlign
-    reference_mvs_max_image_size = 2000
-    reference_patch_match_auto_source_count = 30
-    reference_poisson_depth = 12
-    reference_poisson_trim = 6
-    reference_poisson_point_weight = 6
+    reference_geometry_backend = "openmvs"
+    openmvs_archive_type = -1
+    openmvs_cuda_device = $OpenMvsCudaDevice
+    openmvs_cuda_log_evidence_required = $true
+    openmvs_resolution_level = 1
+    openmvs_max_resolution = 2000
+    openmvs_min_resolution = 640
+    openmvs_number_views = 8
+    openmvs_number_views_fuse = 3
+    openmvs_iterations = 4
+    openmvs_refine_mesh = $true
+    openmvs_refine_cuda_fail_closed_required = $true
+    colmap_mvs_fallback_allowed = $false
+    core_git_commit = $CoreGitCommit
+    exporter_path = $ExporterPath
+    exporter_sha256 = $ExporterSha256
+    evaluator_path = $EvaluatorPath
+    evaluator_sha256 = $EvaluatorSha256
 }) -PathValue (Join-Path $OutRoot "depth_reference_runtime_flags.json")
 
 $script:BatchStatus = [ordered]@{
@@ -260,14 +455,24 @@ $script:BatchStatus = [ordered]@{
     resolution_arg = $ResolutionArg
     rank_threshold_m = $RankThresholdM
     enable_agreement_metrics = [bool]$EnableAgreementMetrics
-    enable_reference_mesh_hole_fix = [bool]$EnableReferenceMeshHoleFix
     use_probe_manifest_native_align = [bool]$UseProbeManifestNativeAlign
-    reference_mvs_max_image_size = 2000
-    reference_patch_match_auto_source_count = 30
-    reference_poisson_depth = 12
-    reference_poisson_trim = 6
-    reference_poisson_point_weight = 6
+    reference_geometry_backend = "openmvs"
+    openmvs_archive_type = -1
+    openmvs_cuda_device = $OpenMvsCudaDevice
+    openmvs_cuda_log_evidence_required = $true
+    openmvs_resolution_level = 1
+    openmvs_max_resolution = 2000
+    openmvs_min_resolution = 640
+    openmvs_number_views = 8
+    openmvs_number_views_fuse = 3
+    openmvs_iterations = 4
+    openmvs_refine_mesh = $true
+    openmvs_refine_cuda_fail_closed_required = $true
+    colmap_mvs_fallback_allowed = $false
     repo_root = $RepoRoot
+    core_git_commit = $CoreGitCommit
+    exporter_sha256 = $ExporterSha256
+    evaluator_sha256 = $EvaluatorSha256
     inventory_csv = $InventoryCsv
     out_root = $OutRoot
     started_at = (Get-Date).ToString("s")
@@ -288,23 +493,32 @@ try {
         protocol = "reference-depth-based-geometric-evaluation-v1"
         thresholds_m = $ThresholdsM
         resolution_arg = $ResolutionArg
+        core_git_commit = $CoreGitCommit
+        exporter_path = $ExporterPath
+        exporter_sha256 = $ExporterSha256
+        evaluator_path = $EvaluatorPath
+        evaluator_sha256 = $EvaluatorSha256
         rank_threshold_m = $RankThresholdM
         use_probe_manifest_native_align = [bool]$UseProbeManifestNativeAlign
         reference_parameters = [ordered]@{
-            patch_match_max_image_size = 2000
-            patch_match_auto_source_count = 30
-            patch_match_geom_consistency = 1
-            patch_match_filter = 1
-            patch_match_window_radius = 7
-            patch_match_num_iterations = 7
-            stereo_fusion_min_num_pixels = 3
-            stereo_fusion_max_reproj_error = 2.0
-            stereo_fusion_max_depth_error = 0.02
-            stereo_fusion_max_normal_error = 12.0
-            mesh_backend_preference = "poisson"
-            poisson_depth = 12
-            poisson_trim = 6
-            poisson_point_weight = 6
+            reference_geometry_backend = "openmvs"
+            archive_type = -1
+            interface_colmap_normalize = $false
+            cuda_device = $OpenMvsCudaDevice
+            cuda_log_evidence_required = $true
+            resolution_level = 1
+            max_resolution = 2000
+            min_resolution = 640
+            number_views = 8
+            number_views_fuse = 3
+            iterations = 4
+            estimate_roi = $false
+            crop_to_roi = $false
+            refine_mesh = $true
+            refine_resolution_level = 1
+            refine_scales = 2
+            texture_mesh_used = $false
+            colmap_mvs_fallback_allowed = $false
         }
         scenes = @()
     }
@@ -328,57 +542,41 @@ try {
         }
 
         $sceneOutDir = Join-Path $OutRoot $sceneName
-        $referenceOutDir = Join-Path $sceneOutDir "reference"
+        # Keep OpenMVS references isolated from any earlier COLMAP-MVS artifacts.
+        $referenceOutDir = Join-Path $sceneOutDir "reference_openmvs_v1"
         New-Item -ItemType Directory -Force -Path $sceneOutDir | Out-Null
 
         $referenceManifest = Join-Path $referenceOutDir "reference_depth_manifest.json"
         $probeCameraManifest = Join-Path $referenceOutDir "probe_camera_manifest.json"
-        if (-not (Test-Path -LiteralPath $referenceManifest)) {
-            Update-BatchStatus -Stage "build_reference" -SceneName $sceneName -Note "$sceneName training-only reference depth artifacts"
-            $referenceArgs = @(
-                (Join-Path $RepoRoot "tools\geometric_repeatability\build_depth_reference.py"),
-                "--strict_protocol_manifest", $strictManifestPath,
-                "--out_dir", $referenceOutDir,
-                "--colmap_cmd", $ColmapCmd,
-                "--resolution_arg", ([string]$ResolutionArg),
-                "--thresholds_m", $ThresholdsM,
-                "--support_min_count", "1",
-                "--support_radius_px", "1",
-                "--support_depth_tolerance_m", "0.10",
-                "--patch_match_max_image_size", "2000",
-                "--patch_match_auto_source_count", "30",
-                "--patch_match_window_radius", "7",
-                "--patch_match_num_iterations", "7",
-                "--patch_match_geom_consistency", "1",
-                "--patch_match_filter", "1",
-                "--stereo_fusion_min_num_pixels", "3",
-                "--stereo_fusion_max_reproj_error", "2.0",
-                "--stereo_fusion_max_depth_error", "0.02",
-                "--stereo_fusion_max_normal_error", "12.0",
-                "--mesh_backend_preference", "poisson",
-                "--poisson_depth", "12",
-                "--poisson_trim", "6",
-                "--poisson_point_weight", "6"
-            )
-            if ($EnableReferenceMeshHoleFix) {
-                $referenceArgs += @(
-                    "--mesh_backend_preference", "poisson",
-                    "--poisson_depth", "12",
-                    "--poisson_trim", "6",
-                    "--poisson_point_weight", "6",
-                    "--stereo_fusion_min_num_pixels", "3",
-                    "--stereo_fusion_max_depth_error", "0.02",
-                    "--stereo_fusion_max_reproj_error", "2.0",
-                    "--stereo_fusion_max_normal_error", "12.0",
-                    "--patch_match_window_radius", "7",
-                    "--patch_match_num_iterations", "7",
-                    "--patch_match_geom_consistency", "1",
-                    "--patch_match_filter", "1",
-                    "--patch_match_auto_source_count", "30"
-                )
-            }
-            Invoke-PythonChecked -ArgsList $referenceArgs -FailureMessage "Reference build failed for $sceneName"
-        }
+        # Always enter the builder, even on resume. It validates the current
+        # training partition, source fingerprint, executable hashes, frozen
+        # command plan, cached CUDA evidence, and required OpenMVS artifacts
+        # before reusing any result. Merely seeing a manifest is not enough.
+        Update-BatchStatus -Stage "build_reference" -SceneName $sceneName -Note "$sceneName validate/resume training-only OpenMVS reference"
+        $referenceArgs = @(
+            (Join-Path $RepoRoot "tools\geometric_repeatability\build_depth_reference.py"),
+            "--strict_protocol_manifest", $strictManifestPath,
+            "--out_dir", $referenceOutDir,
+            "--openmvs_interface_colmap_cmd", $OpenMvsInterfaceColmapExe,
+            "--openmvs_densify_cmd", $OpenMvsDensifyExe,
+            "--openmvs_reconstruct_mesh_cmd", $OpenMvsReconstructMeshExe,
+            "--openmvs_refine_mesh_cmd", $OpenMvsRefineMeshExe,
+            "--openmvs_cuda_device", ([string]$OpenMvsCudaDevice),
+            "--openmvs_resolution_level", "1",
+            "--openmvs_max_resolution", "2000",
+            "--openmvs_min_resolution", "640",
+            "--openmvs_number_views", "8",
+            "--openmvs_number_views_fuse", "3",
+            "--openmvs_iterations", "4",
+            "--openmvs_refine_resolution_level", "1",
+            "--openmvs_refine_scales", "2",
+            "--resolution_arg", ([string]$ResolutionArg),
+            "--thresholds_m", $ThresholdsM,
+            "--support_min_count", "1",
+            "--support_radius_px", "1",
+            "--support_depth_tolerance_m", "0.10"
+        )
+        Invoke-PythonChecked -ArgsList $referenceArgs -FailureMessage "Reference build failed for $sceneName"
         Assert-Exists -PathValue $referenceManifest -Label "Reference depth manifest for $sceneName"
         if ($UseProbeManifestNativeAlign) {
             Assert-Exists -PathValue $probeCameraManifest -Label "Probe camera manifest for $sceneName"
@@ -416,23 +614,24 @@ try {
             New-Item -ItemType Directory -Force -Path $methodOutDir | Out-Null
             New-Item -ItemType Directory -Force -Path $evalOutDir | Out-Null
 
-            if (-not (Test-Path -LiteralPath $adapterPath)) {
-                $adapterPayload = [ordered]@{
-                    protocol_name = "reference-depth-based-geometric-evaluation-v1"
-                    method_name = $methodOutName
-                    model_path = $modelPath
-                    source_path = $strictThermalRoot
-                    iteration = $iteration
-                    depth_semantics = "inverse_camera_z_from_renderer"
-                    validity_rule = [ordered]@{
-                        mode = "opacity_threshold"
-                        opacity_threshold = 0.5
-                        depth_min = 1e-6
-                    }
-                    notes = "Frozen v1 adapter for formal 5-scene 8-method batch"
+            # Rebuild this deterministic manifest on every pass so a resumed
+            # evaluation cannot retain an adapter that names an older model,
+            # source tree, or iteration. Metrics reuse is bound to its SHA.
+            $adapterPayload = [ordered]@{
+                protocol_name = "reference-depth-based-geometric-evaluation-v1"
+                method_name = $methodOutName
+                model_path = $modelPath
+                source_path = $strictThermalRoot
+                iteration = $iteration
+                depth_semantics = "inverse_camera_z_from_renderer"
+                validity_rule = [ordered]@{
+                    mode = "opacity_threshold"
+                    opacity_threshold = 0.5
+                    depth_min = 1e-6
                 }
-                Write-JsonUtf8 -Object $adapterPayload -PathValue $adapterPath
+                notes = "Frozen v1 adapter for formal 5-scene 8-method batch"
             }
+            Write-JsonUtf8 -Object $adapterPayload -PathValue $adapterPath
 
             if ($UseProbeManifestNativeAlign) {
                 $expectedCameraFrameMode = "probe_manifest_native_align"
@@ -443,7 +642,20 @@ try {
 
             $bundleManifest = Join-Path $bundleOutDir "split_manifest.json"
             $bundleWasExported = $false
-            if (-not (Test-BundleManifestMatches -ManifestPath $bundleManifest -ExpectedResolutionArg $ResolutionArg -ExpectedCameraFrameMode $expectedCameraFrameMode -ExpectedProbeCameraManifest $expectedProbeCameraManifest -ExpectedNativeCamerasJson $expectedNativeCamerasJson)) {
+            if (-not (Test-BundleManifestMatches `
+                -ManifestPath $bundleManifest `
+                -ExpectedResolutionArg $ResolutionArg `
+                -ExpectedModelPath $modelPath `
+                -ExpectedSourcePath $strictThermalRoot `
+                -ExpectedIteration $iteration `
+                -ExpectedTrainList $trainUnionList `
+                -ExpectedTestList $probeList `
+                -ExpectedRepoCommit $CoreGitCommit `
+                -ExpectedExporterPath $ExporterPath `
+                -ExpectedExporterSha256 $ExporterSha256 `
+                -ExpectedCameraFrameMode $expectedCameraFrameMode `
+                -ExpectedProbeCameraManifest $expectedProbeCameraManifest `
+                -ExpectedNativeCamerasJson $expectedNativeCamerasJson)) {
                 if (Test-Path -LiteralPath $bundleOutDir) {
                     Remove-Item -LiteralPath $bundleOutDir -Recurse -Force
                 }
@@ -473,13 +685,44 @@ try {
                 Invoke-PythonChecked -ArgsList $exportArgs -FailureMessage "Bundle export failed for $sceneName / $methodName"
                 $bundleWasExported = $true
             }
+            if (-not (Test-BundleManifestMatches `
+                -ManifestPath $bundleManifest `
+                -ExpectedResolutionArg $ResolutionArg `
+                -ExpectedModelPath $modelPath `
+                -ExpectedSourcePath $strictThermalRoot `
+                -ExpectedIteration $iteration `
+                -ExpectedTrainList $trainUnionList `
+                -ExpectedTestList $probeList `
+                -ExpectedRepoCommit $CoreGitCommit `
+                -ExpectedExporterPath $ExporterPath `
+                -ExpectedExporterSha256 $ExporterSha256 `
+                -ExpectedCameraFrameMode $expectedCameraFrameMode `
+                -ExpectedProbeCameraManifest $expectedProbeCameraManifest `
+                -ExpectedNativeCamerasJson $expectedNativeCamerasJson)) {
+                throw "Bundle manifest contract failed after export/resume for $sceneName / $methodName"
+            }
 
             $metricsJson = Join-Path $evalOutDir "metrics_summary.json"
             if ($bundleWasExported -and (Test-Path -LiteralPath $evalOutDir)) {
                 Remove-Item -LiteralPath $evalOutDir -Recurse -Force
                 New-Item -ItemType Directory -Force -Path $evalOutDir | Out-Null
             }
-            if (-not (Test-Path -LiteralPath $metricsJson)) {
+            $metricsMatch = Test-MetricsManifestMatches `
+                -ManifestPath $metricsJson `
+                -ExpectedSceneName $sceneName `
+                -ExpectedMethodName $methodOutName `
+                -ExpectedReferenceManifest $referenceManifest `
+                -ExpectedModelManifest $bundleManifest `
+                -ExpectedAdapterManifest $adapterPath `
+                -ExpectedRepoCommit $CoreGitCommit `
+                -ExpectedEvaluatorPath $EvaluatorPath `
+                -ExpectedEvaluatorSha256 $EvaluatorSha256 `
+                -ExpectedAgreementMetrics ([bool]$EnableAgreementMetrics)
+            if (-not $metricsMatch) {
+                if (Test-Path -LiteralPath $evalOutDir) {
+                    Remove-Item -LiteralPath $evalOutDir -Recurse -Force
+                }
+                New-Item -ItemType Directory -Force -Path $evalOutDir | Out-Null
                 Update-BatchStatus -Stage "evaluate_depth_reference" -SceneName $sceneName -MethodName $methodName -Note "Evaluating model depth against reference"
                 $evalArgs = @(
                     (Join-Path $RepoRoot "tools\geometric_repeatability\evaluate_depth_reference.py"),
@@ -495,6 +738,19 @@ try {
             }
 
             Assert-Exists -PathValue $metricsJson -Label "Metrics summary for $sceneName / $methodName"
+            if (-not (Test-MetricsManifestMatches `
+                -ManifestPath $metricsJson `
+                -ExpectedSceneName $sceneName `
+                -ExpectedMethodName $methodOutName `
+                -ExpectedReferenceManifest $referenceManifest `
+                -ExpectedModelManifest $bundleManifest `
+                -ExpectedAdapterManifest $adapterPath `
+                -ExpectedRepoCommit $CoreGitCommit `
+                -ExpectedEvaluatorPath $EvaluatorPath `
+                -ExpectedEvaluatorSha256 $EvaluatorSha256 `
+                -ExpectedAgreementMetrics ([bool]$EnableAgreementMetrics))) {
+                throw "Metrics manifest contract failed after evaluation for $sceneName / $methodName"
+            }
             $sceneManifest.methods += [ordered]@{
                 method_name = $methodOutName
                 model_path = $modelPath

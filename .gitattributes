@@ -11,3 +11,4 @@
 *.h text eol=lf
 *.hpp text eol=lf
 *.cpp text eol=lf
+*.patch text eol=lf -whitespace

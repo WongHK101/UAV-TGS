@@ -1,13 +1,72 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, List
 
 import numpy as np
 
 from depth_reference_common import load_json, save_json, write_simple_csv
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _producer_identity() -> Dict[str, Any]:
+    script_path = Path(__file__).resolve()
+    try:
+        commit = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        status = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "status", "--porcelain=v1", "--untracked-files=all"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        git_error = ""
+    except Exception as exc:
+        commit = ""
+        status = "git-identity-unavailable"
+        git_error = f"{type(exc).__name__}: {exc}"
+    return {
+        "script_path": str(script_path),
+        "script_sha256": _sha256_file(script_path),
+        "repo_root": str(REPO_ROOT.resolve()),
+        "git_commit": commit,
+        "git_dirty": bool(status.strip()),
+        "git_status_sha256": hashlib.sha256(status.encode("utf-8")).hexdigest(),
+        "git_error": git_error,
+    }
+
+
+def _verified_view_npz(manifest_path: Path, view: Dict[str, Any], *, label: str) -> Path:
+    manifest_root = manifest_path.parent.resolve()
+    npz_path = (manifest_root / str(view.get("npz_file", ""))).resolve()
+    try:
+        npz_path.relative_to(manifest_root)
+    except ValueError as exc:
+        raise ValueError(f"{label} view escapes its manifest root: {npz_path}") from exc
+    if not npz_path.is_file():
+        raise FileNotFoundError(f"{label} view NPZ is missing: {npz_path}")
+    expected_size = int(view.get("npz_size_bytes", -1))
+    expected_sha = str(view.get("npz_sha256", "")).lower()
+    if expected_size != int(npz_path.stat().st_size) or expected_sha != _sha256_file(npz_path):
+        raise RuntimeError(f"{label} view NPZ identity mismatch: {npz_path}")
+    return npz_path
 
 
 def _raw_depth_to_metric_camera_z(raw_depth: np.ndarray, depth_semantics: str) -> np.ndarray:
@@ -79,8 +138,12 @@ def main() -> None:
     depth_min = float(validity_rule.get("depth_min", 1e-6))
     opacity_threshold = float(validity_rule.get("opacity_threshold", 0.5))
 
-    ref_by_name = {str(v["image_name"]): v for v in ref_manifest["views"]}
-    model_by_name = {str(v["image_name"]): v for v in model_manifest["views"]}
+    ref_views = list(ref_manifest["views"])
+    model_views = list(model_manifest["views"])
+    ref_by_name = {str(v["image_name"]): v for v in ref_views}
+    model_by_name = {str(v["image_name"]): v for v in model_views}
+    if len(ref_by_name) != len(ref_views) or len(model_by_name) != len(model_views):
+        raise ValueError("Reference/model manifests contain duplicate image_name entries")
     missing_in_model = sorted(set(ref_by_name) - set(model_by_name))
     extra_in_model = sorted(set(model_by_name) - set(ref_by_name))
     if missing_in_model:
@@ -104,8 +167,10 @@ def main() -> None:
     for image_name in sorted(ref_by_name):
         ref_view = ref_by_name[image_name]
         model_view = model_by_name[image_name]
-        ref_npz = np.load(ref_manifest_path.parent / ref_view["npz_file"])
-        model_npz = np.load(model_manifest_path.parent / model_view["npz_file"])
+        ref_npz_path = _verified_view_npz(ref_manifest_path, ref_view, label="Reference")
+        model_npz_path = _verified_view_npz(model_manifest_path, model_view, label="Model")
+        ref_npz = np.load(ref_npz_path)
+        model_npz = np.load(model_npz_path)
 
         ref_depth = np.asarray(ref_npz["depth"], dtype=np.float64)
         ref_valid = np.asarray(ref_npz["valid_mask"], dtype=np.uint8).astype(bool)
@@ -208,11 +273,15 @@ def main() -> None:
 
     summary_payload = {
         "protocol_name": "reference-depth-based-geometric-evaluation-v1",
+        "producer_identity": _producer_identity(),
         "scene_name": ref_manifest["scene_name"],
         "method_name": adapter_manifest["method_name"],
         "reference_manifest": str(ref_manifest_path),
+        "reference_manifest_sha256": _sha256_file(ref_manifest_path),
         "model_manifest": str(model_manifest_path),
+        "model_manifest_sha256": _sha256_file(model_manifest_path),
         "adapter_manifest": str(adapter_manifest_path),
+        "adapter_manifest_sha256": _sha256_file(adapter_manifest_path),
         "depth_semantics": adapter_semantics,
         "validity_rule": validity_rule,
         "evaluation_options": {

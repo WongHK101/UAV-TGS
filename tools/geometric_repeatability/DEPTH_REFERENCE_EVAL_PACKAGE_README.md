@@ -68,8 +68,8 @@ methods for reference artifacts.
 
 Required checks:
 
-- inspect the fused dense point cloud
-- inspect the Poisson mesh in CloudCompare or MeshLab
+- inspect the OpenMVS dense point cloud
+- inspect the OpenMVS refined mesh in CloudCompare or MeshLab
 - render unmasked reference depth for several probe cameras
 - render masked reference depth and confirm the mask is not hiding failure cases
 
@@ -82,25 +82,26 @@ Warning signs:
 
 ## 3. Frozen Parameters Used In Our Current Run
 
-The current frozen Building pilot and 5-scene rerun use:
+The current frozen reference build uses:
 
 ```text
-PatchMatch max_image_size: 2000
-PatchMatch source images: 30
-PatchMatch geom_consistency: 1
-PatchMatch filter: 1
-PatchMatch window_radius: 7
-PatchMatch num_iterations: 7
-
-StereoFusion min_num_pixels: 3
-StereoFusion max_reproj_error: 2.0
-StereoFusion max_depth_error: 0.02
-StereoFusion max_normal_error: 12.0
-
-Mesh backend: Poisson
-Poisson depth: 12
-Poisson trim: 6
-Poisson point_weight: 6
+Reference backend: OpenMVS only (no COLMAP-MVS fallback)
+OpenMVS archive_type: -1
+InterfaceCOLMAP normalize: 0
+DensifyPointCloud resolution_level: 1
+DensifyPointCloud max_resolution: 2000
+DensifyPointCloud min_resolution: 640
+DensifyPointCloud number_views: 8
+DensifyPointCloud number_views_fuse: 3
+DensifyPointCloud iters: 4
+OpenMVS estimate_roi/crop_to_roi: 0/0
+RefineMesh resolution_level: 1
+RefineMesh scales: 2
+TextureMesh: not used
+CUDA evidence: Densify/Reconstruct/Refine logs must contain `CUDA device 0 initialized:`;
+patched RefineMesh must also contain `CUDA mesh refinement path completed; CPU fallback disabled`
+The runner streams stage output and immediately terminates on `CUDA error`,
+CUDA-unavailable, or CPU-fallback text; partial outputs and depth-map caches are removed.
 
 Evaluation thresholds:
 0.10, 0.25, 0.50, 1.00, 2.00, 5.00, 10.00, 20.00, 30.00 meters
@@ -129,7 +130,7 @@ tools/geometric_repeatability/
 
 Main scripts:
 
-- `build_depth_reference.py`: builds the training-only MVS reference and renders `D_ref`
+- `build_depth_reference.py`: builds the training-only OpenMVS reference and renders `D_ref`
 - `export_gaussian_probe_bundle.py`: renders model RGB/depth/opacity from probe cameras
 - `evaluate_depth_reference.py`: computes metrics between `D_ref` and `D_model`
 - `summarize_depth_reference_methods.py`: aggregates method-level metric CSVs
@@ -142,7 +143,11 @@ Expected environment:
 
 - Windows + PowerShell
 - Python environment compatible with the 3DGS repository
-- COLMAP command line executable
+- CUDA-enabled OpenMVS executables: `InterfaceCOLMAP`, `DensifyPointCloud`,
+  `ReconstructMesh`, and a fail-closed `RefineMesh` built with
+  `openmvs-2.4.0-refine-cuda-fail-closed.patch`
+- a clean Git worktree; bundle and metric manifests bind the commit plus the
+  exporter/evaluator SHA256 and are invalidated when code changes
 - CUDA/PyTorch environment for Gaussian model rendering
 
 Python packages used by the packaged tools include:
@@ -192,40 +197,39 @@ All commands below are templates. Replace paths with your local paths.
 ```powershell
 $py = "python"
 $repo = "<REPO_ROOT>"
-$colmap = "colmap"
+$openmvs = "<OPENMVS_BIN>"
 
 & $py "$repo\tools\geometric_repeatability\build_depth_reference.py" `
   --strict_protocol_manifest "<WORK_ROOT>\strict_protocol_manifest.json" `
-  --out_dir "<WORK_ROOT>\DepthReference\SceneName\reference" `
-  --colmap_cmd $colmap `
+  --out_dir "<WORK_ROOT>\DepthReference\SceneName\reference_openmvs_v1" `
+  --openmvs_interface_colmap_cmd "$openmvs\InterfaceCOLMAP.exe" `
+  --openmvs_densify_cmd "$openmvs\DensifyPointCloud.exe" `
+  --openmvs_reconstruct_mesh_cmd "$openmvs\ReconstructMesh.exe" `
+  --openmvs_refine_mesh_cmd "$openmvs\RefineMesh.exe" `
+  --openmvs_cuda_device 0 `
+  --openmvs_resolution_level 1 `
+  --openmvs_max_resolution 2000 `
+  --openmvs_min_resolution 640 `
+  --openmvs_number_views 8 `
+  --openmvs_number_views_fuse 3 `
+  --openmvs_iterations 4 `
+  --openmvs_refine_resolution_level 1 `
+  --openmvs_refine_scales 2 `
   --resolution_arg 4 `
   --thresholds_m "0.10,0.25,0.50,1.00,2.00,5.00,10.00,20.00,30.00" `
   --support_min_count 1 `
   --support_radius_px 1 `
-  --support_depth_tolerance_m 0.10 `
-  --patch_match_max_image_size 2000 `
-  --patch_match_auto_source_count 30 `
-  --patch_match_window_radius 7 `
-  --patch_match_num_iterations 7 `
-  --patch_match_geom_consistency 1 `
-  --patch_match_filter 1 `
-  --stereo_fusion_min_num_pixels 3 `
-  --stereo_fusion_max_reproj_error 2.0 `
-  --stereo_fusion_max_depth_error 0.02 `
-  --stereo_fusion_max_normal_error 12.0 `
-  --mesh_backend_preference poisson `
-  --poisson_depth 12 `
-  --poisson_trim 6 `
-  --poisson_point_weight 6
+  --support_depth_tolerance_m 0.10
 ```
 
 Important outputs:
 
-- `reference_manifest.json`
+- `reference_depth_manifest.json`
 - `probe_camera_manifest.json`
-- `reference_views/`
-- `_colmap_workspace_flat/fused.ply`
-- `_colmap_workspace_flat/meshed-poisson-trim6-pw6.ply` or equivalent mesh path
+- `views/`
+- `openmvs_command_plan.json`
+- `_openmvs_workspace/reference_openmvs_dense.ply`
+- `_openmvs_workspace/reference_openmvs_mesh_refined.ply`
 
 ### Step 2: Render each model at the same probe cameras
 
@@ -239,37 +243,62 @@ Important outputs:
   --split_label "MethodName" `
   --scene_name_override "SceneName" `
   --camera_frame_mode probe_manifest_native_align `
-  --probe_camera_manifest "<WORK_ROOT>\SceneName\reference\probe_camera_manifest.json" `
+  --probe_camera_manifest "<WORK_ROOT>\DepthReference\SceneName\reference_openmvs_v1\probe_camera_manifest.json" `
   --native_cameras_json "<MODEL_ROOT>\cameras.json"
 ```
 
 For a fair comparison, all methods must use the same `probe_camera_manifest`
 and the same reference for the scene.
 
+Create the frozen depth-semantics adapter consumed by the evaluator:
+
+```powershell
+$adapter = [ordered]@{
+  protocol_name = "reference-depth-based-geometric-evaluation-v1"
+  method_name = "MethodName"
+  model_path = "<MODEL_ROOT>"
+  source_path = "<SCENE_ROOT>"
+  iteration = 30000
+  depth_semantics = "inverse_camera_z_from_renderer"
+  validity_rule = [ordered]@{
+    mode = "opacity_threshold"
+    opacity_threshold = 0.5
+    depth_min = 1e-6
+  }
+}
+$adapterPath = "<WORK_ROOT>\DepthReference\SceneName\MethodName\probe_bundle\depth_adapter_manifest.json"
+$adapterJson = $adapter | ConvertTo-Json -Depth 8
+[System.IO.File]::WriteAllText(
+  $adapterPath,
+  $adapterJson + [Environment]::NewLine,
+  (New-Object System.Text.UTF8Encoding($false))
+)
+```
+
 ### Step 3: Evaluate model depth against reference depth
 
 ```powershell
 & $py "$repo\tools\geometric_repeatability\evaluate_depth_reference.py" `
-  --reference_manifest "<WORK_ROOT>\SceneName\reference\reference_manifest.json" `
-  --model_manifest "<WORK_ROOT>\SceneName\MethodName\probe_bundle\model_depth_manifest.json" `
-  --adapter_manifest "<WORK_ROOT>\SceneName\MethodName\probe_bundle\depth_adapter_manifest.json" `
-  --out_dir "<WORK_ROOT>\SceneName\MethodName\metrics" `
+  --reference_manifest "<WORK_ROOT>\DepthReference\SceneName\reference_openmvs_v1\reference_depth_manifest.json" `
+  --model_manifest "<WORK_ROOT>\DepthReference\SceneName\MethodName\probe_bundle\split_manifest.json" `
+  --adapter_manifest "<WORK_ROOT>\DepthReference\SceneName\MethodName\probe_bundle\depth_adapter_manifest.json" `
+  --out_dir "<WORK_ROOT>\DepthReference\SceneName\MethodName\metrics" `
   --enable_agreement_metrics
 ```
 
 Important outputs:
 
+- `metrics_summary.json`
 - `metrics_summary.csv`
-- `metrics_by_threshold.csv`
-- `metrics_by_view.csv`
-- `evaluation_manifest.json`
+- `front_intrusion_curve.csv`
+- `per_view_counts.csv`
 
 ### Step 4: Visualize alignment and depth behavior
 
 ```powershell
 & $py "$repo\tools\geometric_repeatability\visualize_strict_probe_method_rgb_depth_comparison.py" `
-  --reference_manifest "<WORK_ROOT>\SceneName\reference\reference_manifest.json" `
-  --out_dir "<WORK_ROOT>\SceneName\visual_checks" `
+  --reference_manifest "<WORK_ROOT>\DepthReference\SceneName\reference_openmvs_v1\reference_depth_manifest.json" `
+  --out_dir "<WORK_ROOT>\DepthReference\SceneName\visual_checks" `
   --scene_name "SceneName" `
   --gt_images_root "<STRICT_DATASET_ROOT>" `
   --gt_images_dir_name "images" `
@@ -377,12 +406,15 @@ Camera mismatch:
 Mesh holes:
 
 - symptom: invalid reference depth on facades or roofs
-- fix: rebuild reference, inspect fused cloud, adjust MVS/fusion/Poisson parameters
+- fix: rebuild the reference, inspect the OpenMVS dense cloud and refined mesh,
+  and audit the frozen `DensifyPointCloud`/`ReconstructMesh`/`RefineMesh`
+  parameters before deciding whether a protocol-wide change is justified
 
 Overly soft mesh:
 
 - symptom: straight edges become rounded or bulged
-- fix: inspect Poisson depth/trim/point_weight and avoid over-smoothing
+- fix: inspect the OpenMVS dense cloud and the pre-/post-refinement meshes;
+  do not tune refinement settings per scene or silently replace the backend
 
 Stale metrics:
 

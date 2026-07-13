@@ -71,10 +71,10 @@ Build one external reference geometry `G_ref` per scene from **training RGB view
 
 Recommended pipeline:
 
-1. training-only sparse reconstruction / training-only camera subset
-2. dense stereo from the training RGB subset
-3. dense fusion
-4. reference mesh reconstruction from the fused dense result
+1. training-only aligned sparse reconstruction / training-only camera subset
+2. import the aligned COLMAP sparse model with OpenMVS `InterfaceCOLMAP`
+3. OpenMVS dense reconstruction with `DensifyPointCloud`
+4. OpenMVS mesh reconstruction and refinement with `ReconstructMesh` and `RefineMesh`
 
 Rationale for using a mesh:
 
@@ -88,22 +88,45 @@ The fused dense point cloud should still be saved as an audit artifact, but the 
 
 The final fixed reference reconstruction settings are:
 
-- `PatchMatchStereo.max_image_size = 2000`
-- `patch_match_auto_source_count = 30`
-- `PatchMatchStereo.geom_consistency = 1`
-- `PatchMatchStereo.filter = 1`
-- `PatchMatchStereo.window_radius = 7`
-- `PatchMatchStereo.num_iterations = 7`
-- `StereoFusion.min_num_pixels = 3`
-- `StereoFusion.max_reproj_error = 2.0`
-- `StereoFusion.max_depth_error = 0.02`
-- `StereoFusion.max_normal_error = 12.0`
-- `mesh_backend_preference = poisson`
-- `PoissonMeshing.depth = 12`
-- `PoissonMeshing.trim = 6`
-- `PoissonMeshing.point_weight = 6`
+- backend: `OpenMVS` only; no COLMAP MVS/mesher fallback
+- all four OpenMVS stages use interface archive mode: `archive_type = -1`
+- `InterfaceCOLMAP.normalize = 0` so the aligned SfM coordinate frame is preserved
+- `DensifyPointCloud.resolution_level = 1`
+- `DensifyPointCloud.max_resolution = 2000`
+- `DensifyPointCloud.min_resolution = 640`
+- `DensifyPointCloud.number_views = 8`
+- `DensifyPointCloud.number_views_fuse = 3`
+- `DensifyPointCloud.iters = 4`
+- automatic OpenMVS ROI estimation/cropping disabled; the evaluator's existing robust training-only ROI rule remains authoritative
+- `RefineMesh.resolution_level = 1`
+- `RefineMesh.scales = 2`
+- CUDA device: `0` by default
+- `DensifyPointCloud`, `ReconstructMesh`, and `RefineMesh` logs must prove
+  `CUDA device 0 initialized:` and must not report CUDA failure; OpenMVS's
+  Delaunay/graph-cut reconstruction contains CPU work by algorithm design
+- the runner streams OpenMVS output and terminates the whole stage immediately
+  on `CUDA error`, CUDA-unavailable, or CPU-fallback text; partial outputs and
+  depth-map caches are removed before control returns
+- `RefineMesh` must be built with
+  `openmvs-2.4.0-refine-cuda-fail-closed.patch`; its binary is checked before
+  execution and its log must contain
+  `CUDA mesh refinement path completed; CPU fallback disabled`
+- `TextureMesh` is not run because reference depth requires geometry, not texture
 
-These parameters were fixed after a Building pilot. In that pilot, `max_image_size=3000` provided no visible improvement over `2000`, `trim=7` left excessive facade holes, `trim=6` reduced holes, and `depth=12` preserved more visible structure than `depth=10`.
+OpenMVS v2.4 artifact contract:
+
+- `InterfaceCOLMAP` produces `scene.mvs`
+- `DensifyPointCloud` produces `reference_openmvs_dense.mvs` and `.ply`
+- `ReconstructMesh` produces only `reference_openmvs_mesh.ply`
+- `RefineMesh` receives the dense `.mvs` plus `--mesh-file` and produces only
+  `reference_openmvs_mesh_refined.ply`
+- successful stage receipts bind the plan, command contract, required outputs,
+  logs, and SHA256 identities; densification invalidation also deletes `.dmap`
+  sidecar caches before rerun
+- bundle/metric reuse additionally requires the same clean Git commit and the
+  current exporter/evaluator script SHA256
+
+These settings must be frozen before comparing methods. Any change requires a new isolated reference output and a rerun of every method evaluated against it.
 
 ### 4.3 Reference ROI
 

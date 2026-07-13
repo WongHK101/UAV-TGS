@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -33,6 +35,58 @@ def _save_json(path: Path, payload: Dict[str, Any]) -> None:
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=True)
         f.write("\n")
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _optional_file_identity(value: str | Path | None) -> Dict[str, Any]:
+    if value is None or not str(value).strip():
+        return {"path": "", "size_bytes": 0, "sha256": ""}
+    path = Path(value).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    return {
+        "path": str(path),
+        "size_bytes": int(path.stat().st_size),
+        "sha256": _sha256_file(path),
+    }
+
+
+def _producer_identity() -> Dict[str, Any]:
+    script_path = Path(__file__).resolve()
+    try:
+        commit = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        status = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "status", "--porcelain=v1", "--untracked-files=all"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        git_error = ""
+    except Exception as exc:
+        commit = ""
+        status = "git-identity-unavailable"
+        git_error = f"{type(exc).__name__}: {exc}"
+    return {
+        "script_path": str(script_path),
+        "script_sha256": _sha256_file(script_path),
+        "repo_root": str(REPO_ROOT.resolve()),
+        "git_commit": commit,
+        "git_dirty": bool(status.strip()),
+        "git_status_sha256": hashlib.sha256(status.encode("utf-8")).hexdigest(),
+        "git_error": git_error,
+    }
 
 
 def _camera_to_world_from_view(view) -> List[List[float]]:
@@ -187,6 +241,8 @@ def export_probe_bundle(
                         "cy": float(view.image_height / 2.0),
                         "camera_to_world": _camera_to_world_from_view(view),
                         "npz_file": str(view_rel).replace("\\", "/"),
+                        "npz_size_bytes": int(view_path.stat().st_size),
+                        "npz_sha256": _sha256_file(view_path),
                     }
                 )
         elif camera_frame_mode == "probe_manifest_native_align":
@@ -244,18 +300,36 @@ def export_probe_bundle(
                         "camera_to_world": strict_view["camera_to_world"],
                         "native_camera_to_world": native_c2w.tolist(),
                         "npz_file": str(view_rel).replace("\\", "/"),
+                        "npz_size_bytes": int(view_path.stat().st_size),
+                        "npz_sha256": _sha256_file(view_path),
                     }
                 )
         else:
             raise ValueError(f"Unsupported camera_frame_mode: {camera_frame_mode!r}")
 
+    model_point_cloud = (
+        Path(dataset.model_path).resolve()
+        / "point_cloud"
+        / f"iteration_{int(scene.loaded_iter)}"
+        / "point_cloud.ply"
+    )
+    if not model_point_cloud.is_file():
+        raise FileNotFoundError(f"Loaded Gaussian point cloud is missing: {model_point_cloud}")
     split_manifest = {
         "bundle_type": "gaussian_probe_split_bundle_v1",
+        "producer_identity": _producer_identity(),
         "scene_name": scene_name_override if scene_name_override else _infer_scene_name(dataset),
         "split_label": split_label,
         "model_path": str(Path(dataset.model_path).resolve()),
         "source_path": str(Path(dataset.source_path).resolve()),
         "iteration": int(scene.loaded_iter),
+        "model_point_cloud": {
+            "path": str(model_point_cloud),
+            "size_bytes": int(model_point_cloud.stat().st_size),
+            "sha256": _sha256_file(model_point_cloud),
+        },
+        "train_list": _optional_file_identity(getattr(dataset, "train_list", "")),
+        "test_list": _optional_file_identity(getattr(dataset, "test_list", "")),
         # The rasterizer returns inverse depth rather than metric camera-z depth.
         "depth_semantics": "inverse_camera_z_from_renderer",
         "opacity_semantics": "black_bg_plus_white_override_color_render",
@@ -264,7 +338,9 @@ def export_probe_bundle(
             "resolution_arg": int(dataset.resolution),
         },
         "probe_camera_manifest": str(probe_camera_manifest_path.resolve()) if probe_camera_manifest_path is not None else "",
+        "probe_camera_manifest_identity": _optional_file_identity(probe_camera_manifest_path),
         "native_cameras_json": str(native_cameras_json_path.resolve()) if native_cameras_json_path is not None else "",
+        "native_cameras_json_identity": _optional_file_identity(native_cameras_json_path),
         "strict_to_native_alignment": strict_to_native_alignment,
         "views": manifest_views,
     }
