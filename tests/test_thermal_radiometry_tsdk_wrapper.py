@@ -161,6 +161,7 @@ class TsdkWrapperTests(unittest.TestCase):
             records = [json.loads(line) for line in manifest_path.read_text(encoding="utf-8").splitlines()]
             self.assertEqual(len(records), 1)
             self.assertTrue(records[0]["success"])
+            self.assertEqual(records[0]["temperature_npy"], str(temperature_path.resolve()))
             self.assertEqual(records[0]["parameters"]["emissivity"]["source"], "benchmark_assumption")
             self.assertEqual(len(records[0]["output_sha256"]), 64)
 

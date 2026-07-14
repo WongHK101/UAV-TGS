@@ -43,6 +43,24 @@ PARAMETER_NAMES = (
     "ambient_c",
     "reflected_c",
 )
+PROTOCOL_PASSTHROUGH_FIELDS = (
+    "capture_time",
+    "rgb_capture_time",
+    "timestamp",
+    "timestamp_utc",
+    "gimbal_pitch_deg",
+    "gimbal_yaw_deg",
+    "gimbal_roll_deg",
+    "gps_latitude",
+    "gps_longitude",
+    "relative_altitude_m",
+    "rgb_path",
+    "thermal_path",
+    "original_files",
+    "stratum",
+    "strip_id",
+    "metadata",
+)
 
 
 class DecodeConfigurationError(ValueError):
@@ -391,10 +409,14 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 "pair_id": str(record.get("pair_id") or frame_id),
                 "source_path": str(source),
                 "output_path": str(output_path.resolve(strict=False)),
+                "temperature_npy": str(output_path.resolve(strict=False)),
                 "tsdk_root": str(tsdk_root),
                 "adapter": args.adapter,
                 "parameters": parameters,
             }
+            for key in PROTOCOL_PASSTHROUGH_FIELDS:
+                if key in record:
+                    request[key] = record[key]
             request_path = output_root / "manifests" / "decode_requests" / f"{scene}--{frame_id}.json"
             if request_path.exists() and not args.overwrite:
                 raise DecodeConfigurationError(f"Decode request exists; pass --overwrite: {request_path}")
