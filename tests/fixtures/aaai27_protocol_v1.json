@@ -1,0 +1,72 @@
+{
+  "schema": "uav-tgs-aaai27-protocol-v1",
+  "terminology": {
+    "cfr": "Cross-sensor FoV/Resolution Canonicalization",
+    "ogs": "Observability-Guided Gaussian Stabilization",
+    "stage2": "Geometry-Frozen Radiometric Thermal Transfer",
+    "temperature_metric": "TSDK-referenced apparent-temperature consistency",
+    "all_float": "model-space interpolation",
+    "hot_all_float": "hotspot-enhanced visualization"
+  },
+  "claim_boundaries": {
+    "cfr_is_not": [
+      "pixel-level registration",
+      "full calibration",
+      "distortion correction",
+      "parallax removal"
+    ],
+    "temperature_metric_is_not": [
+      "absolute thermometry",
+      "true surface temperature",
+      "physical ground truth"
+    ],
+    "hot_all_float_is_not": [
+      "automatic defect detection",
+      "fault classification",
+      "absolute overtemperature diagnosis"
+    ]
+  },
+  "legacy_pipeline_defaults": {
+    "rgb_iter": 30000,
+    "t_iter": 60000,
+    "t_feature_lr": 0.001,
+    "t_opacity_lr": 0.0002,
+    "clamp_scale_max_t": 10.0,
+    "thermal_reset_features": true,
+    "sgf_disable": false
+  },
+  "aaai_stage2_defaults": {
+    "thermal_recipe": "legacy",
+    "thermal_max_sh_degree": 3,
+    "thermal_optimizer_state": "restore",
+    "thermal_freeze_mode": "legacy",
+    "thermal_scale_clamp": "legacy",
+    "thermal_checkpoint_offsets": [10000, 20000, 30000]
+  },
+  "radiometry": {
+    "palette": "uav-tgs-hot-iron-v1",
+    "temperature_dtype": "float32-celsius",
+    "mapping": "linear",
+    "gamma": 1.0,
+    "training_image_format": "png-lossless",
+    "range_source": "train-only",
+    "block_frames": 16,
+    "test_block_period": 8,
+    "guard_frames": 2
+  },
+  "implementation_order": [
+    "legacy-fixtures",
+    "h30t-audit-and-decode-wrapper",
+    "block-guard-split-and-train-range",
+    "canonical-palette-roundtrip-and-temperature-evaluation",
+    "thermal-sh-cap-and-fresh-optimizer",
+    "strict-appearance-only-stage2"
+  ],
+  "deferred_until_pilot_review": [
+    "ogs-v1",
+    "ogs-v2",
+    "temperature-loss",
+    "fusion-simplification",
+    "gpu-training"
+  ]
+}
