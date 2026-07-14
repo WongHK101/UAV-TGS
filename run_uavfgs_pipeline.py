@@ -1147,6 +1147,14 @@ def main() -> None:
                     help="Thermal-only: reset SH features after restore/prune/clamp (default: on)")
     ap.add_argument("--no_thermal_reset_features", dest="thermal_reset_features", action="store_false",
                     help="Disable thermal SH feature reset.")
+    ap.add_argument(
+        "--thermal_max_sh_degree", type=int, choices=[0, 1, 3], default=None,
+        help="Thermal-only SH cap. When feature reset is enabled, cold-restart from SH degree 0."
+    )
+    ap.add_argument(
+        "--thermal_optimizer_state", choices=["restore", "fresh"], default="restore",
+        help="Thermal checkpoint optimizer state (default: restore)."
+    )
     ap.add_argument("--debug_gaussian_stats", action="store_true", default=False,
                     help="Thermal-only: log gaussian stats after restore/before save (default: off)")
     ap.add_argument("--sgf_disable", action="store_true", default=False,
@@ -1727,6 +1735,8 @@ def main() -> None:
                 "clamp_effective_rgb": clamp_effective_rgb,
                 "clamp_effective_t": clamp_effective_t,
                 "thermal_reset_features": bool(getattr(args, "thermal_reset_features", False)),
+                "thermal_max_sh_degree": getattr(args, "thermal_max_sh_degree", None),
+                "thermal_optimizer_state": getattr(args, "thermal_optimizer_state", "restore"),
                 "sgf_disable": bool(getattr(args, "sgf_disable", False)),
                 "t_opacity_lr": getattr(args, "t_opacity_lr", None),
                 "debug_gaussian_stats": bool(getattr(args, "debug_gaussian_stats", False)),
@@ -1910,6 +1920,9 @@ def main() -> None:
                     "clamp_scale_max_t": getattr(args, "clamp_scale_max_t", None),
                     "clamp_effective_rgb": clamp_effective_rgb,
                     "clamp_effective_t": clamp_effective_t,
+                    "thermal_reset_features": bool(getattr(args, "thermal_reset_features", False)),
+                    "thermal_max_sh_degree": getattr(args, "thermal_max_sh_degree", None),
+                    "thermal_optimizer_state": getattr(args, "thermal_optimizer_state", "restore"),
                     "t_opacity_lr": getattr(args, "t_opacity_lr", None),
                     "eval_thermal_scalar": getattr(args, "eval_thermal_scalar", None),
                     "eval_thermal_align": getattr(args, "eval_thermal_align", None),
@@ -2669,6 +2682,12 @@ def main() -> None:
         train2_cmd.extend(["--clamp_scale_max", str(clamp_effective_t)])
     if args.thermal_reset_features:
         train2_cmd.append("--thermal_reset_features")
+    if args.thermal_max_sh_degree is not None:
+        train2_cmd.extend(["--thermal_max_sh_degree", str(args.thermal_max_sh_degree)])
+    # Preserve the byte-for-byte legacy command by relying on train.py's
+    # restore default unless fresh state is explicitly requested.
+    if args.thermal_optimizer_state != "restore":
+        train2_cmd.extend(["--thermal_optimizer_state", str(args.thermal_optimizer_state)])
     if args.debug_gaussian_stats:
         train2_cmd.append("--debug_gaussian_stats")
     if args.sgf_disable:

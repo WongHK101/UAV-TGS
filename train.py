@@ -152,7 +152,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # 2.6+ defaults to weights_only=True, which rejects that established
         # checkpoint format before thermal fine-tuning can start.
         (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
-        gaussians.restore(model_params, opt)
+        optimizer_restore_mode = str(getattr(args, "thermal_optimizer_state", "restore"))
+        gaussians.restore(model_params, opt, optimizer_restore_mode=optimizer_restore_mode)
+        if optimizer_restore_mode == "fresh":
+            state_entries = len(gaussians.optimizer.state)
+            step_entries = sum(
+                1
+                for state in gaussians.optimizer.state.values()
+                if isinstance(state, dict) and "step" in state
+            )
+            if state_entries != 0 or step_entries != 0:
+                raise RuntimeError(
+                    "Fresh optimizer restore inherited RGB optimizer state: "
+                    f"state_entries={state_entries} step_entries={step_entries}"
+                )
+            print("[INFO] FreshOptimizerRestore: state_entries=0 step_entries=0")
     start_iteration = int(first_iter)
     if getattr(args, "ss_prune_before_thermal", False) and checkpoint:
         if not getattr(args, "ss_enable", False):
@@ -200,6 +214,38 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         except Exception:
             adam_cleared = False
         print(f"[INFO] ThermalResetFeatures: sh_zeroed=1 adam_state_cleared={1 if adam_cleared else 0}")
+
+    thermal_max_sh_degree = getattr(args, "thermal_max_sh_degree", None)
+    if thermal_max_sh_degree is not None:
+        if not (checkpoint and getattr(args, "start_checkpoint", None)):
+            raise RuntimeError("thermal_max_sh_degree requires a start checkpoint")
+        thermal_max_sh_degree = int(thermal_max_sh_degree)
+        cold_restart = bool(getattr(args, "thermal_reset_features", False))
+        zeroed_bands = gaussians.configure_sh_degree_cap_(
+            thermal_max_sh_degree, cold_restart=cold_restart
+        )
+
+        # A cap without a full SH reset must also remove inherited Adam
+        # momentum for inactive coefficients, otherwise zero-valued higher
+        # bands can move even when the renderer supplies zero gradients.
+        keep_rest = (thermal_max_sh_degree + 1) ** 2 - 1
+        for group in gaussians.optimizer.param_groups:
+            if group.get("name", None) != "f_rest" or not group.get("params"):
+                continue
+            param = group["params"][0]
+            state = gaussians.optimizer.state.get(param, None)
+            if not isinstance(state, dict):
+                continue
+            for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                value = state.get(key, None)
+                if torch.is_tensor(value) and value.shape == param.shape:
+                    with torch.no_grad():
+                        value[:, keep_rest:, :].zero_()
+        print(
+            "[INFO] ThermalSHColdRestart: "
+            f"enabled={1 if cold_restart else 0} active_degree={gaussians.active_sh_degree} "
+            f"max_degree={thermal_max_sh_degree} zeroed_rest_bands={zeroed_bands}"
+        )
 
     def _reapply_lrs_after_restore() -> None:
         for group in gaussians.optimizer.param_groups:
@@ -337,7 +383,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
-            gaussians.oneupSHdegree()
+            gaussians.oneupSHdegree(max_degree=thermal_max_sh_degree)
 
         # Pick a random Camera
         if not viewpoint_stack:
@@ -428,6 +474,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
             if (iteration in saving_iterations):
+                if thermal_max_sh_degree is not None:
+                    gaussians.zero_sh_above_degree_(thermal_max_sh_degree)
                 if debug_stats and iteration == opt.iterations:
                     _log_gaussian_stats("before_save")
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
@@ -478,6 +526,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.optimizer.zero_grad(set_to_none = True)
 
             if (iteration in checkpoint_iterations):
+                if thermal_max_sh_degree is not None:
+                    gaussians.zero_sh_above_degree_(thermal_max_sh_degree)
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
@@ -644,6 +694,14 @@ if __name__ == "__main__":
     parser.add_argument("--clamp_scale_after_densify", action="store_true", default=False)
     parser.add_argument("--clamp_scale_after_rgb_final", action="store_true", default=False)
     parser.add_argument("--thermal_reset_features", action="store_true", default=False)
+    parser.add_argument(
+        "--thermal_max_sh_degree", type=int, choices=[0, 1, 3], default=None,
+        help="Thermal-only SH cap. With --thermal_reset_features, restart active SH at degree 0."
+    )
+    parser.add_argument(
+        "--thermal_optimizer_state", choices=["restore", "fresh"], default="restore",
+        help="Thermal checkpoint optimizer state (default: restore). fresh starts a new Adam state."
+    )
     parser.add_argument("--sgf_disable", action="store_true", default=False)
     parser.add_argument("--baseline_modules_off", action="store_true", default=False)
     parser.add_argument("--baseline_restore_ssp", action="store_true", default=False)
@@ -655,6 +713,11 @@ if __name__ == "__main__":
 
     cli_args = sys.argv[1:]
     args = parser.parse_args(cli_args)
+
+    if args.thermal_max_sh_degree is not None and not args.start_checkpoint:
+        parser.error("--thermal_max_sh_degree requires --start_checkpoint")
+    if args.thermal_optimizer_state == "fresh" and not args.start_checkpoint:
+        parser.error("--thermal_optimizer_state fresh requires --start_checkpoint")
 
     if (args.baseline_restore_ssp or args.baseline_restore_stt) and (not args.baseline_modules_off):
         parser.error("--baseline_restore_ssp/--baseline_restore_stt require --baseline_modules_off")

@@ -98,7 +98,12 @@ class GaussianModel:
             self.spatial_lr_scale,
         )
     
-    def restore(self, model_args, training_args):
+    def restore(self, model_args, training_args, optimizer_restore_mode="restore"):
+        if optimizer_restore_mode not in ("restore", "fresh"):
+            raise ValueError(
+                "optimizer_restore_mode must be 'restore' or 'fresh', "
+                f"got {optimizer_restore_mode!r}"
+            )
         (self.active_sh_degree, 
         self._xyz, 
         self._features_dc, 
@@ -114,7 +119,12 @@ class GaussianModel:
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
-        self.optimizer.load_state_dict(opt_dict)
+        if optimizer_restore_mode == "restore":
+            self.optimizer.load_state_dict(opt_dict)
+        elif len(self.optimizer.state) != 0:
+            # A freshly constructed optimizer must not inherit any per-parameter
+            # Adam state (including the RGB step counter).
+            raise RuntimeError("Fresh optimizer restore unexpectedly contains optimizer state")
 
 
 
@@ -554,8 +564,39 @@ class GaussianModel:
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
 
-    def oneupSHdegree(self):
-        if self.active_sh_degree < self.max_sh_degree:
+    def zero_sh_above_degree_(self, max_degree):
+        """Keep the SH3 tensor schema while zeroing coefficients above a cap."""
+        max_degree = int(max_degree)
+        if max_degree < 0 or max_degree > self.max_sh_degree:
+            raise ValueError(
+                f"SH degree cap must be in [0, {self.max_sh_degree}], got {max_degree}"
+            )
+        keep_rest = (max_degree + 1) ** 2 - 1
+        total_rest = int(self._features_rest.shape[1])
+        if keep_rest >= total_rest:
+            return 0
+        with torch.no_grad():
+            self._features_rest[:, keep_rest:, :].zero_()
+        return total_rest - keep_rest
+
+    def configure_sh_degree_cap_(self, max_degree, cold_restart=False):
+        """Apply an SH cap without changing the allocated SH tensor schema."""
+        max_degree = int(max_degree)
+        if max_degree < 0 or max_degree > self.max_sh_degree:
+            raise ValueError(
+                f"SH degree cap must be in [0, {self.max_sh_degree}], got {max_degree}"
+            )
+        if cold_restart:
+            self.active_sh_degree = 0
+        else:
+            self.active_sh_degree = min(int(self.active_sh_degree), max_degree)
+        return self.zero_sh_above_degree_(max_degree)
+
+    def oneupSHdegree(self, max_degree=None):
+        limit = self.max_sh_degree if max_degree is None else min(int(max_degree), self.max_sh_degree)
+        if limit < 0:
+            raise ValueError(f"SH degree cap must be non-negative, got {limit}")
+        if self.active_sh_degree < limit:
             self.active_sh_degree += 1
 
     def create_from_pcd(self, pcd : BasicPointCloud, cam_infos : int, spatial_lr_scale : float):
