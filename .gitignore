@@ -16,3 +16,4 @@ Thumbs.db
 outputs/
 runs/
 tools/geometric_repeatability/artifacts/
+_external/
