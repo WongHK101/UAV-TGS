@@ -303,6 +303,27 @@ The script is resumable by default and writes per-step state files under:
 <DATA_ROOT>/_pipeline_state/
 ```
 
+## Optional Efficiency Measurements
+
+Efficiency probing is opt-in and disabled by default. For a full UAV-FGS run, enable it with:
+
+```bash
+python run_uavfgs_pipeline.py --data_root <DATA_ROOT> --out_root <OUT_ROOT> --benchmark_efficiency
+```
+
+The pipeline writes `<OUT_ROOT>/efficiency_benchmark.json` and stage sidecars next to the measured RGB/thermal models. A resumable step is considered efficiency-complete only when its expected sidecar is present; an older model without that sidecar is not silently reported as measured.
+
+`efficiency_probe.py` can also wrap an arbitrary command from this or another method repository:
+
+```bash
+python efficiency_probe.py run \
+  --output <METHOD_OUTPUT>/efficiency.json \
+  --artifact final_model=<METHOD_OUTPUT>/point_cloud.ply \
+  -- python <OTHER_METHOD>/train.py <METHOD_ARGS>
+```
+
+The shared JSON schema records command or stage wall time, explicit artifact sizes, and PLY vertex count when available. UAV-FGS training peak memory is measured at the training-call boundary with the PyTorch caching allocator; it does not include driver or non-PyTorch allocations. Rendering FPS is render-only: controlled warm-up views, ground-truth work, CPU transfer, and file I/O are excluded. The generic command wrapper samples only the directly launched PID through `nvidia-smi`; launcher children and very short peaks may be missed. These scopes should remain explicit when comparing different algorithms.
+
 ## Depth-Reference Geometry Evaluation
 
 The reference-depth geometry consistency and front-intrusion tools are under

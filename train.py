@@ -11,6 +11,7 @@
 
 import os
 import torch
+from efficiency_probe import TorchStageProbe
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 
@@ -152,6 +153,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # checkpoint format before thermal fine-tuning can start.
         (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
+    start_iteration = int(first_iter)
     if getattr(args, "ss_prune_before_thermal", False) and checkpoint:
         if not getattr(args, "ss_enable", False):
             print("[WARN] ss_prune_before_thermal set but ss_enable=False; skipping prune.")
@@ -515,6 +517,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 scene.save(opt.iterations)
                 torch.save((gaussians.capture(), opt.iterations), scene.model_path + "/chkpnt" + str(opt.iterations) + ".pth")
 
+    return {
+        "start_iteration": start_iteration,
+        "final_iteration": int(opt.iterations),
+        "iterations_executed": max(0, int(opt.iterations) - start_iteration),
+        "gaussian_count": int(gaussians.get_xyz.shape[0]),
+        "model_path": str(scene.model_path),
+    }
+
 def prepare_output_and_logger(args):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
@@ -605,6 +615,12 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--benchmark_efficiency", action="store_true", default=False,
+                        help="Write boundary-only training time and peak PyTorch CUDA memory (default: off).")
+    parser.add_argument("--efficiency_output", type=str, default="",
+                        help="Training efficiency JSON path (default: <model_path>/train_efficiency.json).")
+    parser.add_argument("--efficiency_stage", type=str, default="auto",
+                        help="Stage label stored in efficiency JSON (default: auto -> rgb/thermal).")
 
     # Sparse Support (disabled by default): gates densification using sparse COLMAP support / init point cloud.
     parser.add_argument("--ss_enable", action="store_true", default=False)
@@ -704,17 +720,42 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(
-        lp.extract(args),
-        op.extract(args),
-        pp.extract(args),
-        args.test_iterations,
-        args.save_iterations,
-        args.checkpoint_iterations,
-        args.start_checkpoint,
-        args.debug_from,
-        ss_args=(args if args.ss_enable else None),
+    if args.benchmark_efficiency and not (args.efficiency_output or args.model_path):
+        parser.error("--benchmark_efficiency requires -m/--model_path or --efficiency_output")
+    efficiency_stage = args.efficiency_stage
+    if efficiency_stage == "auto":
+        efficiency_stage = "thermal" if args.start_checkpoint else "rgb"
+    efficiency_output = args.efficiency_output or os.path.join(args.model_path, "train_efficiency.json")
+    efficiency_probe = TorchStageProbe(
+        args.benchmark_efficiency,
+        efficiency_output,
+        efficiency_stage,
+        torch,
+        metadata={
+            "source_path": str(args.source_path),
+            "model_path": str(args.model_path),
+            "requested_final_iteration": int(args.iterations),
+            "start_checkpoint": str(args.start_checkpoint) if args.start_checkpoint else None,
+            "resolution": int(args.resolution),
+        },
     )
+    efficiency_probe.start()
+    try:
+        training_result = training(
+            lp.extract(args),
+            op.extract(args),
+            pp.extract(args),
+            args.test_iterations,
+            args.save_iterations,
+            args.checkpoint_iterations,
+            args.start_checkpoint,
+            args.debug_from,
+            ss_args=(args if args.ss_enable else None),
+        )
+    except BaseException as error:
+        efficiency_probe.finish("failed", error=error)
+        raise
+    efficiency_probe.finish("completed", result=training_result)
 
     # All done
     print("\nTraining complete.")

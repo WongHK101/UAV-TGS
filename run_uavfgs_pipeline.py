@@ -49,6 +49,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from efficiency_probe import artifact_record, atomic_write_json, read_json_if_present
+
 
 ORIG_3DGS_OPT_DEFAULTS: Dict[str, float] = {
     "position_lr_init": 0.00016,
@@ -971,6 +973,14 @@ def main() -> None:
                     help="Collect counts (PLY vertices / image counts) in profile (default: off)")
     ap.add_argument("--profile_save_logs", action="store_true", default=False,
                     help="Redirect each run step stdout+stderr to out_root/log_<step>.txt (default: off)")
+    ap.add_argument("--benchmark_efficiency", action="store_true", default=False,
+                    help="Opt in to training/render efficiency sidecars and a final summary (default: off).")
+    ap.add_argument("--efficiency_out", type=str, default=None,
+                    help="Efficiency summary JSON path (default: out_root/efficiency_benchmark.json).")
+    ap.add_argument("--efficiency_render_warmup_views", type=int, default=10,
+                    help="Render benchmark warm-up calls, excluded from timing (default: 10).")
+    ap.add_argument("--efficiency_render_repeats", type=int, default=3,
+                    help="Timed passes over the test views (default: 3).")
 
     # Step range control (for partial runs / resume)
     ap.add_argument("--from_step", type=int, default=1, help="Execute steps starting from this number (1-14).")
@@ -1200,6 +1210,12 @@ def main() -> None:
         ap.error("--eval_montage_samples must be >= 0")
     if float(args.cfr_exif_noise_pct) < 0.0:
         ap.error("--cfr_exif_noise_pct must be >= 0")
+    if args.efficiency_render_warmup_views < 0:
+        ap.error("--efficiency_render_warmup_views must be >= 0")
+    if args.efficiency_render_repeats <= 0:
+        ap.error("--efficiency_render_repeats must be > 0")
+    if args.benchmark_efficiency and args.dry_run:
+        ap.error("--benchmark_efficiency cannot be combined with --dry_run")
     if args.grouped_ablation_mode != "none" and (not bool(getattr(args, "baseline_modules_off", False))):
         ap.error("--grouped_ablation_mode requires --baseline_modules_off")
 
@@ -1349,6 +1365,10 @@ def main() -> None:
     model_t = out_root / "Model_T"
     model_f = out_root / "Model_F"
     eval_out = out_root / "eval"
+    train_eff_rgb = model_rgb / "train_efficiency.json"
+    train_eff_t = model_t / "train_efficiency.json"
+    render_eff_rgb = model_rgb / "render_efficiency.json"
+    render_eff_t = model_t / "render_efficiency.json"
 
     ensure_dir(out_root)
     train1_cmd = None
@@ -1368,6 +1388,47 @@ def main() -> None:
 
     def _in_step_range(n: int) -> bool:
         return args.from_step <= n <= args.to_step
+
+    def _efficiency_sidecar_completed(
+        path: Path,
+        kind: str,
+        *,
+        stage: Optional[str] = None,
+        iteration: Optional[int] = None,
+    ) -> bool:
+        payload = read_json_if_present(path)
+        if not payload:
+            return False
+        if payload.get("schema_name") != "uav-tgs-efficiency" or payload.get("schema_version") != 1:
+            return False
+        if payload.get("kind") != kind or payload.get("status") != "completed":
+            return False
+        if stage is not None and payload.get("stage") != stage:
+            return False
+        if kind == "training_stage" and iteration is not None:
+            result = payload.get("result")
+            if not isinstance(result, dict) or result.get("final_iteration") != int(iteration):
+                return False
+        if kind == "render":
+            if iteration is not None and payload.get("iteration") != int(iteration):
+                return False
+            benchmark = payload.get("benchmark")
+            if not isinstance(benchmark, dict):
+                return False
+            if benchmark.get("warmup_views") != int(args.efficiency_render_warmup_views):
+                return False
+            if benchmark.get("repeats") != int(args.efficiency_render_repeats):
+                return False
+        return True
+
+    def _sidecar_fingerprint(path: Path) -> Optional[Tuple[int, int, str]]:
+        if not path.is_file():
+            return None
+        try:
+            stat = path.stat()
+            return int(stat.st_size), int(stat.st_mtime_ns), _sha256_file(path)
+        except Exception:
+            return None
 
     debug_enabled = bool(args.debug_dump)
     debug_dump_written = False
@@ -1395,8 +1456,11 @@ def main() -> None:
                 "marker": str(marker_path(state_dir, name)),
             }
 
-    profile_enabled = bool(args.profile_pipeline)
+    # Efficiency summaries reuse the existing boundary-only stage timer.  The
+    # expensive recursive profile size/count collectors remain opt-in.
+    profile_enabled = bool(args.profile_pipeline or args.benchmark_efficiency)
     profile_dump_written = False
+    efficiency_dump_written = False
     profile_start_iso = datetime.now().isoformat(timespec="seconds")
     profile_start_perf = time.perf_counter()
     profile_steps: Dict[str, Dict[str, object]] = {}
@@ -1726,9 +1790,88 @@ def main() -> None:
         dump_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         eprint(f"[INFO] DebugDump: {dump_path}")
 
+    def _write_efficiency_dump(reason: str = "") -> None:
+        nonlocal efficiency_dump_written
+        if (not args.benchmark_efficiency) or efficiency_dump_written:
+            return
+        dump_path = Path(args.efficiency_out).expanduser() if args.efficiency_out else (out_root / "efficiency_benchmark.json")
+
+        stages: Dict[str, Dict[str, object]] = {}
+        for name in step_order:
+            entry = profile_steps.get(name, {})
+            run_meta = profile_run_meta.get(name, {})
+            stages[name] = {
+                "decision": entry.get("decision", "not_reached"),
+                # Only an actually entered step has a meaningful duration.
+                # Skipped/not-reached stages stay null instead of becoming 0 s.
+                "wall_time_s": run_meta.get("duration_s"),
+                "return_code": run_meta.get("returncode"),
+            }
+
+        rgb_ply = model_rgb / "point_cloud" / f"iteration_{args.rgb_iter}" / "point_cloud.ply"
+        t_ply = model_t / "point_cloud" / f"iteration_{args.t_iter}" / "point_cloud.ply"
+        fused_models = []
+        if model_f.is_dir():
+            try:
+                fused_models = [
+                    artifact_record(path, str(path.relative_to(model_f)))
+                    for path in sorted(model_f.rglob("point_cloud.ply"))
+                ]
+            except Exception as scan_error:
+                eprint(f"[WARN] Efficiency fused-model scan failed: {scan_error}")
+
+        final_reason = reason or "incomplete"
+        if final_reason.startswith("error:"):
+            run_status = "failed"
+        elif final_reason == "done":
+            run_status = "completed"
+        else:
+            run_status = "partial"
+        payload = {
+            "schema_name": "uav-tgs-efficiency",
+            "schema_version": 1,
+            "kind": "pipeline",
+            "run": {
+                "status": run_status,
+                "reason": final_reason,
+                "started_at": profile_start_iso,
+                "ended_at": _now_iso(),
+                "total_wall_time_s": float(time.perf_counter() - profile_start_perf),
+                "data_root": str(data_root),
+                "out_root": str(out_root),
+            },
+            "measurement_scope": {
+                "training_time": "train.py entry-to-return; includes model setup, evaluation, and saves",
+                "training_peak_memory": "PyTorch caching allocator, reset once at training boundary",
+                "render_time": "test-view render calls only; warm-up, GT handling, CPU transfer, and image I/O excluded",
+                "stage_time": "blocking subprocess wall time",
+            },
+            "stages": stages,
+            "training": {
+                "rgb": read_json_if_present(train_eff_rgb),
+                "thermal": read_json_if_present(train_eff_t),
+            },
+            "rendering": {
+                "rgb": read_json_if_present(render_eff_rgb),
+                "thermal": read_json_if_present(render_eff_t),
+            },
+            "models": {
+                "rgb": artifact_record(rgb_ply, "rgb"),
+                "thermal": artifact_record(t_ply, "thermal"),
+                "fused": fused_models,
+            },
+        }
+        try:
+            atomic_write_json(dump_path, payload)
+            efficiency_dump_written = True
+            eprint(f"[INFO] EfficiencyBenchmark: {dump_path}")
+        except Exception as write_error:
+            eprint(f"[WARN] Efficiency summary could not be written: {write_error}")
+
     def _write_profile_dump(reason: str = "") -> None:
         nonlocal profile_dump_written
-        if (not profile_enabled) or profile_dump_written:
+        _write_efficiency_dump(reason)
+        if (not args.profile_pipeline) or profile_dump_written:
             return
         profile_dump_written = True
         dump_path = Path(args.profile_out).expanduser() if args.profile_out else (out_root / "pipeline_profile.json")
@@ -2265,8 +2408,17 @@ def main() -> None:
         train1_cmd.extend(["--clamp_scale_max", str(clamp_effective_rgb), "--clamp_scale_after_densify"])
     if args.clamp_scale_after_rgb_final:
         train1_cmd.append("--clamp_scale_after_rgb_final")
+    if args.benchmark_efficiency:
+        train1_cmd.extend([
+            "--benchmark_efficiency",
+            "--efficiency_output", str(train_eff_rgb),
+            "--efficiency_stage", "rgb",
+        ])
 
-    train1_outputs_ok = ckpt_rgb.exists()
+    train1_outputs_ok = ckpt_rgb.exists() and (
+        (not args.benchmark_efficiency)
+        or _efficiency_sidecar_completed(train_eff_rgb, "training_stage", stage="rgb", iteration=args.rgb_iter)
+    )
     if not _in_step_range(5):
         eprint("[SKIP] 05_train_rgb (outside selected step range)")
         _record_step("05_train_rgb", "skip_range", train1_cmd, outputs_ok=train1_outputs_ok)
@@ -2275,15 +2427,32 @@ def main() -> None:
         if skip:
             _record_step("05_train_rgb", "skip", train1_cmd, outputs_ok=train1_outputs_ok)
         else:
+            train1_sidecar_before = _sidecar_fingerprint(train_eff_rgb) if args.benchmark_efficiency else None
             maybe_run(train1_cmd, cwd=gs_root, step_name="05_train_rgb")
-            train1_outputs_ok = ckpt_rgb.exists()
+            train1_sidecar_fresh = (
+                (not args.benchmark_efficiency)
+                or (
+                    _efficiency_sidecar_completed(train_eff_rgb, "training_stage", stage="rgb", iteration=args.rgb_iter)
+                    and _sidecar_fingerprint(train_eff_rgb) != train1_sidecar_before
+                )
+            )
+            train1_outputs_ok = ckpt_rgb.exists() and train1_sidecar_fresh
             if not train1_outputs_ok:
-                _maybe_raise_file_not_found(f"RGB checkpoint not found after training: {ckpt_rgb}")
+                _maybe_raise_file_not_found(
+                    f"RGB checkpoint or fresh completed efficiency sidecar missing after training: {model_rgb}"
+                )
             _record_step("05_train_rgb", "run", train1_cmd, outputs_ok=train1_outputs_ok)
             write_marker(marker_path(state_dir, "05_train_rgb"), "05_train_rgb", train1_cmd, cwd=gs_root)
 
     # Render RGB (keep -r consistent with training to avoid mismatched intrinsics/resolution)
     render1_cmd = [py, "render.py", "-m", str(model_rgb), "-s", str(data_root), "-r", str(args.rgb_res)]
+    if args.benchmark_efficiency:
+        render1_cmd.extend([
+            "--benchmark_efficiency",
+            "--benchmark_warmup_views", str(args.efficiency_render_warmup_views),
+            "--benchmark_repeats", str(args.efficiency_render_repeats),
+            "--benchmark_output", str(render_eff_rgb),
+        ])
     render1_outputs_ok = (model_rgb / "test").exists() and contains_any_file(model_rgb / "test", ("00000.png",), max_depth=5)  # weak check
     # Better: any image in test dir
     if (model_rgb / "test").exists():
@@ -2291,6 +2460,10 @@ def main() -> None:
             render1_outputs_ok = any(p.suffix.lower() in (".png", ".jpg", ".jpeg") for p in (model_rgb / "test").rglob("*"))
         except Exception:
             pass
+    render1_outputs_ok = render1_outputs_ok and (
+        (not args.benchmark_efficiency)
+        or _efficiency_sidecar_completed(render_eff_rgb, "render", iteration=args.rgb_iter)
+    )
 
     if not _in_step_range(6):
 
@@ -2303,7 +2476,27 @@ def main() -> None:
         if skip:
             _record_step("06_render_rgb", "skip", render1_cmd, outputs_ok=render1_outputs_ok)
         else:
+            render1_sidecar_before = _sidecar_fingerprint(render_eff_rgb) if args.benchmark_efficiency else None
             maybe_run(render1_cmd, cwd=gs_root, step_name="06_render_rgb")
+            render1_outputs_ok = (model_rgb / "test").exists()
+            if render1_outputs_ok:
+                try:
+                    render1_outputs_ok = any(
+                        p.suffix.lower() in (".png", ".jpg", ".jpeg")
+                        for p in (model_rgb / "test").rglob("*")
+                    )
+                except Exception:
+                    render1_outputs_ok = False
+            render1_sidecar_fresh = (
+                (not args.benchmark_efficiency)
+                or (
+                    _efficiency_sidecar_completed(render_eff_rgb, "render", iteration=args.rgb_iter)
+                    and _sidecar_fingerprint(render_eff_rgb) != render1_sidecar_before
+                )
+            )
+            render1_outputs_ok = render1_outputs_ok and render1_sidecar_fresh
+            if not render1_outputs_ok:
+                _maybe_raise_file_not_found(f"RGB render outputs or efficiency sidecar missing under: {model_rgb}")
             _record_step("06_render_rgb", "run", render1_cmd, outputs_ok=render1_outputs_ok)
             write_marker(marker_path(state_dir, "06_render_rgb"), "06_render_rgb", render1_cmd, cwd=gs_root)
 
@@ -2482,7 +2675,16 @@ def main() -> None:
         train2_cmd.append("--sgf_disable")
 
     train2_cmd.extend(tstruct_train_extra)
-    train2_outputs_ok = ckpt_t.exists()
+    if args.benchmark_efficiency:
+        train2_cmd.extend([
+            "--benchmark_efficiency",
+            "--efficiency_output", str(train_eff_t),
+            "--efficiency_stage", "thermal",
+        ])
+    train2_outputs_ok = ckpt_t.exists() and (
+        (not args.benchmark_efficiency)
+        or _efficiency_sidecar_completed(train_eff_t, "training_stage", stage="thermal", iteration=args.t_iter)
+    )
     # Preflight: step 10 requires stage-1 checkpoint and thermal_UD dataset
     if _in_step_range(10):
         if not ckpt_rgb.exists():
@@ -2501,20 +2703,41 @@ def main() -> None:
         if skip:
             _record_step("10_train_thermal", "skip", train2_cmd, outputs_ok=train2_outputs_ok)
         else:
+            train2_sidecar_before = _sidecar_fingerprint(train_eff_t) if args.benchmark_efficiency else None
             maybe_run(train2_cmd, cwd=gs_root, step_name="10_train_thermal")
-            train2_outputs_ok = ckpt_t.exists()
+            train2_sidecar_fresh = (
+                (not args.benchmark_efficiency)
+                or (
+                    _efficiency_sidecar_completed(train_eff_t, "training_stage", stage="thermal", iteration=args.t_iter)
+                    and _sidecar_fingerprint(train_eff_t) != train2_sidecar_before
+                )
+            )
+            train2_outputs_ok = ckpt_t.exists() and train2_sidecar_fresh
             if not train2_outputs_ok:
-                _maybe_raise_file_not_found(f"Thermal checkpoint not found after training: {ckpt_t}")
+                _maybe_raise_file_not_found(
+                    f"Thermal checkpoint or fresh completed efficiency sidecar missing after training: {model_t}"
+                )
             _record_step("10_train_thermal", "run", train2_cmd, outputs_ok=train2_outputs_ok)
             write_marker(marker_path(state_dir, "10_train_thermal"), "10_train_thermal", train2_cmd, cwd=gs_root)
 
     render2_cmd = [py, "render.py", "-m", str(model_t), "-s", str(thermal_ud), "-r", str(args.t_res)]
+    if args.benchmark_efficiency:
+        render2_cmd.extend([
+            "--benchmark_efficiency",
+            "--benchmark_warmup_views", str(args.efficiency_render_warmup_views),
+            "--benchmark_repeats", str(args.efficiency_render_repeats),
+            "--benchmark_output", str(render_eff_t),
+        ])
     render2_outputs_ok = (model_t / "test").exists()
     if (model_t / "test").exists():
         try:
             render2_outputs_ok = any(p.suffix.lower() in (".png", ".jpg", ".jpeg") for p in (model_t / "test").rglob("*"))
         except Exception:
             pass
+    render2_outputs_ok = render2_outputs_ok and (
+        (not args.benchmark_efficiency)
+        or _efficiency_sidecar_completed(render_eff_t, "render", iteration=args.t_iter)
+    )
 
     if not _in_step_range(11):
 
@@ -2527,7 +2750,27 @@ def main() -> None:
         if skip:
             _record_step("11_render_thermal", "skip", render2_cmd, outputs_ok=render2_outputs_ok)
         else:
+            render2_sidecar_before = _sidecar_fingerprint(render_eff_t) if args.benchmark_efficiency else None
             maybe_run(render2_cmd, cwd=gs_root, step_name="11_render_thermal")
+            render2_outputs_ok = (model_t / "test").exists()
+            if render2_outputs_ok:
+                try:
+                    render2_outputs_ok = any(
+                        p.suffix.lower() in (".png", ".jpg", ".jpeg")
+                        for p in (model_t / "test").rglob("*")
+                    )
+                except Exception:
+                    render2_outputs_ok = False
+            render2_sidecar_fresh = (
+                (not args.benchmark_efficiency)
+                or (
+                    _efficiency_sidecar_completed(render_eff_t, "render", iteration=args.t_iter)
+                    and _sidecar_fingerprint(render_eff_t) != render2_sidecar_before
+                )
+            )
+            render2_outputs_ok = render2_outputs_ok and render2_sidecar_fresh
+            if not render2_outputs_ok:
+                _maybe_raise_file_not_found(f"Thermal render outputs or efficiency sidecar missing under: {model_t}")
             _record_step("11_render_thermal", "run", render2_cmd, outputs_ok=render2_outputs_ok)
             write_marker(marker_path(state_dir, "11_render_thermal"), "11_render_thermal", render2_cmd, cwd=gs_root)
 
