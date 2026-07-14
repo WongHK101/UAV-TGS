@@ -66,3 +66,46 @@ python tools/thermal_radiometry/estimate_scene_range.py `
 The default range is the envelope of per-training-frame p0.1/p99.9 estimates
 plus a 2% span margin.  Test maps are read only after the range is fixed and
 contribute only clipping QA; guard maps are not read.
+
+## Canonical palette, round-trip QA, and temperature evaluation
+
+Render every float32 map with the same repository-owned, 256-entry Hot-Iron
+LUT, linear scene range, gamma 1, and lossless PNG:
+
+```powershell
+python tools/thermal_radiometry/render_canonical_palette.py `
+  --temperature-root DERIVED/temperature_c `
+  --output-root DERIVED/canonical_hotiron `
+  --range-manifest DERIVED/qa/range_manifest.json
+```
+
+The LUT is named `uav-tgs-hot-iron-v1`; its RGB-byte SHA and uniqueness count
+are written to every manifest.  It is a repository-owned canonical palette,
+not a claim that native DJI previews use the same color table.
+
+Validate the canonical encoding before training:
+
+```powershell
+python tools/thermal_radiometry/validate_roundtrip.py `
+  --temperature-root DERIVED/temperature_c `
+  --canonical-root DERIVED/canonical_hotiron `
+  --range-manifest DERIVED/qa/range_manifest.json `
+  --report DERIVED/qa/roundtrip_report.json
+```
+
+The check fails if an in-range pixel exceeds half a temperature bin, a
+canonical pixel is off the LUT, or clipping exceeds the configured limit.
+
+Evaluate a thermal render against the original float32 maps with:
+
+```powershell
+python tools/thermal_radiometry/evaluate_temperature.py `
+  --ground-truth-root DERIVED/temperature_c `
+  --render-root RENDERED_THERMAL `
+  --range-manifest DERIVED/qa/range_manifest.json `
+  --report OUTPUT/temperature_metrics.json
+```
+
+The reported quantity is **TSDK-referenced apparent-temperature consistency**
+(MAE, RMSE, signed bias, P95 error, clipping, and off-LUT distance).  It is not
+absolute thermometry, true surface temperature, or physical ground truth.
