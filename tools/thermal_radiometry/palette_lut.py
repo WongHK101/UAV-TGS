@@ -158,19 +158,60 @@ def nearest_lut_indices(
     table_u8 = hot_iron_lut() if lut is None else np.asarray(lut, dtype=np.uint8)
     if table_u8.shape != (PALETTE_SIZE, 3):
         raise ValueError(f"Expected a {PALETTE_SIZE}x3 LUT, got {table_u8.shape}")
-    pixels = image.reshape(-1, 3).astype(np.float32, copy=False)
+    flat_image = image.reshape(-1, 3)
+    pixels = flat_image.astype(np.float32, copy=False)
     table = table_u8.astype(np.float32)
     table_norm = np.sum(table * table, axis=1)[None, :]
     indices = np.empty(pixels.shape[0], dtype=np.uint8)
     distances = np.empty(pixels.shape[0], dtype=np.float32)
+    # PNG canonical observations and many rendered pixels are already exact LUT
+    # entries.  Resolve those by a compact 24-bit RGB key and reserve the
+    # 256-way distance projection for genuinely off-LUT pixels.  Stable sorting
+    # preserves np.argmin's first-entry tie behaviour if a custom LUT contains
+    # duplicate colours.
+    exact_u8_input = image.dtype == np.uint8
+    table_keys = (
+        (table_u8[:, 0].astype(np.uint32) << 16)
+        | (table_u8[:, 1].astype(np.uint32) << 8)
+        | table_u8[:, 2].astype(np.uint32)
+    )
+    table_key_order = np.argsort(table_keys, kind="stable")
+    sorted_table_keys = table_keys[table_key_order]
     for start in range(0, pixels.shape[0], chunk_pixels):
         stop = min(start + chunk_pixels, pixels.shape[0])
         part = pixels[start:stop]
-        d2 = np.sum(part * part, axis=1, keepdims=True) + table_norm - 2.0 * (part @ table.T)
-        np.maximum(d2, 0.0, out=d2)
-        nearest = np.argmin(d2, axis=1)
-        indices[start:stop] = nearest.astype(np.uint8)
-        distances[start:stop] = np.sqrt(d2[np.arange(stop - start), nearest])
+        part_indices = indices[start:stop]
+        part_distances = distances[start:stop]
+        exact = np.zeros(stop - start, dtype=bool)
+        if exact_u8_input:
+            part_u8 = flat_image[start:stop]
+            part_keys = (
+                (part_u8[:, 0].astype(np.uint32) << 16)
+                | (part_u8[:, 1].astype(np.uint32) << 8)
+                | part_u8[:, 2].astype(np.uint32)
+            )
+            positions = np.searchsorted(sorted_table_keys, part_keys)
+            candidates = np.minimum(positions, PALETTE_SIZE - 1)
+            exact = (positions < PALETTE_SIZE) & (
+                sorted_table_keys[candidates] == part_keys
+            )
+            if np.any(exact):
+                part_indices[exact] = table_key_order[candidates[exact]].astype(np.uint8)
+                part_distances[exact] = 0.0
+        unmatched = ~exact
+        if np.any(unmatched):
+            projected = part[unmatched]
+            d2 = (
+                np.sum(projected * projected, axis=1, keepdims=True)
+                + table_norm
+                - 2.0 * (projected @ table.T)
+            )
+            np.maximum(d2, 0.0, out=d2)
+            nearest = np.argmin(d2, axis=1)
+            part_indices[unmatched] = nearest.astype(np.uint8)
+            part_distances[unmatched] = np.sqrt(
+                d2[np.arange(projected.shape[0]), nearest]
+            )
     return indices.reshape(image.shape[:2]), distances.reshape(image.shape[:2])
 
 

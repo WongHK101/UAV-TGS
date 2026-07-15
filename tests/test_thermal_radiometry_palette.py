@@ -14,6 +14,25 @@ from tools.thermal_radiometry import validate_roundtrip
 
 
 class CanonicalPaletteTests(unittest.TestCase):
+    def test_exact_lut_fast_path_matches_bruteforce_projection(self) -> None:
+        lut = palette_lut.hot_iron_lut()
+        exact_indices = np.array([[0, 1, 127], [128, 254, 255]], dtype=np.uint8)
+        image = lut[exact_indices]
+        projected, distances = palette_lut.nearest_lut_indices(image, chunk_pixels=2)
+        np.testing.assert_array_equal(projected, exact_indices)
+        np.testing.assert_array_equal(distances, np.zeros_like(distances))
+
+        mixed = image.copy()
+        mixed[0, 1] = np.array([13, 91, 207], dtype=np.uint8)
+        pixels = mixed.reshape(-1, 3).astype(np.float32)
+        table = lut.astype(np.float32)
+        brute_d2 = np.sum((pixels[:, None, :] - table[None, :, :]) ** 2, axis=2)
+        brute_indices = np.argmin(brute_d2, axis=1).astype(np.uint8).reshape(mixed.shape[:2])
+        brute_distances = np.sqrt(np.min(brute_d2, axis=1)).reshape(mixed.shape[:2])
+        projected, distances = palette_lut.nearest_lut_indices(mixed, chunk_pixels=3)
+        np.testing.assert_array_equal(projected, brute_indices)
+        np.testing.assert_allclose(distances, brute_distances, rtol=0.0, atol=0.0)
+
     def test_lut_is_fixed_unique_and_versioned(self):
         lut = palette_lut.hot_iron_lut()
         self.assertEqual(lut.shape, (256, 3))
