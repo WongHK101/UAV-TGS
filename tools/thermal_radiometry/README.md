@@ -38,6 +38,43 @@ Parameter values are never silently labeled as embedded.  Every value carries
 an explicit source such as `per_frame_lrf`, `scene_embedded_median`,
 `geometry_estimate`, or `benchmark_assumption`.
 
+## Explicit per-scene decode protocol
+
+Resolve an audit manifest into the complete, decode-ready protocol before a
+batch run:
+
+```powershell
+python tools/thermal_radiometry/build_radiometry_protocol.py `
+  --audit-manifest DERIVED/manifests/rjpeg_audit.jsonl `
+  --output DERIVED/manifests/decode_protocol.jsonl `
+  --summary-out DERIVED/qa/decode_protocol_summary.json `
+  --scene SCENE `
+  --scene-distance-m 30 `
+  --scene-distance-provenance benchmark_assumption:scene_nominal_altitude `
+  --humidity-percent 70 `
+  --humidity-percent-source benchmark_assumption:aaai_pilot_v1 `
+  --ambient-c 25 `
+  --ambient-c-source benchmark_assumption:aaai_pilot_v1 `
+  --reflected-c 23 `
+  --reflected-c-source benchmark_assumption:aaai_pilot_v1
+```
+
+The default emissivity is the explicit benchmark assumption `0.95`.  Distance
+is fixed per view/flight strip in this order: robust median of valid LRF
+measurements, robust median of `relative altitude / sin(abs(gimbal pitch))`,
+then the explicitly supplied scene assumption.  Each frame retains its raw
+LRF fields, resolved strip ID, used distance and source, and fallback reason.
+No missing environmental value is presented as embedded metadata.
+
+Pass the result directly to the decoder:
+
+```powershell
+python tools/thermal_radiometry/decode_temperature.py `
+  --input-manifest DERIVED/manifests/decode_protocol.jsonl `
+  --output-dir DERIVED `
+  --tsdk-root PATH_TO_DJI_TSDK
+```
+
 ## Leakage-guarded split and train-only range
 
 Build a deterministic split from the audit/protocol manifest:
@@ -53,6 +90,19 @@ The preferred route uses timestamp and gimbal strata.  If those fields are not
 reliable for every frame, the complete scene uses natural filename order.  A
 stable scene/strip hash selects complete 16-frame test blocks every eight
 blocks; two adjacent frames on each side are `guard` and never enter training.
+
+Before choosing a formal guard width, produce a side-by-side QA report for the
+fixed candidates 2, 4, and 8 (the tool deliberately makes no selection):
+
+```powershell
+python tools/thermal_radiometry/split_qa.py `
+  --manifest DERIVED/manifests/all_scenes_audit.jsonl `
+  --output DERIVED/qa/split_guard_2_4_8.json
+```
+
+The report includes scene/stratum/strip counts, strips without a test block,
+retained and train/test ratios, metadata coverage/fallback, and for every test
+frame its nearest usable train observation by time, GPS, and gimbal angle.
 
 After decoded NPY paths have been attached to the split records, estimate a
 fixed range using training frames only:
@@ -103,9 +153,39 @@ python tools/thermal_radiometry/evaluate_temperature.py `
   --ground-truth-root DERIVED/temperature_c `
   --render-root RENDERED_THERMAL `
   --range-manifest DERIVED/qa/range_manifest.json `
+  --split-manifest DERIVED/splits/split_manifest.json `
+  --subset test `
+  --mask-root RENDERED_ALPHA `
+  --alpha-threshold 0.01 `
+  --require-support `
   --report OUTPUT/temperature_metrics.json
 ```
 
-The reported quantity is **TSDK-referenced apparent-temperature consistency**
-(MAE, RMSE, signed bias, P95 error, clipping, and off-LUT distance).  It is not
-absolute thermometry, true surface temperature, or physical ground truth.
+`--subset` accepts `train`, `test`, or `guard` and requires the split manifest.
+Masks mirror the render-relative paths and may be grayscale/RGBA images or
+two-dimensional NPY arrays.  Mask values and RGBA render alpha are normalised
+to `[0,1]`; a pixel is supported only when its value is strictly greater than
+`--alpha-threshold`.  An external mask takes precedence over render alpha.  If
+neither exists, an RGB render is treated as fully supported for legacy CLI
+compatibility, but `support_is_explicit=false` and a warning are written to the
+report.  Use `--require-support` for formal evaluation: it fails closed on a
+missing render/mask, implicit RGB full-frame fallback, or a frame without any
+supported pixels.
+
+For a real model render, the primary reported quantity is
+**palette-inverted TSDK-referenced apparent-temperature error** on supported
+pixels.  The umbrella evaluation name remains **TSDK-referenced
+apparent-temperature consistency**.  The report separately includes:
+
+- supported-pixel and all-pixel-diagnostic MAE, RMSE, signed bias, and P95;
+- pixel-micro aggregates and frame-macro mean/standard deviation;
+- unsupported, missing-render, missing-mask, and combined ratios;
+- supported/all-pixel clipping and off-LUT distance.
+
+Missing renders or requested masks are counted rather than silently dropped.
+`primary_metric_valid` is false and the report status is
+`invalid_no_supported_pixels` when the supported domain is empty.  A valid
+primary result with missing inputs has status `completed_with_missing`; it is
+never labeled simply `complete`.
+The all-pixel result is diagnostic only.  These quantities are not absolute
+thermometry, true surface temperature, or physical ground truth.
