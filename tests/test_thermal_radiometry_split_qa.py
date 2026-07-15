@@ -55,7 +55,7 @@ class SplitQaTests(unittest.TestCase):
             self.assertEqual(report["fixed_rule"]["block_size_frames"], 16)
             self.assertEqual(
                 [candidate["guard_frames_each_side"] for candidate in report["candidates"]],
-                [2, 4, 8],
+                [2, 4],
             )
             for candidate in report["candidates"]:
                 self.assertEqual(candidate["counts"]["total"], 200)
@@ -70,6 +70,7 @@ class SplitQaTests(unittest.TestCase):
                 self.assertAlmostEqual(candidate["metadata_fallback"]["frame_rate"], 0.2)
                 self.assertIn("retained_ratio", candidate["retained_train_test"])
                 self.assertIn("train_to_test_ratio", candidate["retained_train_test"])
+                self.assertEqual(candidate["invalid_scene_count"], 0)
 
                 scenes = {scene["scene"]: scene for scene in candidate["scenes"]}
                 reliable_scene = scenes["Reliable"]
@@ -77,6 +78,10 @@ class SplitQaTests(unittest.TestCase):
                 self.assertTrue(reliable_scene["stratum_counts"])
                 self.assertTrue(reliable_scene["strip_counts"])
                 self.assertTrue(reliable_scene["test_frame_nearest_train"])
+                self.assertEqual(reliable_scene["validation"]["status"], "passed")
+                self.assertGreaterEqual(reliable_scene["test_fraction_of_scene"], 0.08)
+                self.assertLessEqual(reliable_scene["test_fraction_of_scene"], 0.16)
+                self.assertIn("strata_without_test", reliable_scene)
                 nearest = reliable_scene["test_frame_nearest_train"][0]
                 self.assertIsNotNone(nearest["nearest_train_temporal_gap_s"])
                 self.assertIsNotNone(nearest["nearest_train_gps_distance_m"])
@@ -97,15 +102,19 @@ class SplitQaTests(unittest.TestCase):
                 self.assertEqual(fallback_scene["ordering_mode"], "filename_order_fallback")
                 self.assertEqual(fallback_scene["metadata_fallback_rate"], 1.0)
 
-    def test_larger_guard_never_increases_training_count(self) -> None:
+    def test_each_guard_candidate_preserves_budget_and_count_conservation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             manifest = Path(temporary) / "scene.jsonl"
             self._write_manifest(manifest, self._records("Scene", 160))
             report = split_qa.build_split_qa_report([manifest], seed="fixed-seed")
-            train_counts = [candidate["counts"]["train"] for candidate in report["candidates"]]
-            guard_counts = [candidate["counts"]["guard"] for candidate in report["candidates"]]
-            self.assertEqual(train_counts, sorted(train_counts, reverse=True))
-            self.assertEqual(guard_counts, sorted(guard_counts))
+            for candidate in report["candidates"]:
+                counts = candidate["counts"]
+                self.assertEqual(counts["total"], counts["train"] + counts["test"] + counts["guard"])
+                scene = candidate["scenes"][0]
+                self.assertEqual(scene["test_block_budget"]["target"], 1)
+                self.assertEqual(scene["test_block_budget"]["selected"], 1)
+                self.assertEqual(counts["test"], 16)
+                self.assertEqual(scene["validation"]["status"], "passed")
 
     def test_short_strip_is_explicitly_reported_without_test(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -119,23 +128,20 @@ class SplitQaTests(unittest.TestCase):
                 self.assertEqual(candidate["strips_without_test_count"], 1)
                 self.assertIsNone(candidate["retained_train_test"]["train_to_test_ratio"])
 
-    def test_single_complete_block_warns_about_no_train_strip_and_stratum(self) -> None:
+    def test_single_complete_block_is_kept_entirely_for_training(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             manifest = Path(temporary) / "no_train.jsonl"
             self._write_manifest(manifest, self._records("NoTrain", 16))
             report = split_qa.build_split_qa_report([manifest], seed="fixed-seed")
             for candidate in report["candidates"]:
                 scene = candidate["scenes"][0]
-                self.assertEqual(scene["counts"]["train"], 0)
-                self.assertEqual(len(scene["strips_without_train"]), 1)
-                self.assertEqual(len(scene["strata_without_train"]), 1)
-                self.assertEqual(candidate["strips_without_train_count"], 1)
-                self.assertEqual(candidate["strata_without_train_count"], 1)
-                self.assertEqual(candidate["warning_count"], 2)
-                self.assertEqual(
-                    {warning["code"] for warning in candidate["warnings"]},
-                    {"strip_without_train", "stratum_without_train"},
-                )
+                self.assertEqual(scene["counts"], {"total": 16, "train": 16, "test": 0, "guard": 0})
+                self.assertEqual(scene["strips_without_train"], [])
+                self.assertEqual(scene["strata_without_train"], [])
+                self.assertEqual(candidate["strips_without_train_count"], 0)
+                self.assertEqual(candidate["strata_without_train_count"], 0)
+                self.assertEqual(candidate["warning_count"], 0)
+                self.assertEqual(scene["validation"]["status"], "passed")
                 nearest_summary = candidate["nearest_train_summary"]
                 self.assertEqual(
                     nearest_summary["per_metric_independent_minima"]["temporal_gap_s"]["supported_count"],
@@ -146,16 +152,39 @@ class SplitQaTests(unittest.TestCase):
                     0,
                 )
 
+    def test_formal_split_failure_is_reported_as_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = Path(temporary) / "invalid.jsonl"
+            records = self._records("Invalid", 160)
+            for index, record in enumerate(records):
+                group = index // 16
+                record["stratum"] = f"short-{group:02d}"
+                record["strip_id"] = f"short-{group:02d}"
+            self._write_manifest(manifest, records)
+
+            report = split_qa.build_split_qa_report([manifest], seed="fixed-seed")
+            for candidate in report["candidates"]:
+                scene = candidate["scenes"][0]
+                self.assertEqual(scene["validation"]["status"], "failed")
+                self.assertEqual(candidate["invalid_scene_count"], 1)
+                budget_error = next(
+                    warning
+                    for warning in scene["warnings"]
+                    if warning["code"] == "test_block_budget_shortfall"
+                )
+                self.assertEqual(budget_error["severity"], "error")
+
     def test_report_is_deterministic_and_cli_writes_it(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             manifest = root / "scene.jsonl"
             output = root / "qa.json"
-            self._write_manifest(manifest, self._records("Scene", 64))
+            self._write_manifest(manifest, self._records("Scene", 128))
             first = split_qa.build_split_qa_report([manifest], seed="fixed-seed")
             second = split_qa.build_split_qa_report([manifest], seed="fixed-seed")
             self.assertEqual(first, second)
             self.assertEqual(len(first["qa_hash"]), 64)
+            self.assertTrue(first["cross_guard_test_set_comparison"])
 
             exit_code = split_qa.main(
                 [

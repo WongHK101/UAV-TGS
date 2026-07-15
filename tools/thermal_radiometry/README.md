@@ -87,22 +87,28 @@ python tools/thermal_radiometry/build_split.py `
 ```
 
 The preferred route uses timestamp and gimbal strata.  If those fields are not
-reliable for every frame, the complete scene uses natural filename order.  A
-stable scene/strip hash selects complete 16-frame test blocks every eight
-blocks; two adjacent frames on each side are `guard` and never enter training.
+reliable for every frame, the complete scene uses natural filename order.  The
+scene receives `round_half_up(scene_frames / (16 * 8))` complete test blocks.
+Eligible blocks must leave at least 16 training frames in both their strip and
+stratum; a largest-remainder allocation distributes the scene budget across
+strata, and stable hashes select blocks within each stratum.  Short unsupported
+strata therefore remain entirely in training instead of being forced into test.
+Adjacent frames on each side of a selected block are `guard` and never train.
 
 Before choosing a formal guard width, produce a side-by-side QA report for the
-fixed candidates 2, 4, and 8 (the tool deliberately makes no selection):
+fixed candidates 2 and 4 (the tool deliberately makes no selection):
 
 ```powershell
 python tools/thermal_radiometry/split_qa.py `
   --manifest DERIVED/manifests/all_scenes_audit.jsonl `
-  --output DERIVED/qa/split_guard_2_4_8.json
+  --output DERIVED/qa/split_guard_2_4.json
 ```
 
-The report includes scene/stratum/strip counts, strips without a test block,
-retained and train/test ratios, metadata coverage/fallback, and for every test
-frame its nearest usable train observation by time, GPS, and gimbal angle.
+The report includes per-scene budget and test fraction, scene/stratum/strip
+counts, strata without a test block, fail-closed validation, cross-guard test
+set overlap, metadata coverage/fallback, and for every test frame its nearest
+usable train observation by time, GPS, and gimbal angle.  Guard selection stays
+pending until the comparison is reviewed.
 
 After decoded NPY paths have been attached to the split records, estimate a
 fixed range using training frames only:

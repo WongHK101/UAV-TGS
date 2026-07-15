@@ -3,7 +3,7 @@
 
 The tool deliberately does not select a preferred guard width.  It reuses
 ``build_split.build_split_manifest`` with a fixed 16-frame block size and
-reports guard=2/4/8 candidates (configurable only as an explicit comparison
+reports guard=2/4 candidates (configurable only as an explicit comparison
 set).  Input manifests may be audit JSONL files or protocol JSON manifests;
 records are grouped by their scene before each candidate split is built.
 
@@ -30,10 +30,10 @@ except ImportError:  # pragma: no cover
 
 
 SCHEMA_NAME = "uav_tgs_split_guard_qa"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 BLOCK_SIZE = 16
 TEST_PERIOD_BLOCKS = 8
-DEFAULT_GUARDS = (2, 4, 8)
+DEFAULT_GUARDS = (2, 4)
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -460,6 +460,7 @@ def _scene_candidate(
         test_period_blocks=TEST_PERIOD_BLOCKS,
         guard_frames=guard_frames,
         strip_max_gap_s=strip_max_gap_s,
+        fail_on_invalid=False,
     )
     metadata_by_pair: dict[str, dict[str, Any]] = {}
     for index, source_record in enumerate(records):
@@ -517,13 +518,23 @@ def _scene_candidate(
         for item in stratum_counts
         if item["train"] == 0
     ]
+    strata_without_test = [
+        {
+            "stratum": item["stratum"],
+            "frame_count": item["total"],
+            "train_count": item["train"],
+            "guard_count": item["guard"],
+        }
+        for item in stratum_counts
+        if item["test"] == 0
+    ]
     warnings: list[dict[str, Any]] = []
     for item in strips_without_train:
         warnings.append(
             {
                 "code": "strip_without_train",
-                "severity": "warning",
-                "message": "Candidate split leaves this strip with no training frames.",
+                "severity": "error",
+                "message": "Invalid split leaves this strip with no training frames.",
                 **item,
             }
         )
@@ -531,9 +542,20 @@ def _scene_candidate(
         warnings.append(
             {
                 "code": "stratum_without_train",
-                "severity": "warning",
-                "message": "Candidate split leaves this stratum with no training frames.",
+                "severity": "error",
+                "message": "Invalid split leaves this stratum with no training frames.",
                 **item,
+            }
+        )
+    existing_warning_codes = {str(item["code"]) for item in warnings}
+    for error in split["validation"]["errors"]:
+        if error in existing_warning_codes:
+            continue
+        warnings.append(
+            {
+                "code": str(error),
+                "severity": "error",
+                "message": "Scene-budget split failed a formal validation invariant.",
             }
         )
     metadata_supported = {
@@ -551,6 +573,13 @@ def _scene_candidate(
     return {
         "scene": scene,
         "split_hash": split["split_hash"],
+        "input_records_hash": split["input_records_hash"],
+        "allocation_hash": split["allocation_hash"],
+        "selected_test_blocks_hash": split["selected_test_blocks_hash"],
+        "selected_candidate_hashes": split["selected_candidate_hashes"],
+        "test_block_budget": split["test_block_budget"],
+        "stratum_allocations": split["stratum_allocations"],
+        "validation": split["validation"],
         "ordering_mode": split["rule"]["ordering_mode"],
         "metadata_reliability": split["metadata_reliability"],
         "metadata_fallback_frame_count": counts["total"] if fallback else 0,
@@ -564,12 +593,14 @@ def _scene_candidate(
             for name, supported in metadata_supported.items()
         },
         "counts": counts,
+        "test_fraction_of_scene": counts["test"] / counts["total"] if counts["total"] else None,
         "retained_train_test": _ratio_summary(counts),
         "stratum_counts": stratum_counts,
         "strip_counts": strip_counts,
         "strips_without_test": without_test,
         "strips_without_train": strips_without_train,
         "strata_without_train": strata_without_train,
+        "strata_without_test": strata_without_test,
         "warning_count": len(warnings),
         "warnings": warnings,
         "test_frame_nearest_train": nearest,
@@ -662,12 +693,57 @@ def build_split_qa_report(
                 "strata_without_train_count": sum(
                     len(scene["strata_without_train"]) for scene in scenes
                 ),
+                "strata_without_test_count": sum(
+                    len(scene["strata_without_test"]) for scene in scenes
+                ),
+                "valid_scene_count": sum(
+                    scene["validation"]["status"] == "passed" for scene in scenes
+                ),
+                "invalid_scene_count": sum(
+                    scene["validation"]["status"] != "passed" for scene in scenes
+                ),
                 "warning_count": len(candidate_warnings),
                 "warnings": candidate_warnings,
                 "nearest_train_summary": _nearest_summary(all_nearest),
                 "scenes": scenes,
             }
         )
+
+    cross_guard_test_set_comparison: list[dict[str, Any]] = []
+    for first_index, first_candidate in enumerate(candidates):
+        first_by_scene = {scene["scene"]: scene for scene in first_candidate["scenes"]}
+        for second_candidate in candidates[first_index + 1 :]:
+            second_by_scene = {
+                scene["scene"]: scene for scene in second_candidate["scenes"]
+            }
+            for scene in sorted(first_by_scene):
+                first_scene = first_by_scene[scene]
+                second_scene = second_by_scene[scene]
+                first_blocks = set(first_scene["selected_candidate_hashes"])
+                second_blocks = set(second_scene["selected_candidate_hashes"])
+                union = first_blocks | second_blocks
+                intersection = first_blocks & second_blocks
+                cross_guard_test_set_comparison.append(
+                    {
+                        "scene": scene,
+                        "first_guard_frames_each_side": first_candidate[
+                            "guard_frames_each_side"
+                        ],
+                        "second_guard_frames_each_side": second_candidate[
+                            "guard_frames_each_side"
+                        ],
+                        "first_selected_test_blocks_hash": first_scene[
+                            "selected_test_blocks_hash"
+                        ],
+                        "second_selected_test_blocks_hash": second_scene[
+                            "selected_test_blocks_hash"
+                        ],
+                        "same_selected_test_blocks": first_blocks == second_blocks,
+                        "intersection_block_count": len(intersection),
+                        "union_block_count": len(union),
+                        "jaccard": len(intersection) / len(union) if union else 1.0,
+                    }
+                )
 
     result: dict[str, Any] = {
         "schema_name": SCHEMA_NAME,
@@ -687,12 +763,25 @@ def build_split_qa_report(
         "fixed_rule": {
             "block_size_frames": BLOCK_SIZE,
             "test_period_blocks": TEST_PERIOD_BLOCKS,
+            "scene_test_block_budget": (
+                "round_half_up(scene_frame_count / "
+                "(block_size_frames * test_period_blocks))"
+            ),
+            "minimum_train_frames_after_selected_test": (
+                build_split.MIN_TRAIN_FRAMES_AFTER_TEST
+            ),
+            "stratum_allocation": "largest_remainder_over_feasible_capacity",
+            "test_fraction_of_scene_range": [
+                build_split.MIN_TEST_FRACTION,
+                build_split.MAX_TEST_FRACTION,
+            ],
             "strip_max_gap_s": strip_max_gap_s,
             "guard_candidates_frames_each_side": list(guard_values),
         },
         "input_manifests": input_descriptors,
         "scene_count": len(scene_records),
         "candidates": candidates,
+        "cross_guard_test_set_comparison": cross_guard_test_set_comparison,
     }
     result["qa_hash"] = _hash_json(result)
     return result

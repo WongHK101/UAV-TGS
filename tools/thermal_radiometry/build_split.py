@@ -3,8 +3,9 @@
 
 The preferred ordering derives contiguous strips from reliable timestamp and
 gimbal metadata.  If any record lacks those fields, the complete scene falls
-back to a deterministic natural filename order.  Test data are selected only
-as complete 16-frame blocks; the two neighbouring frames on either side are
+back to a deterministic natural filename order.  A scene-level test-block
+budget is allocated across strata by deterministic largest remainder.  Test
+data are selected only as complete 16-frame blocks; neighbouring frames are
 marked ``guard`` and are never included in training.
 """
 
@@ -22,10 +23,13 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 SCHEMA_NAME = "uav_tgs_deterministic_block_split"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_BLOCK_SIZE = 16
 DEFAULT_TEST_PERIOD_BLOCKS = 8
 DEFAULT_GUARD_FRAMES = 2
+MIN_TRAIN_FRAMES_AFTER_TEST = 16
+MIN_TEST_FRACTION = 0.08
+MAX_TEST_FRACTION = 0.16
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -383,10 +387,100 @@ def _build_strips(
     return "timestamp_gimbal", strips
 
 
-def _phase(seed: str, scene: str, strip_hash: str, period: int) -> tuple[int, str]:
-    phase_input = {"seed": seed, "scene": scene, "strip_hash": strip_hash}
-    phase_hash = _hash_json(phase_input)
-    return int(phase_hash[:16], 16) % period, phase_hash
+class SplitAllocationError(ValueError):
+    """Raised when the requested scene-level split cannot satisfy its guards."""
+
+
+def _round_half_up(value: float) -> int:
+    return int(math.floor(value + 0.5))
+
+
+def _selection_partition(
+    strip_infos: Sequence[Mapping[str, Any]],
+    selected: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, dict[str, set[int]]], dict[str, int], dict[str, int]]:
+    positions = {
+        str(info["strip_id"]): {"test": set(), "guard": set()}
+        for info in strip_infos
+    }
+    for candidate in selected:
+        entry = positions[str(candidate["strip_id"])]
+        entry["test"].update(candidate["test_positions"])
+        entry["guard"].update(candidate["guard_positions"])
+    for entry in positions.values():
+        entry["guard"].difference_update(entry["test"])
+
+    strip_train: dict[str, int] = {}
+    stratum_train: dict[str, int] = {}
+    for info in strip_infos:
+        strip_id = str(info["strip_id"])
+        stratum = str(info["stratum"])
+        removed = positions[strip_id]["test"] | positions[strip_id]["guard"]
+        train_count = int(info["frame_count"]) - len(removed)
+        strip_train[strip_id] = train_count
+        stratum_train[stratum] = stratum_train.get(stratum, 0) + train_count
+    return positions, strip_train, stratum_train
+
+
+def _can_add_candidate(
+    strip_infos: Sequence[Mapping[str, Any]],
+    selected: Sequence[Mapping[str, Any]],
+    candidate: Mapping[str, Any],
+    *,
+    minimum_train_frames: int,
+) -> bool:
+    _, strip_train, stratum_train = _selection_partition(
+        strip_infos, [*selected, candidate]
+    )
+    return (
+        strip_train[str(candidate["strip_id"])] >= minimum_train_frames
+        and stratum_train[str(candidate["stratum"])] >= minimum_train_frames
+    )
+
+
+def _largest_remainder_quotas(
+    eligible_by_stratum: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    target: int,
+    scene: str,
+    seed: str,
+) -> dict[str, dict[str, Any]]:
+    total_weight = sum(len(items) for items in eligible_by_stratum.values())
+    allocatable_target = min(target, total_weight)
+
+    allocation: dict[str, dict[str, Any]] = {}
+    for stratum in sorted(eligible_by_stratum):
+        weight = len(eligible_by_stratum[stratum])
+        ideal = (allocatable_target * weight / total_weight) if total_weight else 0.0
+        floor_quota = int(math.floor(ideal))
+        allocation[stratum] = {
+            "eligible_block_count": weight,
+            "ideal_quota": ideal,
+            "floor_quota": floor_quota,
+            "remainder": ideal - floor_quota,
+            "tie_hash": _hash_json(
+                {
+                    "seed": seed,
+                    "scene": scene,
+                    "stratum": stratum,
+                    "purpose": "largest_remainder_tie_break",
+                }
+            ),
+            "quota": floor_quota,
+        }
+
+    remaining = allocatable_target - sum(item["quota"] for item in allocation.values())
+    order = sorted(
+        allocation,
+        key=lambda stratum: (
+            -float(allocation[stratum]["remainder"]),
+            str(allocation[stratum]["tie_hash"]),
+            stratum,
+        ),
+    )
+    for stratum in order[:remaining]:
+        allocation[stratum]["quota"] += 1
+    return allocation
 
 
 def build_split_manifest(
@@ -400,9 +494,12 @@ def build_split_manifest(
     test_period_blocks: int = DEFAULT_TEST_PERIOD_BLOCKS,
     guard_frames: int = DEFAULT_GUARD_FRAMES,
     strip_max_gap_s: float = 10.0,
+    fail_on_invalid: bool = True,
 ) -> dict[str, Any]:
     if not scene:
         raise ValueError("scene must not be empty")
+    if not records:
+        raise ValueError("records must not be empty")
     if block_size <= 0 or test_period_blocks <= 0 or guard_frames < 0:
         raise ValueError("block size and period must be positive; guard must be non-negative")
     if strip_max_gap_s <= 0:
@@ -419,6 +516,16 @@ def build_split_manifest(
         metadata_reliable=reliability["reliable"],
         max_gap_s=strip_max_gap_s,
     )
+    input_records_hash = _hash_json(
+        [
+            {
+                "source_index": record["source_index"],
+                "pair_id": record["pair_id"],
+                "source_record_hash": record["source_record_hash"],
+            }
+            for record in normalised
+        ]
+    )
     rule = {
         "ordering_preference": "timestamp_gimbal_then_filename_order",
         "ordering_mode": ordering_mode,
@@ -431,67 +538,219 @@ def build_split_manifest(
         "test_period_blocks": test_period_blocks,
         "guard_frames_each_side": guard_frames,
         "partial_tail_block_can_be_test": False,
-        "phase_rule": "sha256(seed,scene,strip_hash) modulo test_period_blocks",
-        "short_strip_phase_rule": "if fewer complete blocks than the period, phase modulo complete block count",
+        "test_block_budget_rule": (
+            "round_half_up(scene_frame_count / "
+            "(block_size_frames * test_period_blocks))"
+        ),
+        "candidate_rule": "all complete blocks in every strip",
+        "candidate_order_rule": (
+            "sha256(seed,scene,stratum,strip_hash,block_index,ordered_block_pairs)"
+        ),
+        "candidate_hash_guard_invariant": True,
+        "minimum_train_frames_after_selected_test": MIN_TRAIN_FRAMES_AFTER_TEST,
+        "short_stratum_rule": (
+            "a complete block without at least 16 remaining strip and stratum "
+            "training frames is ineligible and remains train"
+        ),
+        "allocation_rule": (
+            "largest_remainder_over_deterministic_feasible_capacity_by_stratum"
+        ),
+        "test_fraction_of_scene_range": [MIN_TEST_FRACTION, MAX_TEST_FRACTION],
+        "zero_budget_fraction_exemption": True,
     }
     rule_hash = _hash_json(rule)
 
-    output_records: list[dict[str, Any]] = []
-    strip_summaries: list[dict[str, Any]] = []
+    stratum_frame_counts: dict[str, int] = {}
+    strip_infos: list[dict[str, Any]] = []
     for strip in strips:
         strip_records = strip["records"]
+        stratum = str(strip["stratum"])
         strip_hash = _hash_json(
             {
                 "scene": scene,
                 "strip_id": strip["strip_id"],
-                "stratum": strip["stratum"],
+                "stratum": stratum,
                 "ordered_pairs": [r["pair_id"] for r in strip_records],
             }
         )
         full_block_count = len(strip_records) // block_size
-        raw_phase, phase_hash = _phase(seed, scene, strip_hash, test_period_blocks)
-        phase = raw_phase if full_block_count >= test_period_blocks else (
-            raw_phase % full_block_count if full_block_count else raw_phase
+        info = {
+            "strip_id": str(strip["strip_id"]),
+            "stratum": stratum,
+            "records": strip_records,
+            "strip_hash": strip_hash,
+            "frame_count": len(strip_records),
+            "full_block_count": full_block_count,
+            "tail_frame_count": len(strip_records) % block_size,
+            "candidates": [],
+        }
+        strip_infos.append(info)
+        stratum_frame_counts[stratum] = stratum_frame_counts.get(stratum, 0) + len(
+            strip_records
         )
-        test_blocks = [
-            block_index
-            for block_index in range(full_block_count)
-            if block_index % test_period_blocks == phase
-        ]
-        test_positions: set[int] = set()
-        guard_positions: set[int] = set()
-        for block_index in test_blocks:
+
+    all_candidates: list[dict[str, Any]] = []
+    for info in strip_infos:
+        strip_records = info["records"]
+        for block_index in range(int(info["full_block_count"])):
             start = block_index * block_size
             end = start + block_size
-            test_positions.update(range(start, end))
-            guard_positions.update(range(max(0, start - guard_frames), start))
-            guard_positions.update(range(end, min(len(strip_records), end + guard_frames)))
-        guard_positions.difference_update(test_positions)
+            test_positions = tuple(range(start, end))
+            guard_positions = tuple(
+                [*range(max(0, start - guard_frames), start)]
+                + [*range(end, min(len(strip_records), end + guard_frames))]
+            )
+            removed_count = len(set(test_positions) | set(guard_positions))
+            strip_train_if_only = len(strip_records) - removed_count
+            stratum_train_if_only = (
+                stratum_frame_counts[str(info["stratum"])] - removed_count
+            )
+            eligibility_reasons: list[str] = []
+            if strip_train_if_only < MIN_TRAIN_FRAMES_AFTER_TEST:
+                eligibility_reasons.append("strip_would_have_fewer_than_16_train_frames")
+            if stratum_train_if_only < MIN_TRAIN_FRAMES_AFTER_TEST:
+                eligibility_reasons.append("stratum_would_have_fewer_than_16_train_frames")
+            ordered_block_pairs = [
+                strip_records[position]["pair_id"] for position in test_positions
+            ]
+            candidate = {
+                "strip_id": str(info["strip_id"]),
+                "stratum": str(info["stratum"]),
+                "strip_hash": str(info["strip_hash"]),
+                "block_index": block_index,
+                "test_positions": test_positions,
+                "guard_positions": guard_positions,
+                "ordered_block_pairs": ordered_block_pairs,
+                "candidate_hash": _hash_json(
+                    {
+                        "seed": seed,
+                        "scene": scene,
+                        "stratum": info["stratum"],
+                        "strip_hash": info["strip_hash"],
+                        "block_index": block_index,
+                        "ordered_block_pairs": ordered_block_pairs,
+                    }
+                ),
+                "eligible_in_isolation": not eligibility_reasons,
+                "eligibility_reasons": eligibility_reasons,
+                "strip_train_frames_if_only_selected": strip_train_if_only,
+                "stratum_train_frames_if_only_selected": stratum_train_if_only,
+            }
+            info["candidates"].append(candidate)
+            all_candidates.append(candidate)
 
+    feasible_by_stratum: dict[str, list[dict[str, Any]]] = {
+        stratum: [] for stratum in sorted(stratum_frame_counts)
+    }
+    for stratum in sorted(feasible_by_stratum):
+        ordered = sorted(
+            (
+                candidate
+                for candidate in all_candidates
+                if candidate["stratum"] == stratum
+                and candidate["eligible_in_isolation"]
+            ),
+            key=lambda candidate: (candidate["candidate_hash"], candidate["strip_id"], candidate["block_index"]),
+        )
+        feasible: list[dict[str, Any]] = []
+        for candidate in ordered:
+            if _can_add_candidate(
+                strip_infos,
+                feasible,
+                candidate,
+                minimum_train_frames=MIN_TRAIN_FRAMES_AFTER_TEST,
+            ):
+                candidate["feasible_sequence_rank"] = len(feasible)
+                feasible.append(candidate)
+            else:
+                candidate["eligibility_reasons"].append(
+                    "cumulative_strip_or_stratum_train_minimum"
+                )
+        feasible_by_stratum[stratum] = feasible
+
+    target_test_blocks = _round_half_up(
+        len(normalised) / float(block_size * test_period_blocks)
+    )
+    quota_details = _largest_remainder_quotas(
+        feasible_by_stratum,
+        target=target_test_blocks,
+        scene=scene,
+        seed=seed,
+    )
+    selected_candidates: list[dict[str, Any]] = []
+    for stratum in sorted(feasible_by_stratum):
+        quota = int(quota_details[stratum]["quota"])
+        selected_candidates.extend(feasible_by_stratum[stratum][:quota])
+        quota_details[stratum]["feasible_capacity"] = len(feasible_by_stratum[stratum])
+        quota_details[stratum]["selected_block_count"] = min(
+            quota, len(feasible_by_stratum[stratum])
+        )
+
+    selected_hashes = {
+        str(candidate["candidate_hash"]) for candidate in selected_candidates
+    }
+    selected_test_blocks_hash = _hash_json(sorted(selected_hashes))
+    allocation_hash = _hash_json(
+        {
+            "scene": scene,
+            "seed": seed,
+            "rule_hash": rule_hash,
+            "input_records_hash": input_records_hash,
+            "target_test_blocks": target_test_blocks,
+            "stratum_quotas": {
+                stratum: int(details["quota"])
+                for stratum, details in sorted(quota_details.items())
+            },
+            "selected_candidate_hashes": sorted(selected_hashes),
+        }
+    )
+    positions_by_strip, strip_train_counts, stratum_train_counts = _selection_partition(
+        strip_infos, selected_candidates
+    )
+    test_candidate_by_position: dict[tuple[str, int], Mapping[str, Any]] = {}
+    for candidate in selected_candidates:
+        for position in candidate["test_positions"]:
+            test_candidate_by_position[(str(candidate["strip_id"]), position)] = candidate
+
+    output_records: list[dict[str, Any]] = []
+    strip_summaries: list[dict[str, Any]] = []
+    for info in strip_infos:
+        strip_id = str(info["strip_id"])
+        strip_records = info["records"]
+        test_positions = positions_by_strip[strip_id]["test"]
+        guard_positions = positions_by_strip[strip_id]["guard"]
         for position, record in enumerate(strip_records):
             block_index = position // block_size
             block_offset = position % block_size
             if position in test_positions:
                 split = "test"
-                assignment_rule = "periodic_complete_test_block"
+                assignment_rule = "scene_budget_stratum_allocated_test_block"
+                selected_candidate_hash = str(
+                    test_candidate_by_position[(strip_id, position)]["candidate_hash"]
+                )
             elif position in guard_positions:
                 split = "guard"
                 assignment_rule = "adjacent_to_test_block"
+                selected_candidate_hash = None
             else:
                 split = "train"
                 assignment_rule = "non_test_non_guard"
+                selected_candidate_hash = None
             stable_assignment = {
                 "scene": scene,
                 "pair_id": record["pair_id"],
-                "stratum": strip["stratum"],
-                "strip_id": strip["strip_id"],
-                "strip_hash": strip_hash,
+                "stratum": info["stratum"],
+                "strip_id": strip_id,
+                "strip_hash": info["strip_hash"],
                 "position_in_strip": position,
                 "block_index": block_index,
                 "block_offset": block_offset,
                 "split": split,
                 "rule": assignment_rule,
                 "rule_hash": rule_hash,
+                "input_records_hash": input_records_hash,
+                "allocation_hash": allocation_hash,
+                "selected_candidate_hash": selected_candidate_hash,
             }
             output_record = {
                 **stable_assignment,
@@ -509,16 +768,37 @@ def build_split_manifest(
 
         strip_summaries.append(
             {
-                "strip_id": strip["strip_id"],
-                "stratum": strip["stratum"],
-                "strip_hash": strip_hash,
-                "phase": phase,
-                "raw_period_phase": raw_phase,
-                "phase_hash": phase_hash,
+                "strip_id": strip_id,
+                "stratum": info["stratum"],
+                "strip_hash": info["strip_hash"],
                 "frame_count": len(strip_records),
-                "full_block_count": full_block_count,
-                "tail_frame_count": len(strip_records) % block_size,
-                "test_block_indices": test_blocks,
+                "full_block_count": info["full_block_count"],
+                "tail_frame_count": info["tail_frame_count"],
+                "test_block_indices": sorted(
+                    candidate["block_index"]
+                    for candidate in selected_candidates
+                    if candidate["strip_id"] == strip_id
+                ),
+                "train_frame_count": strip_train_counts[strip_id],
+                "test_frame_count": len(test_positions),
+                "guard_frame_count": len(guard_positions),
+                "candidates": [
+                    {
+                        "block_index": candidate["block_index"],
+                        "candidate_hash": candidate["candidate_hash"],
+                        "eligible_in_isolation": candidate["eligible_in_isolation"],
+                        "feasible_sequence_rank": candidate.get("feasible_sequence_rank"),
+                        "selected": candidate["candidate_hash"] in selected_hashes,
+                        "eligibility_reasons": candidate["eligibility_reasons"],
+                        "strip_train_frames_if_only_selected": candidate[
+                            "strip_train_frames_if_only_selected"
+                        ],
+                        "stratum_train_frames_if_only_selected": candidate[
+                            "stratum_train_frames_if_only_selected"
+                        ],
+                    }
+                    for candidate in info["candidates"]
+                ],
             }
         )
 
@@ -526,6 +806,85 @@ def build_split_manifest(
         split: sum(record["split"] == split for record in output_records)
         for split in ("train", "test", "guard")
     }
+    test_fraction = counts["test"] / len(output_records) if output_records else 0.0
+    strips_without_train = sorted(
+        strip_id for strip_id, count in strip_train_counts.items() if count == 0
+    )
+    strata_without_train = sorted(
+        stratum for stratum, count in stratum_train_counts.items() if count == 0
+    )
+    selected_strip_ids = {str(candidate["strip_id"]) for candidate in selected_candidates}
+    selected_strata = {str(candidate["stratum"]) for candidate in selected_candidates}
+    validation_errors: list[str] = []
+    if len(selected_candidates) != target_test_blocks:
+        validation_errors.append("test_block_budget_shortfall")
+    if strips_without_train:
+        validation_errors.append("strip_without_train")
+    if strata_without_train:
+        validation_errors.append("stratum_without_train")
+    if any(
+        strip_train_counts[strip_id] < MIN_TRAIN_FRAMES_AFTER_TEST
+        for strip_id in selected_strip_ids
+    ):
+        validation_errors.append("selected_strip_below_16_train")
+    if any(
+        stratum_train_counts[stratum] < MIN_TRAIN_FRAMES_AFTER_TEST
+        for stratum in selected_strata
+    ):
+        validation_errors.append("selected_stratum_below_16_train")
+    fraction_check_required = target_test_blocks > 0
+    if fraction_check_required and not (
+        MIN_TEST_FRACTION <= test_fraction <= MAX_TEST_FRACTION
+    ):
+        validation_errors.append("test_fraction_out_of_range")
+    validation = {
+        "status": "passed" if not validation_errors else "failed",
+        "errors": validation_errors,
+        "exact_budget": len(selected_candidates) == target_test_blocks,
+        "no_strip_without_train": not strips_without_train,
+        "no_stratum_without_train": not strata_without_train,
+        "strips_without_train": strips_without_train,
+        "strata_without_train": strata_without_train,
+        "selected_strip_minimum_train_passed": not any(
+            strip_train_counts[strip_id] < MIN_TRAIN_FRAMES_AFTER_TEST
+            for strip_id in selected_strip_ids
+        ),
+        "selected_stratum_minimum_train_passed": not any(
+            stratum_train_counts[stratum] < MIN_TRAIN_FRAMES_AFTER_TEST
+            for stratum in selected_strata
+        ),
+        "test_fraction_check_required": fraction_check_required,
+        "test_fraction_of_scene": test_fraction,
+        "test_fraction_range": [MIN_TEST_FRACTION, MAX_TEST_FRACTION],
+        "test_fraction_passed": (
+            None
+            if not fraction_check_required
+            else MIN_TEST_FRACTION <= test_fraction <= MAX_TEST_FRACTION
+        ),
+    }
+
+    stratum_summaries: list[dict[str, Any]] = []
+    for stratum in sorted(stratum_frame_counts):
+        stratum_records = [record for record in output_records if record["stratum"] == stratum]
+        stratum_counts = {
+            split_name: sum(record["split"] == split_name for record in stratum_records)
+            for split_name in ("train", "test", "guard")
+        }
+        stratum_summaries.append(
+            {
+                "stratum": stratum,
+                "frame_count": stratum_frame_counts[stratum],
+                **quota_details[stratum],
+                "counts": stratum_counts,
+                "without_test": stratum_counts["test"] == 0,
+                "selected_candidate_hashes": sorted(
+                    candidate["candidate_hash"]
+                    for candidate in selected_candidates
+                    if candidate["stratum"] == stratum
+                ),
+            }
+        )
+
     split_basis = [
         {
             key: record[key]
@@ -538,6 +897,7 @@ def build_split_manifest(
                 "split",
                 "rule",
                 "hash",
+                "source_record_hash",
             )
         }
         for record in output_records
@@ -549,16 +909,41 @@ def build_split_manifest(
         "seed": seed,
         "source_manifest": source_manifest,
         "source_manifest_sha256": source_manifest_sha256,
+        "input_records_hash": input_records_hash,
         "rule": rule,
         "rule_hash": rule_hash,
         "metadata_reliability": reliability,
         "counts": {"total": len(output_records), **counts},
+        "test_block_budget": {
+            "target": target_test_blocks,
+            "selected": len(selected_candidates),
+            "shortfall": max(0, target_test_blocks - len(selected_candidates)),
+        },
+        "allocation_hash": allocation_hash,
+        "selected_test_blocks_hash": selected_test_blocks_hash,
+        "selected_candidate_hashes": sorted(selected_hashes),
+        "stratum_allocations": stratum_summaries,
         "strips": strip_summaries,
         "records": output_records,
+        "validation": validation,
     }
     result["split_hash"] = _hash_json(
-        {"scene": scene, "seed": seed, "rule_hash": rule_hash, "records": split_basis}
+        {
+            "schema_name": SCHEMA_NAME,
+            "schema_version": SCHEMA_VERSION,
+            "scene": scene,
+            "seed": seed,
+            "rule_hash": rule_hash,
+            "source_manifest_sha256": source_manifest_sha256,
+            "input_records_hash": input_records_hash,
+            "allocation_hash": allocation_hash,
+            "records": split_basis,
+        }
     )
+    if validation_errors and fail_on_invalid:
+        raise SplitAllocationError(
+            f"split validation failed for scene {scene}: {', '.join(validation_errors)}"
+        )
     return result
 
 

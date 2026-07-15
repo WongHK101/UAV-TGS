@@ -67,7 +67,12 @@
     "range_source": "train-only",
     "block_frames": 16,
     "test_block_period": 8,
-    "guard_frames": 2
+    "scene_test_block_budget": "round_half_up(scene_frames/(block_frames*test_block_period))",
+    "minimum_train_frames_after_selected_test": 16,
+    "test_fraction_of_scene_range": [0.08, 0.16],
+    "guard_candidates_frames": [2, 4],
+    "guard_frames_selected": null,
+    "guard_selection_status": "pending_gpt_review"
   },
   "implementation_order": [
     "legacy-fixtures",
