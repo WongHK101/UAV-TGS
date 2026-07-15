@@ -9,6 +9,8 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import hashlib
+import json
 import os
 import torch
 from efficiency_probe import TorchStageProbe
@@ -48,10 +50,79 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
+
+_STRICT_FREEZE_FIELDS = ("_xyz", "_scaling", "_rotation", "_opacity")
+
+
+def _tensor_sha256(tensor):
+    value = tensor.detach().cpu().contiguous()
+    return hashlib.sha256(value.numpy().tobytes()).hexdigest()
+
+
+def _snapshot_strict_freeze_fields(gaussians):
+    return {
+        name: getattr(gaussians, name).detach().cpu().contiguous().clone()
+        for name in _STRICT_FREEZE_FIELDS
+    }
+
+
+def _write_strict_freeze_audit(model_path, gaussians, before, start_iteration, final_iteration):
+    fields = {}
+    all_unchanged = True
+    for name, expected in before.items():
+        actual = getattr(gaussians, name).detach().cpu().contiguous()
+        same_shape = tuple(actual.shape) == tuple(expected.shape)
+        same_dtype = actual.dtype == expected.dtype
+        unchanged = bool(same_shape and same_dtype and torch.equal(actual, expected))
+        all_unchanged = all_unchanged and unchanged
+        max_abs_diff = None
+        if same_shape and actual.numel() > 0:
+            max_abs_diff = float(torch.max(torch.abs(actual - expected)).item())
+        elif same_shape:
+            max_abs_diff = 0.0
+        fields[name] = {
+            "shape": list(actual.shape),
+            "dtype": str(actual.dtype),
+            "before_sha256": _tensor_sha256(expected),
+            "after_sha256": _tensor_sha256(actual),
+            "max_abs_diff": max_abs_diff,
+            "unchanged": unchanged,
+        }
+
+    payload = {
+        "schema": "uav-tgs-strict-freeze-audit-v1",
+        "status": "passed" if all_unchanged else "failed",
+        "start_iteration": int(start_iteration),
+        "final_iteration": int(final_iteration),
+        "fields": fields,
+    }
+    output_path = os.path.join(model_path, "strict_freeze_audit.json")
+    temporary_path = output_path + f".tmp-{os.getpid()}"
+    os.makedirs(model_path, exist_ok=True)
+    with open(temporary_path, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary_path, output_path)
+    if not all_unchanged:
+        changed = [name for name, item in fields.items() if not item["unchanged"]]
+        raise RuntimeError(
+            "Strict thermal freeze invariant failed for: " + ", ".join(changed)
+        )
+    print(f"[INFO] StrictFreezeAudit: passed path={output_path}")
+    return payload
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, ss_args=None):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
+
+    thermal_freeze_mode = str(getattr(args, "thermal_freeze_mode", "legacy"))
+    strict_freeze = thermal_freeze_mode == "strict"
+    topology_frozen = thermal_freeze_mode in ("strict", "continuous_unfrozen")
+    if (strict_freeze or thermal_freeze_mode == "continuous_unfrozen") and not checkpoint:
+        raise RuntimeError(f"thermal_freeze_mode={thermal_freeze_mode} requires a start checkpoint")
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -62,7 +133,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # Optional: sparse support gating for densification (disabled by default).
     # NOTE: When enabled, the index is built and pinned to the model device once
     # before training starts. There must be no CPU/Numpy fallback in the densify hot-path.
-    if ss_args is not None and getattr(ss_args, "ss_enable", False):
+    if ss_args is not None and getattr(ss_args, "ss_enable", False) and not topology_frozen:
         try:
             from utils import sparse_support as _ss
             from scene.colmap_loader import load_colmap_sparse_xyz as _load_colmap_sparse_xyz
@@ -168,7 +239,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 )
             print("[INFO] FreshOptimizerRestore: state_entries=0 step_entries=0")
     start_iteration = int(first_iter)
-    if getattr(args, "ss_prune_before_thermal", False) and checkpoint:
+    if getattr(args, "ss_prune_before_thermal", False) and checkpoint and not topology_frozen:
         if not getattr(args, "ss_enable", False):
             print("[WARN] ss_prune_before_thermal set but ss_enable=False; skipping prune.")
         elif not (getattr(gaussians, "_ss_enabled", False) and gaussians._ss_is_enabled()):
@@ -181,7 +252,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 keep_ratio = (after / float(before)) if before > 0 else 1.0
                 print(f"[INFO] SparseSupport prune_before_thermal: before={before} after={after} removed={removed} keep_ratio={keep_ratio:.6f}")
 
-    if args.clamp_scale_max is not None and checkpoint and getattr(args, "start_checkpoint", None):
+    thermal_scale_clamp = str(getattr(args, "thermal_scale_clamp", "legacy"))
+    if (
+        thermal_scale_clamp != "off"
+        and not strict_freeze
+        and args.clamp_scale_max is not None
+        and checkpoint
+        and getattr(args, "start_checkpoint", None)
+    ):
         clamped_gauss, total, before_smax, after_smax = gaussians.clamp_scaling_max_(args.clamp_scale_max)
         if clamped_gauss > 0:
             print(
@@ -245,6 +323,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             "[INFO] ThermalSHColdRestart: "
             f"enabled={1 if cold_restart else 0} active_degree={gaussians.active_sh_degree} "
             f"max_degree={thermal_max_sh_degree} zeroed_rest_bands={zeroed_bands}"
+        )
+
+    strict_freeze_snapshot = None
+    if strict_freeze:
+        strict_freeze_snapshot = _snapshot_strict_freeze_fields(gaussians)
+        preserve_feature_state = str(
+            getattr(args, "thermal_optimizer_state", "restore")
+        ) == "restore"
+        gaussians.training_setup_appearance_only(
+            opt,
+            sh_degree_cap=thermal_max_sh_degree,
+            preserve_feature_state=preserve_feature_state,
+        )
+        optimizer_groups = [group.get("name") for group in gaussians.optimizer.param_groups]
+        expected_groups = ["f_dc"] if thermal_max_sh_degree == 0 else ["f_dc", "f_rest"]
+        if optimizer_groups != expected_groups:
+            raise RuntimeError(
+                "Strict thermal optimizer contains unexpected groups: "
+                f"expected={expected_groups} actual={optimizer_groups}"
+            )
+        if gaussians.exposure_optimizer is not None:
+            raise RuntimeError("Strict thermal mode must disable the exposure optimizer")
+        print(
+            "[INFO] StrictThermalFreeze: appearance_only=1 "
+            f"optimizer_groups={optimizer_groups} preserve_feature_state={int(preserve_feature_state)}"
         )
 
     def _reapply_lrs_after_restore() -> None:
@@ -329,7 +432,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
-    use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
+    use_sparse_adam = (
+        opt.optimizer_type == "sparse_adam"
+        and SPARSE_ADAM_AVAILABLE
+        and not strict_freeze
+    )
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
 
     viewpoint_stack = scene.getTrainCameras().copy()
@@ -482,7 +589,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 scene.save(iteration)
 
             # Densification
-            if iteration < opt.densify_until_iter:
+            if (not topology_frozen) and iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
@@ -515,8 +622,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Optimizer step
             if iteration < opt.iterations:
-                gaussians.exposure_optimizer.step()
-                gaussians.exposure_optimizer.zero_grad(set_to_none = True)
+                if gaussians.exposure_optimizer is not None:
+                    gaussians.exposure_optimizer.step()
+                    gaussians.exposure_optimizer.zero_grad(set_to_none = True)
                 if use_sparse_adam:
                     visible = radii > 0
                     gaussians.optimizer.step(visible, radii.shape[0])
@@ -566,6 +674,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 )
                 scene.save(opt.iterations)
                 torch.save((gaussians.capture(), opt.iterations), scene.model_path + "/chkpnt" + str(opt.iterations) + ".pth")
+
+    if strict_freeze:
+        _write_strict_freeze_audit(
+            scene.model_path,
+            gaussians,
+            strict_freeze_snapshot,
+            start_iteration=start_iteration,
+            final_iteration=int(opt.iterations),
+        )
 
     return {
         "start_iteration": start_iteration,
@@ -702,6 +819,20 @@ if __name__ == "__main__":
         "--thermal_optimizer_state", choices=["restore", "fresh"], default="restore",
         help="Thermal checkpoint optimizer state (default: restore). fresh starts a new Adam state."
     )
+    parser.add_argument(
+        "--thermal_recipe", choices=["legacy", "aaai_strict"], default="legacy",
+        help="Stage-2 protocol preset. legacy preserves the ACM behavior by default."
+    )
+    parser.add_argument(
+        "--thermal_freeze_mode",
+        choices=["legacy", "strict", "continuous_unfrozen"],
+        default="legacy",
+        help="Stage-2 parameter update mode. strict trains SH appearance only.",
+    )
+    parser.add_argument(
+        "--thermal_scale_clamp", choices=["legacy", "off"], default="legacy",
+        help="Control the one-shot thermal restore scale clamp.",
+    )
     parser.add_argument("--sgf_disable", action="store_true", default=False)
     parser.add_argument("--baseline_modules_off", action="store_true", default=False)
     parser.add_argument("--baseline_restore_ssp", action="store_true", default=False)
@@ -713,6 +844,9 @@ if __name__ == "__main__":
 
     cli_args = sys.argv[1:]
     args = parser.parse_args(cli_args)
+
+    def _option_was_set(name):
+        return any(token == name or token.startswith(name + "=") for token in cli_args)
 
     if args.thermal_max_sh_degree is not None and not args.start_checkpoint:
         parser.error("--thermal_max_sh_degree requires --start_checkpoint")
@@ -760,6 +894,40 @@ if __name__ == "__main__":
         args.t_struct_grad_norm = True
         args.sgf_disable = False
 
+    if args.thermal_recipe == "aaai_strict":
+        if not args.start_checkpoint:
+            parser.error("--thermal_recipe aaai_strict requires --start_checkpoint")
+        if args.baseline_modules_off or args.baseline_restore_ssp or args.baseline_restore_stt:
+            parser.error("--thermal_recipe aaai_strict cannot be combined with baseline recipe flags")
+        if _option_was_set("--sgf_disable"):
+            parser.error("--thermal_recipe aaai_strict does not use --sgf_disable")
+        if _option_was_set("--thermal_optimizer_state") and args.thermal_optimizer_state != "fresh":
+            parser.error("--thermal_recipe aaai_strict requires --thermal_optimizer_state fresh")
+        if _option_was_set("--thermal_freeze_mode") and args.thermal_freeze_mode != "strict":
+            parser.error("--thermal_recipe aaai_strict requires --thermal_freeze_mode strict")
+        if _option_was_set("--thermal_scale_clamp") and args.thermal_scale_clamp != "off":
+            parser.error("--thermal_recipe aaai_strict requires --thermal_scale_clamp off")
+        if _option_was_set("--ss_enable") or _option_was_set("--ss_prune_before_thermal"):
+            parser.error("--thermal_recipe aaai_strict does not permit Stage-2 sparse-support pruning")
+
+        args.thermal_reset_features = True
+        if args.thermal_max_sh_degree is None:
+            args.thermal_max_sh_degree = 1
+        args.thermal_optimizer_state = "fresh"
+        args.thermal_freeze_mode = "strict"
+        args.thermal_scale_clamp = "off"
+        args.ss_enable = False
+        args.ss_prune_before_thermal = False
+        args.sgf_disable = False
+
+    if args.thermal_freeze_mode in ("strict", "continuous_unfrozen"):
+        if not args.start_checkpoint:
+            parser.error(f"--thermal_freeze_mode {args.thermal_freeze_mode} requires --start_checkpoint")
+        args.ss_prune_before_thermal = False
+        args.ss_enable = False
+    if args.thermal_freeze_mode == "strict" and args.thermal_scale_clamp != "off":
+        parser.error("--thermal_freeze_mode strict requires --thermal_scale_clamp off")
+
     # Thermal-stage default: if user did not explicitly pass --opacity_lr and a
     # checkpoint is provided, use a conservative opacity lr to avoid geometry drift.
     opacity_flag_set = any((a == "--opacity_lr") or a.startswith("--opacity_lr=") for a in cli_args)
@@ -800,6 +968,11 @@ if __name__ == "__main__":
             "requested_final_iteration": int(args.iterations),
             "start_checkpoint": str(args.start_checkpoint) if args.start_checkpoint else None,
             "resolution": int(args.resolution),
+            "thermal_recipe": str(args.thermal_recipe),
+            "thermal_max_sh_degree": args.thermal_max_sh_degree,
+            "thermal_optimizer_state": str(args.thermal_optimizer_state),
+            "thermal_freeze_mode": str(args.thermal_freeze_mode),
+            "thermal_scale_clamp": str(args.thermal_scale_clamp),
         },
     )
     efficiency_probe.start()

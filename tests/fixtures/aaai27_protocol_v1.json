@@ -35,13 +35,28 @@
     "thermal_reset_features": true,
     "sgf_disable": false
   },
-  "aaai_stage2_defaults": {
+  "legacy_stage2_defaults": {
     "thermal_recipe": "legacy",
-    "thermal_max_sh_degree": 3,
+    "thermal_max_sh_degree": null,
     "thermal_optimizer_state": "restore",
     "thermal_freeze_mode": "legacy",
     "thermal_scale_clamp": "legacy",
-    "thermal_checkpoint_offsets": [10000, 20000, 30000]
+    "thermal_checkpoint_offsets": null,
+    "thermal_checkpoint_offsets_applied": false
+  },
+  "aaai_strict_stage2_defaults": {
+    "thermal_recipe": "aaai_strict",
+    "thermal_max_sh_degree": 1,
+    "thermal_optimizer_state": "fresh",
+    "thermal_freeze_mode": "strict",
+    "thermal_scale_clamp": "off",
+    "thermal_checkpoint_offsets": [10000, 20000, 30000],
+    "thermal_checkpoint_offsets_applied": true
+  },
+  "continuous_unfrozen_defaults": {
+    "t_unfrozen_position_lr": 0.0000016,
+    "t_unfrozen_scaling_lr": 0.005,
+    "t_unfrozen_rotation_lr": 0.001
   },
   "radiometry": {
     "palette": "uav-tgs-hot-iron-v1",

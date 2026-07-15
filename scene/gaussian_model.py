@@ -9,6 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import copy
 import torch
 import numpy as np
 from typing import Optional, Tuple, Any
@@ -663,9 +664,65 @@ class GaussianModel:
                                                         lr_delay_mult=training_args.exposure_lr_delay_mult,
                                                         max_steps=training_args.iterations)
 
+    def training_setup_appearance_only(
+        self,
+        training_args,
+        sh_degree_cap=None,
+        preserve_feature_state=False,
+    ):
+        """Create an SH-only optimizer while strictly freezing all other state."""
+        cap = self.max_sh_degree if sh_degree_cap is None else int(sh_degree_cap)
+        if cap < 0 or cap > self.max_sh_degree:
+            raise ValueError(f"SH degree cap must be in [0, {self.max_sh_degree}], got {cap}")
+
+        inherited_state = {}
+        if preserve_feature_state and self.optimizer is not None:
+            for group in self.optimizer.param_groups:
+                name = group.get("name")
+                if name not in ("f_dc", "f_rest") or not group.get("params"):
+                    continue
+                state = self.optimizer.state.get(group["params"][0])
+                if state:
+                    inherited_state[name] = copy.deepcopy(state)
+
+        self.percent_dense = training_args.percent_dense
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+
+        for parameter in (self._xyz, self._scaling, self._rotation, self._opacity, self._exposure):
+            parameter.requires_grad_(False)
+        self._features_dc.requires_grad_(True)
+
+        groups = [
+            {"params": [self._features_dc], "lr": training_args.feature_lr, "name": "f_dc"},
+        ]
+        if cap > 0:
+            self._features_rest.requires_grad_(True)
+            groups.append({
+                "params": [self._features_rest],
+                "lr": training_args.feature_lr / 20.0,
+                "name": "f_rest",
+            })
+        else:
+            self._features_rest.requires_grad_(False)
+
+        if self.optimizer_type not in ("default", "sparse_adam"):
+            raise ValueError(f"Unsupported optimizer_type: {self.optimizer_type!r}")
+        # Appearance-only Stage 2 does not use the sparse optimizer's
+        # visibility-aware geometry update signature.
+        self.optimizer = torch.optim.Adam(groups, lr=0.0, eps=1e-15)
+        if preserve_feature_state:
+            for group in self.optimizer.param_groups:
+                name = group.get("name")
+                if name in inherited_state:
+                    self.optimizer.state[group["params"][0]] = inherited_state[name]
+
+        # Exposure is intentionally immutable in strict Stage 2.
+        self.exposure_optimizer = None
+
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
-        if self.pretrained_exposures is None:
+        if self.pretrained_exposures is None and self.exposure_optimizer is not None:
             for param_group in self.exposure_optimizer.param_groups:
                 param_group['lr'] = self.exposure_scheduler_args(iteration)
 

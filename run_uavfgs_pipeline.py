@@ -47,7 +47,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from efficiency_probe import artifact_record, atomic_write_json, read_json_if_present
 
@@ -68,7 +68,6 @@ ORIG_3DGS_OPT_DEFAULTS: Dict[str, float] = {
     "densify_until_iter": 15000,
     "densify_grad_threshold": 0.0002,
 }
-
 
 # ----------------------------
 # Small utilities
@@ -226,6 +225,102 @@ def _str2bool(v: str) -> bool:
     if s in ("0", "false", "f", "no", "n", "off"):
         return False
     raise argparse.ArgumentTypeError(f"invalid boolean value: {v!r}")
+
+
+def _cli_option_was_supplied(argv: Sequence[str], option: str) -> bool:
+    """Return whether an argparse option was explicitly supplied."""
+    return any(token == option or token.startswith(option + "=") for token in argv)
+
+
+def _apply_thermal_recipe_defaults(
+    args: argparse.Namespace,
+    argv: Sequence[str],
+) -> List[str]:
+    """Apply recipe defaults and reject controls incompatible with the recipe.
+
+    Parser defaults remain the established legacy values.  ``aaai_strict``
+    fills unspecified controls while retaining an explicit SH-cap override;
+    the optimizer/freeze/clamp invariants match train.py's strict contract.
+    """
+    if str(args.thermal_recipe) != "aaai_strict":
+        return []
+
+    applied: List[str] = []
+    strict_defaults = (
+        ("thermal_max_sh_degree", "--thermal_max_sh_degree", 1),
+        ("thermal_optimizer_state", "--thermal_optimizer_state", "fresh"),
+        ("thermal_freeze_mode", "--thermal_freeze_mode", "strict"),
+        ("thermal_scale_clamp", "--thermal_scale_clamp", "off"),
+    )
+    for attribute, option, value in strict_defaults:
+        supplied = _cli_option_was_supplied(argv, option)
+        if supplied and attribute != "thermal_max_sh_degree" and getattr(args, attribute) != value:
+            raise ValueError(
+                f"--thermal_recipe aaai_strict requires {option} {value}"
+            )
+        if not supplied:
+            setattr(args, attribute, value)
+            applied.append(attribute)
+    return applied
+
+
+def _resolve_thermal_checkpoint_iterations(
+    *,
+    rgb_iter: int,
+    t_iter: int,
+    offsets: Sequence[int],
+    use_offsets: bool,
+) -> List[int]:
+    """Resolve stage-2-relative offsets to absolute train.py iterations."""
+    if not use_offsets:
+        return [int(t_iter)]
+    if int(t_iter) <= int(rgb_iter):
+        raise ValueError("thermal checkpoint offsets require --t_iter > --rgb_iter")
+
+    normalized = [int(offset) for offset in offsets]
+    if not normalized:
+        raise ValueError("--thermal_checkpoint_offsets must not be empty")
+    if any(offset <= 0 for offset in normalized):
+        raise ValueError("--thermal_checkpoint_offsets values must be > 0")
+    if normalized != sorted(set(normalized)):
+        raise ValueError("--thermal_checkpoint_offsets must be unique and strictly increasing")
+
+    absolute = [
+        int(rgb_iter) + offset
+        for offset in normalized
+        if int(rgb_iter) + offset <= int(t_iter)
+    ]
+    if int(t_iter) not in absolute:
+        absolute.append(int(t_iter))
+    return sorted(set(absolute))
+
+
+def _thermal_learning_rate_tokens(args: argparse.Namespace) -> Dict[str, str]:
+    """Return explicit stage-2 LR tokens for the resolved freeze protocol."""
+    mode = str(args.thermal_freeze_mode)
+    if mode == "continuous_unfrozen":
+        return {
+            "position_lr_init": str(args.t_unfrozen_position_lr),
+            "position_lr_final": str(args.t_unfrozen_position_lr),
+            "scaling_lr": str(args.t_unfrozen_scaling_lr),
+            "rotation_lr": str(args.t_unfrozen_rotation_lr),
+            "opacity_lr": str(args.t_opacity_lr),
+            "feature_lr": str(args.t_feature_lr),
+        }
+    if mode == "strict":
+        opacity_lr = "0"
+    elif mode == "legacy":
+        opacity_lr = str(args.t_opacity_lr)
+    else:
+        raise ValueError(f"unsupported thermal freeze mode: {mode}")
+    return {
+        "position_lr_init": "0",
+        "position_lr_final": "0",
+        "scaling_lr": "0",
+        "rotation_lr": "0",
+        "opacity_lr": opacity_lr,
+        "feature_lr": str(args.t_feature_lr),
+    }
 
 
 def _build_tstruct_train_args(args: argparse.Namespace) -> List[str]:
@@ -1126,6 +1221,18 @@ def main() -> None:
     ap.add_argument("--t_feature_lr", type=float, default=0.001)
     ap.add_argument("--t_opacity_lr", type=float, default=2e-4,
                     help="Thermal-only opacity lr (default: 2e-4)")
+    ap.add_argument(
+        "--t_unfrozen_position_lr", type=float, default=1.6e-6,
+        help="continuous_unfrozen xyz LR, used as both init and final (default: 1.6e-6)."
+    )
+    ap.add_argument(
+        "--t_unfrozen_scaling_lr", type=float, default=0.005,
+        help="continuous_unfrozen scale LR (default: 0.005)."
+    )
+    ap.add_argument(
+        "--t_unfrozen_rotation_lr", type=float, default=0.001,
+        help="continuous_unfrozen rotation LR (default: 0.001)."
+    )
     ap.add_argument("--t_lambda_dssim", type=float, default=0.05)
     ap.add_argument("--ss_prune_before_thermal", action="store_true", default=False,
                     help="Thermal-only: prune outside sparse support after restore (default: off)")
@@ -1147,6 +1254,31 @@ def main() -> None:
                     help="Thermal-only: reset SH features after restore/prune/clamp (default: on)")
     ap.add_argument("--no_thermal_reset_features", dest="thermal_reset_features", action="store_false",
                     help="Disable thermal SH feature reset.")
+    ap.add_argument(
+        "--thermal_recipe", choices=["legacy", "aaai_strict"], default="legacy",
+        help="Stage-2 protocol preset. Legacy preserves the established command exactly (default: legacy)."
+    )
+    ap.add_argument(
+        "--thermal_freeze_mode",
+        choices=["legacy", "strict", "continuous_unfrozen"],
+        default="legacy",
+        help=(
+            "Stage-2 parameter policy: legacy freezes xyz/scale/rotation; strict also freezes opacity; "
+            "continuous_unfrozen keeps nonzero geometry LRs while topology stays fixed (default: legacy)."
+        ),
+    )
+    ap.add_argument(
+        "--thermal_scale_clamp", choices=["legacy", "off"], default="legacy",
+        help="Stage-2 scale clamp policy: established clamp behavior or no clamp (default: legacy)."
+    )
+    ap.add_argument(
+        "--thermal_checkpoint_offsets", nargs="+", type=int,
+        default=[10000, 20000, 30000],
+        help=(
+            "Stage-2 checkpoint offsets from --rgb_iter. Applied by aaai_strict, or when explicitly "
+            "provided; the final --t_iter checkpoint is always retained."
+        ),
+    )
     ap.add_argument(
         "--thermal_max_sh_degree", type=int, choices=[0, 1, 3], default=None,
         help="Thermal-only SH cap. When feature reset is enabled, cold-restart from SH degree 0."
@@ -1206,6 +1338,21 @@ def main() -> None:
                     help="Forward to eval_blend_sweep.py --gt_mode (default: link)")
 
     args = ap.parse_args()
+    cli_args = sys.argv[1:]
+    thermal_protocol_requested = {
+        "thermal_recipe": args.thermal_recipe,
+        "thermal_freeze_mode": args.thermal_freeze_mode,
+        "thermal_scale_clamp": args.thermal_scale_clamp,
+        "thermal_max_sh_degree": args.thermal_max_sh_degree,
+        "thermal_optimizer_state": args.thermal_optimizer_state,
+        "thermal_checkpoint_offsets": list(args.thermal_checkpoint_offsets),
+        "t_unfrozen_position_lr": args.t_unfrozen_position_lr,
+        "t_unfrozen_scaling_lr": args.t_unfrozen_scaling_lr,
+        "t_unfrozen_rotation_lr": args.t_unfrozen_rotation_lr,
+    }
+    thermal_checkpoint_offsets_explicit = _cli_option_was_supplied(
+        cli_args, "--thermal_checkpoint_offsets"
+    )
 
     # Validate step range
     if args.from_step < 1 or args.to_step > 14 or args.from_step > args.to_step:
@@ -1282,11 +1429,62 @@ def main() -> None:
             args.sgf_disable = False
             args.t_opacity_lr = 2e-4
 
+    try:
+        if args.thermal_recipe == "aaai_strict" and (
+            args.baseline_modules_off or args.grouped_ablation_mode != "none"
+        ):
+            raise ValueError(
+                "--thermal_recipe aaai_strict cannot be combined with baseline recipe flags"
+            )
+        if args.thermal_recipe == "aaai_strict" and not args.thermal_reset_features:
+            raise ValueError(
+                "--thermal_recipe aaai_strict requires thermal feature reset"
+            )
+        if args.thermal_recipe == "aaai_strict" and args.sgf_disable:
+            raise ValueError(
+                "--thermal_recipe aaai_strict does not use --sgf_disable"
+            )
+        thermal_recipe_defaults_applied = _apply_thermal_recipe_defaults(args, cli_args)
+        if args.thermal_freeze_mode == "strict" and args.thermal_scale_clamp != "off":
+            raise ValueError(
+                "--thermal_freeze_mode strict requires --thermal_scale_clamp off"
+            )
+        thermal_checkpoint_offsets_applied = (
+            args.thermal_recipe == "aaai_strict" or thermal_checkpoint_offsets_explicit
+        )
+        thermal_checkpoint_iterations = _resolve_thermal_checkpoint_iterations(
+            rgb_iter=args.rgb_iter,
+            t_iter=args.t_iter,
+            offsets=args.thermal_checkpoint_offsets,
+            use_offsets=thermal_checkpoint_offsets_applied,
+        )
+        thermal_lr_tokens = _thermal_learning_rate_tokens(args)
+    except ValueError as exc:
+        ap.error(str(exc))
+
     # Validate improvement-4 params (always validated; only forwarded when enabled)
     if not math.isfinite(float(getattr(args, "t_struct_grad_w", 0.0))) or float(getattr(args, "t_struct_grad_w", 0.0)) < 0.0:
         ap.error("--t_struct_grad_w must be a finite float >= 0")
     if not math.isfinite(float(getattr(args, "t_opacity_lr", 0.0))) or float(getattr(args, "t_opacity_lr", 0.0)) < 0.0:
         ap.error("--t_opacity_lr must be a finite float >= 0")
+    if args.thermal_freeze_mode == "continuous_unfrozen":
+        continuous_lrs = {
+            "--t_unfrozen_position_lr": args.t_unfrozen_position_lr,
+            "--t_unfrozen_scaling_lr": args.t_unfrozen_scaling_lr,
+            "--t_unfrozen_rotation_lr": args.t_unfrozen_rotation_lr,
+            "--t_opacity_lr": args.t_opacity_lr,
+            "--t_feature_lr": args.t_feature_lr,
+        }
+        invalid_lrs = [
+            name
+            for name, value in continuous_lrs.items()
+            if not math.isfinite(float(value)) or float(value) <= 0.0
+        ]
+        if invalid_lrs:
+            ap.error(
+                "--thermal_freeze_mode continuous_unfrozen requires finite nonzero LRs: "
+                + ", ".join(invalid_lrs)
+            )
     # Sparse Support argument sanity (only when enabled for any stage)
     ss_any_enabled = bool(args.ss_enable or args.ss_enable_rgb or args.ss_enable_t)
     if ss_any_enabled:
@@ -1311,6 +1509,13 @@ def main() -> None:
         ss_enable_rgb = bool(args.ss_enable)
         ss_enable_t = bool(args.ss_enable)
 
+    if args.thermal_recipe == "aaai_strict" and (
+        ss_enable_t or bool(args.ss_prune_before_thermal)
+    ):
+        ap.error(
+            "--thermal_recipe aaai_strict does not permit Stage-2 sparse-support pruning"
+        )
+
     def _build_ss_args_for_stage(enable_flag: bool) -> List[str]:
         if not enable_flag:
             return []
@@ -1326,7 +1531,42 @@ def main() -> None:
     ss_train2_extra: List[str] = _build_ss_args_for_stage(ss_enable_t)
 
     clamp_effective_rgb = getattr(args, "clamp_scale_max_rgb", None)
-    clamp_effective_t = args.clamp_scale_max_t if args.clamp_scale_max_t is not None else args.clamp_scale_max
+    clamp_requested_t = args.clamp_scale_max_t if args.clamp_scale_max_t is not None else args.clamp_scale_max
+    clamp_effective_t = None if args.thermal_scale_clamp == "off" else clamp_requested_t
+    thermal_protocol = {
+        "schema_name": "uav-tgs-stage2-protocol",
+        "schema_version": 1,
+        "thermal_recipe": args.thermal_recipe,
+        "thermal_freeze_mode": args.thermal_freeze_mode,
+        "thermal_scale_clamp": args.thermal_scale_clamp,
+        "thermal_max_sh_degree": args.thermal_max_sh_degree,
+        "thermal_optimizer_state": args.thermal_optimizer_state,
+        "thermal_checkpoint_offsets": (
+            list(args.thermal_checkpoint_offsets)
+            if thermal_checkpoint_offsets_applied
+            else None
+        ),
+        "thermal_checkpoint_offsets_configured": list(args.thermal_checkpoint_offsets),
+        "thermal_checkpoint_offsets_applied": thermal_checkpoint_offsets_applied,
+        "thermal_checkpoint_iterations": list(thermal_checkpoint_iterations),
+        "t_unfrozen_position_lr": args.t_unfrozen_position_lr,
+        "t_unfrozen_scaling_lr": args.t_unfrozen_scaling_lr,
+        "t_unfrozen_rotation_lr": args.t_unfrozen_rotation_lr,
+        "recipe_defaults_applied": list(thermal_recipe_defaults_applied),
+        "requested": thermal_protocol_requested,
+        "topology_fixed": True,
+        "topology_controls": {
+            "densify_from_iter": 999999,
+            "densify_until_iter": 0,
+            "densification_interval": 999999,
+            "opacity_reset_interval": 999999,
+        },
+        "learning_rates": {
+            name: float(value) for name, value in thermal_lr_tokens.items()
+        },
+        "scale_clamp_requested": clamp_requested_t,
+        "scale_clamp_effective": clamp_effective_t,
+    }
 
     if (
         (not getattr(args, "sgf_disable", False))
@@ -1698,6 +1938,7 @@ def main() -> None:
         payload = {
             "reason": reason,
             "args": _json_safe(vars(args)),
+            "protocol": {"thermal_stage2": _json_safe(thermal_protocol)},
             "cmds": {
                 "train1_cmd": _format_cmd_for_debug(train1_cmd) if train1_cmd else None,
                 "train2_cmd": _format_cmd_for_debug(train2_cmd) if train2_cmd else None,
@@ -1735,6 +1976,14 @@ def main() -> None:
                 "clamp_effective_rgb": clamp_effective_rgb,
                 "clamp_effective_t": clamp_effective_t,
                 "thermal_reset_features": bool(getattr(args, "thermal_reset_features", False)),
+                "thermal_recipe": getattr(args, "thermal_recipe", "legacy"),
+                "thermal_freeze_mode": getattr(args, "thermal_freeze_mode", "legacy"),
+                "thermal_scale_clamp": getattr(args, "thermal_scale_clamp", "legacy"),
+                "thermal_checkpoint_offsets": list(getattr(args, "thermal_checkpoint_offsets", [])),
+                "thermal_checkpoint_iterations": list(thermal_checkpoint_iterations),
+                "t_unfrozen_position_lr": getattr(args, "t_unfrozen_position_lr", None),
+                "t_unfrozen_scaling_lr": getattr(args, "t_unfrozen_scaling_lr", None),
+                "t_unfrozen_rotation_lr": getattr(args, "t_unfrozen_rotation_lr", None),
                 "thermal_max_sh_degree": getattr(args, "thermal_max_sh_degree", None),
                 "thermal_optimizer_state": getattr(args, "thermal_optimizer_state", "restore"),
                 "sgf_disable": bool(getattr(args, "sgf_disable", False)),
@@ -1856,6 +2105,7 @@ def main() -> None:
                 "render_time": "test-view render calls only; warm-up, GT handling, CPU transfer, and image I/O excluded",
                 "stage_time": "blocking subprocess wall time",
             },
+            "protocol": {"thermal_stage2": _json_safe(thermal_protocol)},
             "stages": stages,
             "training": {
                 "rgb": read_json_if_present(train_eff_rgb),
@@ -1899,6 +2149,7 @@ def main() -> None:
                 "python": sys.executable,
                 "reason": reason or "done",
                 "args": _json_safe(vars(args)),
+                "protocol": {"thermal_stage2": _json_safe(thermal_protocol)},
                 "flags": {
                     "ss_enable": bool(getattr(args, "ss_enable", False)),
                     "ss_enable_rgb": bool(getattr(args, "ss_enable_rgb", False)),
@@ -1921,6 +2172,14 @@ def main() -> None:
                     "clamp_effective_rgb": clamp_effective_rgb,
                     "clamp_effective_t": clamp_effective_t,
                     "thermal_reset_features": bool(getattr(args, "thermal_reset_features", False)),
+                    "thermal_recipe": getattr(args, "thermal_recipe", "legacy"),
+                    "thermal_freeze_mode": getattr(args, "thermal_freeze_mode", "legacy"),
+                    "thermal_scale_clamp": getattr(args, "thermal_scale_clamp", "legacy"),
+                    "thermal_checkpoint_offsets": list(getattr(args, "thermal_checkpoint_offsets", [])),
+                    "thermal_checkpoint_iterations": list(thermal_checkpoint_iterations),
+                    "t_unfrozen_position_lr": getattr(args, "t_unfrozen_position_lr", None),
+                    "t_unfrozen_scaling_lr": getattr(args, "t_unfrozen_scaling_lr", None),
+                    "t_unfrozen_rotation_lr": getattr(args, "t_unfrozen_rotation_lr", None),
                     "thermal_max_sh_degree": getattr(args, "thermal_max_sh_degree", None),
                     "thermal_optimizer_state": getattr(args, "thermal_optimizer_state", "restore"),
                     "t_opacity_lr": getattr(args, "t_opacity_lr", None),
@@ -2652,20 +2911,32 @@ def main() -> None:
         "--start_checkpoint", str(ckpt_rgb),
         "-r", str(args.t_res),
         "--iterations", str(args.t_iter),
-        "--checkpoint_iterations", str(args.t_iter),
+        "--checkpoint_iterations", *[str(iteration) for iteration in thermal_checkpoint_iterations],
     ]
+    if thermal_checkpoint_offsets_applied:
+        train2_cmd.extend([
+            "--save_iterations",
+            *[str(iteration) for iteration in thermal_checkpoint_iterations],
+        ])
+    if args.thermal_recipe != "legacy":
+        train2_cmd.extend(["--thermal_recipe", str(args.thermal_recipe)])
+    if args.thermal_freeze_mode != "legacy":
+        train2_cmd.extend(["--thermal_freeze_mode", str(args.thermal_freeze_mode)])
+    if args.thermal_scale_clamp != "legacy":
+        train2_cmd.extend(["--thermal_scale_clamp", str(args.thermal_scale_clamp)])
     if bool(getattr(args, "baseline_modules_off", False)):
         train2_cmd.append("--baseline_modules_off")
     if args.grouped_ablation_mode == "m00_plus_stt":
         train2_cmd.append("--baseline_restore_stt")
 
     train2_cmd.extend([
-        # Freeze geometry-related params under the current M01 recipe.
-        "--position_lr_init", "0", "--position_lr_final", "0",
-        "--scaling_lr", "0", "--rotation_lr", "0",
-        "--opacity_lr", str(args.t_opacity_lr),
-        "--feature_lr", str(args.t_feature_lr),
-        # Disable densification & opacity resets under the current M01 recipe.
+        # The resolved protocol always spells out LRs; topology remains fixed.
+        "--position_lr_init", thermal_lr_tokens["position_lr_init"],
+        "--position_lr_final", thermal_lr_tokens["position_lr_final"],
+        "--scaling_lr", thermal_lr_tokens["scaling_lr"],
+        "--rotation_lr", thermal_lr_tokens["rotation_lr"],
+        "--opacity_lr", thermal_lr_tokens["opacity_lr"],
+        "--feature_lr", thermal_lr_tokens["feature_lr"],
         "--densify_from_iter", "999999",
         "--densify_until_iter", "0",
         "--densification_interval", "999999",

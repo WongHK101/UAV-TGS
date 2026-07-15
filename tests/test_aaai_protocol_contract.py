@@ -38,9 +38,25 @@ class AaaiProtocolContractTests(unittest.TestCase):
     def setUpClass(cls):
         cls.protocol = json.loads(FIXTURE.read_text(encoding="utf-8"))
 
-    def test_protocol_fixture_is_versioned_and_legacy_default(self):
+    def test_protocol_fixture_separates_legacy_and_aaai_strict_defaults(self):
         self.assertEqual(self.protocol["schema"], "uav-tgs-aaai27-protocol-v1")
-        self.assertEqual(self.protocol["aaai_stage2_defaults"]["thermal_recipe"], "legacy")
+        legacy = self.protocol["legacy_stage2_defaults"]
+        self.assertEqual(legacy["thermal_recipe"], "legacy")
+        self.assertIsNone(legacy["thermal_max_sh_degree"])
+        self.assertEqual(legacy["thermal_optimizer_state"], "restore")
+        self.assertEqual(legacy["thermal_freeze_mode"], "legacy")
+        self.assertEqual(legacy["thermal_scale_clamp"], "legacy")
+        self.assertIsNone(legacy["thermal_checkpoint_offsets"])
+        self.assertFalse(legacy["thermal_checkpoint_offsets_applied"])
+
+        strict = self.protocol["aaai_strict_stage2_defaults"]
+        self.assertEqual(strict["thermal_recipe"], "aaai_strict")
+        self.assertEqual(strict["thermal_max_sh_degree"], 1)
+        self.assertEqual(strict["thermal_optimizer_state"], "fresh")
+        self.assertEqual(strict["thermal_freeze_mode"], "strict")
+        self.assertEqual(strict["thermal_scale_clamp"], "off")
+        self.assertEqual(strict["thermal_checkpoint_offsets"], [10000, 20000, 30000])
+        self.assertTrue(strict["thermal_checkpoint_offsets_applied"])
         self.assertIn("gpu-training", self.protocol["deferred_until_pilot_review"])
 
     def test_locked_terminology_and_claim_boundaries(self):
@@ -71,6 +87,18 @@ class AaaiProtocolContractTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIn("--" + name, defaults)
                 self.assertEqual(defaults["--" + name], expected[name])
+
+        self.assertEqual(defaults["--thermal_recipe"], "legacy")
+        self.assertEqual(defaults["--thermal_freeze_mode"], "legacy")
+        self.assertEqual(defaults["--thermal_scale_clamp"], "legacy")
+        self.assertEqual(defaults["--thermal_max_sh_degree"], None)
+        self.assertEqual(defaults["--thermal_optimizer_state"], "restore")
+        self.assertEqual(defaults["--thermal_checkpoint_offsets"], [10000, 20000, 30000])
+
+        continuous = self.protocol["continuous_unfrozen_defaults"]
+        for name, value in continuous.items():
+            with self.subTest(name=name):
+                self.assertEqual(defaults["--" + name], value)
 
     def test_radiometry_split_contract_is_explicit(self):
         radiometry = self.protocol["radiometry"]
