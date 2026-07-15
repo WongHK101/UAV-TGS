@@ -117,7 +117,25 @@ class GaussianModel:
         denom,
         opt_dict, 
         self.spatial_lr_scale) = model_args
-        self.training_setup(training_args)
+        checkpoint_group_names = tuple(
+            group.get("name") for group in opt_dict.get("param_groups", [])
+        )
+        appearance_only_groups = (("f_dc",), ("f_dc", "f_rest"))
+        if (
+            optimizer_restore_mode == "restore"
+            and checkpoint_group_names in appearance_only_groups
+        ):
+            # Strict Stage-2 checkpoints contain an appearance-only Adam.  Rebuild
+            # the matching optimizer layout before loading its state; the legacy
+            # six-group setup cannot accept this state_dict.  The exact SH cap is
+            # reapplied by the Stage-2 recipe after restore.
+            optimizer_cap = 0 if checkpoint_group_names == ("f_dc",) else self.max_sh_degree
+            self.training_setup_appearance_only(
+                training_args,
+                sh_degree_cap=optimizer_cap,
+            )
+        else:
+            self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         if optimizer_restore_mode == "restore":
