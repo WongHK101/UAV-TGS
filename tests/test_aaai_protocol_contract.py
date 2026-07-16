@@ -42,6 +42,7 @@ class AaaiProtocolContractTests(unittest.TestCase):
         self.assertEqual(self.protocol["schema"], "uav-tgs-aaai27-protocol-v1")
         legacy = self.protocol["legacy_stage2_defaults"]
         self.assertEqual(legacy["thermal_recipe"], "legacy")
+        self.assertEqual(legacy["artifact_save_semantics"], "legacy")
         self.assertIsNone(legacy["thermal_max_sh_degree"])
         self.assertEqual(legacy["thermal_optimizer_state"], "restore")
         self.assertEqual(legacy["thermal_freeze_mode"], "legacy")
@@ -51,6 +52,7 @@ class AaaiProtocolContractTests(unittest.TestCase):
 
         strict = self.protocol["aaai_strict_stage2_defaults"]
         self.assertEqual(strict["thermal_recipe"], "aaai_strict")
+        self.assertEqual(strict["artifact_save_semantics"], "aligned")
         self.assertEqual(strict["thermal_max_sh_degree"], 1)
         self.assertEqual(strict["thermal_optimizer_state"], "fresh")
         self.assertEqual(strict["thermal_freeze_mode"], "strict")

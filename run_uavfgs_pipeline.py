@@ -232,6 +232,25 @@ def _cli_option_was_supplied(argv: Sequence[str], option: str) -> bool:
     return any(token == option or token.startswith(option + "=") for token in argv)
 
 
+def _resolve_artifact_save_semantics(
+    thermal_recipe: str,
+    requested_semantics: Optional[str],
+) -> str:
+    """Resolve Stage-2 endpoint-save ordering without changing legacy defaults."""
+    recipe = str(thermal_recipe)
+    requested = None if requested_semantics is None else str(requested_semantics)
+    if requested not in (None, "legacy", "aligned"):
+        raise ValueError(f"unsupported artifact save semantics: {requested!r}")
+    if recipe == "aaai_strict":
+        if requested == "legacy":
+            raise ValueError(
+                "--thermal_recipe aaai_strict requires "
+                "--artifact_save_semantics aligned"
+            )
+        return "aligned"
+    return "legacy" if requested is None else requested
+
+
 def _apply_thermal_recipe_defaults(
     args: argparse.Namespace,
     argv: Sequence[str],
@@ -1259,6 +1278,15 @@ def main() -> None:
         help="Stage-2 protocol preset. Legacy preserves the established command exactly (default: legacy)."
     )
     ap.add_argument(
+        "--artifact_save_semantics",
+        choices=["legacy", "aligned"],
+        default=None,
+        help=(
+            "Stage-2 PLY/checkpoint save ordering. Unset preserves legacy "
+            "ordering; aaai_strict resolves to aligned endpoints."
+        ),
+    )
+    ap.add_argument(
         "--thermal_freeze_mode",
         choices=["legacy", "strict", "continuous_unfrozen"],
         default="legacy",
@@ -1341,6 +1369,7 @@ def main() -> None:
     cli_args = sys.argv[1:]
     thermal_protocol_requested = {
         "thermal_recipe": args.thermal_recipe,
+        "artifact_save_semantics": args.artifact_save_semantics,
         "thermal_freeze_mode": args.thermal_freeze_mode,
         "thermal_scale_clamp": args.thermal_scale_clamp,
         "thermal_max_sh_degree": args.thermal_max_sh_degree,
@@ -1352,6 +1381,9 @@ def main() -> None:
     }
     thermal_checkpoint_offsets_explicit = _cli_option_was_supplied(
         cli_args, "--thermal_checkpoint_offsets"
+    )
+    artifact_save_semantics_explicit = _cli_option_was_supplied(
+        cli_args, "--artifact_save_semantics"
     )
 
     # Validate step range
@@ -1445,6 +1477,9 @@ def main() -> None:
                 "--thermal_recipe aaai_strict does not use --sgf_disable"
             )
         thermal_recipe_defaults_applied = _apply_thermal_recipe_defaults(args, cli_args)
+        args.artifact_save_semantics = _resolve_artifact_save_semantics(
+            args.thermal_recipe, args.artifact_save_semantics
+        )
         if args.thermal_freeze_mode == "strict" and args.thermal_scale_clamp != "off":
             raise ValueError(
                 "--thermal_freeze_mode strict requires --thermal_scale_clamp off"
@@ -1537,6 +1572,8 @@ def main() -> None:
         "schema_name": "uav-tgs-stage2-protocol",
         "schema_version": 1,
         "thermal_recipe": args.thermal_recipe,
+        "artifact_save_semantics": args.artifact_save_semantics,
+        "artifact_save_semantics_explicit": artifact_save_semantics_explicit,
         "thermal_freeze_mode": args.thermal_freeze_mode,
         "thermal_scale_clamp": args.thermal_scale_clamp,
         "thermal_max_sh_degree": args.thermal_max_sh_degree,
@@ -2920,6 +2957,10 @@ def main() -> None:
         ])
     if args.thermal_recipe != "legacy":
         train2_cmd.extend(["--thermal_recipe", str(args.thermal_recipe)])
+    if args.thermal_recipe == "aaai_strict" or artifact_save_semantics_explicit:
+        train2_cmd.extend([
+            "--artifact_save_semantics", str(args.artifact_save_semantics)
+        ])
     if args.thermal_freeze_mode != "legacy":
         train2_cmd.extend(["--thermal_freeze_mode", str(args.thermal_freeze_mode)])
     if args.thermal_scale_clamp != "legacy":

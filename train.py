@@ -138,6 +138,23 @@ def _save_iteration_artifacts(
             os.path.join(scene.model_path, "chkpnt" + str(iteration) + ".pth"),
         )
 
+
+def _resolve_artifact_save_semantics(thermal_recipe, requested_semantics):
+    """Resolve the endpoint-save protocol without changing legacy defaults."""
+    recipe = str(thermal_recipe)
+    requested = None if requested_semantics is None else str(requested_semantics)
+    if requested not in (None, "legacy", "aligned"):
+        raise ValueError(f"Unsupported artifact save semantics: {requested!r}")
+    if recipe == "aaai_strict":
+        if requested == "legacy":
+            raise ValueError(
+                "--thermal_recipe aaai_strict requires "
+                "--artifact_save_semantics aligned"
+            )
+        return "aligned"
+    return "legacy" if requested is None else requested
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, ss_args=None):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
@@ -146,11 +163,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     thermal_freeze_mode = str(getattr(args, "thermal_freeze_mode", "legacy"))
     strict_freeze = thermal_freeze_mode == "strict"
     topology_frozen = thermal_freeze_mode in ("strict", "continuous_unfrozen")
-    aligned_artifact_saves = (
-        str(getattr(args, "thermal_recipe", "legacy")) == "aaai_strict"
+    artifact_save_semantics = _resolve_artifact_save_semantics(
+        getattr(args, "thermal_recipe", "legacy"),
+        getattr(args, "artifact_save_semantics", None),
     )
+    aligned_artifact_saves = artifact_save_semantics == "aligned"
     if aligned_artifact_saves:
-        print("[INFO] AAAIArtifactSaveSemantics: aligned_post_optimizer_step=1")
+        print(
+            "[INFO] AAAIArtifactSaveSemantics: "
+            "semantics=aligned aligned_post_optimizer_step=1"
+        )
     if (strict_freeze or thermal_freeze_mode == "continuous_unfrozen") and not checkpoint:
         raise RuntimeError(f"thermal_freeze_mode={thermal_freeze_mode} requires a start checkpoint")
 
@@ -871,6 +893,15 @@ if __name__ == "__main__":
         help="Stage-2 protocol preset. legacy preserves the ACM behavior by default."
     )
     parser.add_argument(
+        "--artifact_save_semantics",
+        choices=["legacy", "aligned"],
+        default=None,
+        help=(
+            "PLY/checkpoint save ordering. Unset resolves to legacy, while "
+            "aaai_strict resolves to aligned post-step endpoints."
+        ),
+    )
+    parser.add_argument(
         "--thermal_freeze_mode",
         choices=["legacy", "strict", "continuous_unfrozen"],
         default="legacy",
@@ -940,6 +971,13 @@ if __name__ == "__main__":
         args.t_struct_grad_w = 0.006
         args.t_struct_grad_norm = True
         args.sgf_disable = False
+
+    try:
+        args.artifact_save_semantics = _resolve_artifact_save_semantics(
+            args.thermal_recipe, args.artifact_save_semantics
+        )
+    except ValueError as error:
+        parser.error(str(error))
 
     if args.thermal_recipe == "aaai_strict":
         if not args.start_checkpoint:
@@ -1016,6 +1054,7 @@ if __name__ == "__main__":
             "start_checkpoint": str(args.start_checkpoint) if args.start_checkpoint else None,
             "resolution": int(args.resolution),
             "thermal_recipe": str(args.thermal_recipe),
+            "artifact_save_semantics": str(args.artifact_save_semantics),
             "thermal_max_sh_degree": args.thermal_max_sh_degree,
             "thermal_optimizer_state": str(args.thermal_optimizer_state),
             "thermal_freeze_mode": str(args.thermal_freeze_mode),

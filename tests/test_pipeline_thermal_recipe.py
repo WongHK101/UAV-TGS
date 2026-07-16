@@ -89,6 +89,10 @@ class PipelineThermalRecipeTests(unittest.TestCase):
         )
         protocol = payload["protocol"]["thermal_stage2"]
         self.assertEqual(protocol["thermal_recipe"], "legacy")
+        self.assertEqual(protocol["artifact_save_semantics"], "legacy")
+        self.assertIsNone(protocol["requested"]["artifact_save_semantics"])
+        self.assertFalse(protocol["artifact_save_semantics_explicit"])
+        self.assertNotIn("--artifact_save_semantics", tokens)
         self.assertIsNone(protocol["thermal_checkpoint_offsets"])
         self.assertEqual(protocol["thermal_checkpoint_offsets_configured"], [10000, 20000, 30000])
         self.assertEqual(protocol["thermal_checkpoint_iterations"], [60000])
@@ -99,6 +103,8 @@ class PipelineThermalRecipeTests(unittest.TestCase):
         protocol = payload["protocol"]["thermal_stage2"]
 
         self.assertEqual(protocol["thermal_recipe"], "aaai_strict")
+        self.assertEqual(protocol["artifact_save_semantics"], "aligned")
+        self.assertFalse(protocol["artifact_save_semantics_explicit"])
         self.assertEqual(protocol["thermal_freeze_mode"], "strict")
         self.assertEqual(protocol["thermal_scale_clamp"], "off")
         self.assertEqual(protocol["thermal_max_sh_degree"], 1)
@@ -110,12 +116,28 @@ class PipelineThermalRecipeTests(unittest.TestCase):
         self.assertEqual(self._values(tokens, "--checkpoint_iterations"), ["40000", "50000", "60000"])
         self.assertEqual(self._values(tokens, "--save_iterations"), ["40000", "50000", "60000"])
         self.assertEqual(self._value(tokens, "--thermal_recipe"), "aaai_strict")
+        self.assertEqual(self._value(tokens, "--artifact_save_semantics"), "aligned")
         self.assertEqual(self._value(tokens, "--thermal_freeze_mode"), "strict")
         self.assertEqual(self._value(tokens, "--thermal_scale_clamp"), "off")
         self.assertEqual(self._value(tokens, "--thermal_max_sh_degree"), "1")
         self.assertEqual(self._value(tokens, "--thermal_optimizer_state"), "fresh")
         self.assertEqual(self._value(tokens, "--opacity_lr"), "0")
         self.assertNotIn("--clamp_scale_max", tokens)
+
+    def test_explicit_aligned_semantics_are_recorded_and_forwarded(self):
+        payload, tokens = self._dry_run(
+            "--artifact_save_semantics", "aligned"
+        )
+        protocol = payload["protocol"]["thermal_stage2"]
+        self.assertEqual(protocol["thermal_recipe"], "legacy")
+        self.assertEqual(protocol["artifact_save_semantics"], "aligned")
+        self.assertEqual(
+            protocol["requested"]["artifact_save_semantics"], "aligned"
+        )
+        self.assertTrue(protocol["artifact_save_semantics_explicit"])
+        self.assertEqual(
+            self._value(tokens, "--artifact_save_semantics"), "aligned"
+        )
 
     def test_continuous_unfrozen_has_nonzero_lrs_and_fixed_topology(self):
         payload, tokens = self._dry_run(
@@ -180,6 +202,23 @@ class PipelineThermalRecipeTests(unittest.TestCase):
                 setattr(args, attribute, value)
                 with self.assertRaisesRegex(ValueError, "aaai_strict requires"):
                     pipeline._apply_thermal_recipe_defaults(args, [option, value])
+
+    def test_artifact_save_semantics_resolution_fails_closed(self):
+        self.assertEqual(
+            pipeline._resolve_artifact_save_semantics("legacy", None), "legacy"
+        )
+        self.assertEqual(
+            pipeline._resolve_artifact_save_semantics("legacy", "aligned"),
+            "aligned",
+        )
+        self.assertEqual(
+            pipeline._resolve_artifact_save_semantics("aaai_strict", None),
+            "aligned",
+        )
+        with self.assertRaisesRegex(ValueError, "requires"):
+            pipeline._resolve_artifact_save_semantics(
+                "aaai_strict", "legacy"
+            )
 
 
 if __name__ == "__main__":

@@ -37,6 +37,7 @@
   },
   "legacy_stage2_defaults": {
     "thermal_recipe": "legacy",
+    "artifact_save_semantics": "legacy",
     "thermal_max_sh_degree": null,
     "thermal_optimizer_state": "restore",
     "thermal_freeze_mode": "legacy",
@@ -46,6 +47,7 @@
   },
   "aaai_strict_stage2_defaults": {
     "thermal_recipe": "aaai_strict",
+    "artifact_save_semantics": "aligned",
     "thermal_max_sh_degree": 1,
     "thermal_optimizer_state": "fresh",
     "thermal_freeze_mode": "strict",

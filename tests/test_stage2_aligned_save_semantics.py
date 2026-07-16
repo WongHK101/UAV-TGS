@@ -13,18 +13,23 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 TRAIN_PATH = REPO_ROOT / "train.py"
 
 
-def _load_save_helper():
+def _load_save_helpers():
     tree = ast.parse(TRAIN_PATH.read_text(encoding="utf-8"))
-    node = next(
-        item
+    selected = {
+        item.name: item
         for item in tree.body
         if isinstance(item, ast.FunctionDef)
-        and item.name == "_save_iteration_artifacts"
+        and item.name in {
+            "_save_iteration_artifacts",
+            "_resolve_artifact_save_semantics",
+        }
+    }
+    module = ast.fix_missing_locations(
+        ast.Module(body=list(selected.values()), type_ignores=[])
     )
-    module = ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[]))
     namespace = {"os": os, "torch": torch}
     exec(compile(module, str(TRAIN_PATH), "exec"), namespace)
-    return namespace["_save_iteration_artifacts"]
+    return namespace
 
 
 def _optimizer_step(gaussians) -> int:
@@ -76,7 +81,36 @@ def _take_step(gaussians: _FakeGaussians) -> None:
 class Stage2AlignedSaveSemanticsTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.save_artifacts = staticmethod(_load_save_helper())
+        helpers = _load_save_helpers()
+        cls.save_artifacts = staticmethod(helpers["_save_iteration_artifacts"])
+        cls.resolve_semantics = staticmethod(
+            helpers["_resolve_artifact_save_semantics"]
+        )
+
+    def test_recipe_resolves_aligned_and_resume_can_request_it_explicitly(self):
+        self.assertEqual(self.resolve_semantics("legacy", None), "legacy")
+        self.assertEqual(self.resolve_semantics("legacy", "legacy"), "legacy")
+        self.assertEqual(self.resolve_semantics("legacy", "aligned"), "aligned")
+        self.assertEqual(self.resolve_semantics("aaai_strict", None), "aligned")
+        self.assertEqual(
+            self.resolve_semantics("aaai_strict", "aligned"), "aligned"
+        )
+        with self.assertRaisesRegex(ValueError, "requires"):
+            self.resolve_semantics("aaai_strict", "legacy")
+
+        tree = ast.parse(TRAIN_PATH.read_text(encoding="utf-8"))
+        argument = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "add_argument"
+            and node.args
+            and ast.literal_eval(node.args[0]) == "--artifact_save_semantics"
+        )
+        keywords = {item.arg: ast.literal_eval(item.value) for item in argument.keywords}
+        self.assertIsNone(keywords["default"])
+        self.assertEqual(keywords["choices"], ["legacy", "aligned"])
 
     def _save(self, root: str, gaussians: _FakeGaussians, iteration: int):
         scene = _FakeScene(root, gaussians)
@@ -150,10 +184,7 @@ class Stage2AlignedSaveSemanticsTests(unittest.TestCase):
         )
         self.assertLess(legacy_ply, optimizer_step)
         self.assertLess(optimizer_step, aaai_pair)
-        self.assertIn(
-            'str(getattr(args, "thermal_recipe", "legacy")) == "aaai_strict"',
-            training_source,
-        )
+        self.assertIn('artifact_save_semantics == "aligned"', training_source)
         self.assertIn(
             "if (not aligned_artifact_saves) and (iteration in saving_iterations):",
             training_source,
