@@ -58,6 +58,8 @@ class ModelParams(ParamGroup):
         self.eval = False
         self.train_list = ""
         self.test_list = ""
+        self.train_list_sha256 = ""
+        self.test_list_sha256 = ""
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -77,6 +79,8 @@ class ModelParams(ParamGroup):
             "eval": self.eval,
             "train_list": self.train_list,
             "test_list": self.test_list,
+            "train_list_sha256": self.train_list_sha256,
+            "test_list_sha256": self.test_list_sha256,
         }
         for k, v in defaults.items():
             if not hasattr(g, k):

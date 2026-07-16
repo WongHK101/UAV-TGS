@@ -9,11 +9,14 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-import torch
-from scene import Scene
+import numpy as np
+import hashlib
 import os
+import torch
 from tqdm import tqdm
 from os import makedirs
+from pathlib import Path
+from scene import Scene
 from gaussian_renderer import render
 import torchvision
 from utils.general_utils import safe_state
@@ -28,23 +31,329 @@ except:
     SPARSE_ADAM_AVAILABLE = False
 
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background, train_test_exp, separate_sh):
+_RENDERER_SUPPORT_KEYS = (
+    "alpha",
+    "accumulation",
+    "accum_alpha",
+    "opacity",
+    "support",
+)
+
+
+def _sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _view_source_name(view):
+    source_name = str(getattr(view, "image_name", ""))
+    if not source_name:
+        raise ValueError("Every rendered view must have a non-empty image_name")
+    return source_name
+
+
+def _image_name_output_stems(views):
+    """Return safe output stems and reject cross-platform collisions up front."""
+    stems = []
+    seen = {}
+    for view in views:
+        source_name = _view_source_name(view)
+        stem = Path(source_name.replace("\\", "/")).stem
+        if not stem or stem in {".", ".."}:
+            raise ValueError(f"Invalid output stem derived from image_name: {source_name!r}")
+        collision_key = stem.casefold()
+        if collision_key in seen:
+            raise ValueError(
+                "Duplicate image_name stem is not allowed for named render output: "
+                f"{seen[collision_key]!r} and {source_name!r} both map to {stem!r}"
+            )
+        seen[collision_key] = source_name
+        stems.append(stem)
+    return stems
+
+
+def _renderer_support_array(render_package, expected_height, expected_width):
+    """Extract a native per-pixel renderer support output without synthesising one."""
+    source_key = next(
+        (key for key in _RENDERER_SUPPORT_KEYS if key in render_package),
+        None,
+    )
+    if source_key is None:
+        available = ", ".join(sorted(str(key) for key in render_package.keys()))
+        raise RuntimeError(
+            "--save_renderer_support requested, but the renderer returned no native "
+            "alpha/accumulation/opacity/support map. Refusing to synthesize a map. "
+            f"Available render-package keys: {available or '<none>'}"
+        )
+
+    values = render_package[source_key]
+    if hasattr(values, "detach"):
+        values = values.detach()
+    if hasattr(values, "float"):
+        values = values.float()
+    if hasattr(values, "cpu"):
+        values = values.cpu()
+    if hasattr(values, "numpy"):
+        values = values.numpy()
+    values = np.asarray(values)
+
+    if values.ndim == 3 and values.shape[0] == 1:
+        values = values[0]
+    elif values.ndim == 3 and values.shape[-1] == 1:
+        values = values[..., 0]
+    if values.ndim != 2:
+        raise RuntimeError(
+            f"Renderer support key {source_key!r} must be a single-channel map, "
+            f"got shape {values.shape}"
+        )
+    if values.shape != (int(expected_height), int(expected_width)):
+        raise RuntimeError(
+            f"Renderer support key {source_key!r} has shape {values.shape}, expected "
+            f"{(int(expected_height), int(expected_width))}"
+        )
+    if not np.all(np.isfinite(values)):
+        raise RuntimeError(f"Renderer support key {source_key!r} contains non-finite values")
+    return np.asarray(values, dtype=np.float32), source_key
+
+
+def _opacity_proxy_array(proxy_render, expected_height, expected_width):
+    """Match the established depth evaluator's white-override opacity proxy."""
+    values = proxy_render
+    if hasattr(values, "detach"):
+        values = values.detach()
+    if hasattr(values, "float"):
+        values = values.float()
+    if hasattr(values, "cpu"):
+        values = values.cpu()
+    if hasattr(values, "numpy"):
+        values = values.numpy()
+    values = np.asarray(values)
+    if values.ndim != 3 or values.shape[0] < 1:
+        raise RuntimeError(
+            "White-override opacity proxy must be a channel-first color render, "
+            f"got shape {values.shape}"
+        )
+    values = values[0]
+    if values.shape != (int(expected_height), int(expected_width)):
+        raise RuntimeError(
+            f"White-override opacity proxy has shape {values.shape}, expected "
+            f"{(int(expected_height), int(expected_width))}"
+        )
+    if not np.all(np.isfinite(values)):
+        raise RuntimeError("White-override opacity proxy contains non-finite values")
+    return np.asarray(values, dtype=np.float32)
+
+
+def render_set(
+    model_path,
+    name,
+    iteration,
+    views,
+    gaussians,
+    pipeline,
+    background,
+    train_test_exp,
+    separate_sh,
+    save_by_image_name=False,
+    save_renderer_support=False,
+    save_opacity_proxy=False,
+):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
 
+    if save_by_image_name:
+        views = list(views)
+        output_stems = _image_name_output_stems(views)
+    else:
+        output_stems = None
+
+    support_path = os.path.join(
+        model_path,
+        name,
+        "ours_{}".format(iteration),
+        "renderer_support",
+    )
+    opacity_proxy_path = os.path.join(
+        model_path,
+        name,
+        "ours_{}".format(iteration),
+        "opacity_proxy",
+    )
+
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
+    if save_renderer_support:
+        makedirs(support_path, exist_ok=True)
+    if save_opacity_proxy:
+        makedirs(opacity_proxy_path, exist_ok=True)
 
+    if save_opacity_proxy:
+        black_background = torch.zeros_like(background)
+        white_override = torch.ones(
+            (gaussians.get_xyz.shape[0], 3),
+            dtype=torch.float32,
+            device=background.device,
+        )
+    else:
+        black_background = None
+        white_override = None
+
+    mapping_entries = []
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        rendering = render(view, gaussians, pipeline, background, use_trained_exp=train_test_exp, separate_sh=separate_sh)["render"]
+        render_package = render(
+            view,
+            gaussians,
+            pipeline,
+            background,
+            use_trained_exp=train_test_exp,
+            separate_sh=separate_sh,
+        )
+        rendering = render_package["render"]
         gt = view.original_image[0:3, :, :]
 
-        if args.train_test_exp:
+        support_values = None
+        support_source_key = None
+        if save_renderer_support:
+            support_values, support_source_key = _renderer_support_array(
+                render_package,
+                rendering.shape[-2],
+                rendering.shape[-1],
+            )
+
+        opacity_proxy_values = None
+        if save_opacity_proxy:
+            opacity_package = render(
+                view,
+                gaussians,
+                pipeline,
+                black_background,
+                scaling_modifier=1.0,
+                separate_sh=False,
+                override_color=white_override,
+                use_trained_exp=False,
+            )
+            opacity_proxy_values = _opacity_proxy_array(
+                opacity_package["render"],
+                rendering.shape[-2],
+                rendering.shape[-1],
+            )
+
+        if train_test_exp:
             rendering = rendering[..., rendering.shape[-1] // 2:]
             gt = gt[..., gt.shape[-1] // 2:]
+            if support_values is not None:
+                support_values = support_values[..., support_values.shape[-1] // 2:]
+            if opacity_proxy_values is not None:
+                opacity_proxy_values = opacity_proxy_values[
+                    ..., opacity_proxy_values.shape[-1] // 2:
+                ]
 
-        torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+        output_stem = output_stems[idx] if output_stems is not None else '{0:05d}'.format(idx)
+        render_relative = os.path.join("renders", output_stem + ".png").replace("\\", "/")
+        gt_relative = os.path.join("gt", output_stem + ".png").replace("\\", "/")
+        render_output_path = os.path.join(render_path, output_stem + ".png")
+        gt_output_path = os.path.join(gts_path, output_stem + ".png")
+        torchvision.utils.save_image(rendering, render_output_path)
+        torchvision.utils.save_image(gt, gt_output_path)
+
+        support_relative = None
+        support_output_path = None
+        if save_renderer_support:
+            support_relative = os.path.join(
+                "renderer_support",
+                output_stem + ".npy",
+            ).replace("\\", "/")
+            support_output_path = os.path.join(support_path, output_stem + ".npy")
+            np.save(
+                support_output_path,
+                support_values,
+                allow_pickle=False,
+            )
+
+        opacity_proxy_relative = None
+        opacity_proxy_output_path = None
+        if save_opacity_proxy:
+            opacity_proxy_relative = os.path.join(
+                "opacity_proxy",
+                output_stem + ".npy",
+            ).replace("\\", "/")
+            opacity_proxy_output_path = os.path.join(
+                opacity_proxy_path,
+                output_stem + ".npy",
+            )
+            np.save(
+                opacity_proxy_output_path,
+                opacity_proxy_values,
+                allow_pickle=False,
+            )
+
+        if save_by_image_name or save_renderer_support or save_opacity_proxy:
+            mapping_entries.append(
+                {
+                    "split": str(name),
+                    "iteration": int(iteration),
+                    "source_image_name": _view_source_name(view),
+                    "output": {
+                        "render": render_relative,
+                        "ground_truth": gt_relative,
+                        "renderer_support": support_relative,
+                        "opacity_proxy": opacity_proxy_relative,
+                    },
+                    "output_sha256": {
+                        "render": _sha256(render_output_path),
+                        "ground_truth": _sha256(gt_output_path),
+                        "renderer_support": (
+                            _sha256(support_output_path)
+                            if support_output_path is not None
+                            else None
+                        ),
+                        "opacity_proxy": (
+                            _sha256(opacity_proxy_output_path)
+                            if opacity_proxy_output_path is not None
+                            else None
+                        ),
+                    },
+                    "renderer_support_source_key": support_source_key,
+                    "opacity_proxy_semantics": (
+                        "black_bg_plus_white_override_color_render"
+                        if save_opacity_proxy
+                        else None
+                    ),
+                    "support_threshold_applied": False,
+                    "support_threshold": None,
+                }
+            )
+
+    if save_by_image_name or save_renderer_support or save_opacity_proxy:
+        manifest_path = os.path.join(
+            model_path,
+            name,
+            "ours_{}".format(iteration),
+            "render_mapping_manifest.json",
+        )
+        atomic_write_json(
+            manifest_path,
+            {
+                "schema_name": "uav-tgs-render-output-mapping",
+                "schema_version": 1,
+                "split": str(name),
+                "iteration": int(iteration),
+                "name_mode": "image_name_stem" if save_by_image_name else "sequential_index",
+                "renderer_support_saved": bool(save_renderer_support),
+                "opacity_proxy_saved": bool(save_opacity_proxy),
+                "opacity_proxy_semantics": (
+                    "black_bg_plus_white_override_color_render"
+                    if save_opacity_proxy
+                    else None
+                ),
+                "support_threshold_applied": False,
+                "support_threshold": None,
+                "entries": mapping_entries,
+            },
+        )
 
 def _view_resolution(view):
     width = getattr(view, "image_width", None)
@@ -71,6 +380,9 @@ def render_sets(
     benchmark_repeats: int = 3,
     benchmark_output: str = "",
     benchmark_only: bool = False,
+    save_by_image_name: bool = False,
+    save_renderer_support: bool = False,
+    save_opacity_proxy: bool = False,
 ):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
@@ -133,10 +445,36 @@ def render_sets(
         # Keep benchmark warm-up controlled and comparable: when both actions
         # are requested, measure before the full PNG render pass.
         if not benchmark_only and not skip_train:
-             render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, dataset.train_test_exp, separate_sh)
+             render_set(
+                 dataset.model_path,
+                 "train",
+                 scene.loaded_iter,
+                 scene.getTrainCameras(),
+                 gaussians,
+                 pipeline,
+                 background,
+                 dataset.train_test_exp,
+                 separate_sh,
+                 save_by_image_name,
+                 save_renderer_support,
+                 save_opacity_proxy,
+             )
 
         if not benchmark_only and not skip_test:
-             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, dataset.train_test_exp, separate_sh)
+             render_set(
+                 dataset.model_path,
+                 "test",
+                 scene.loaded_iter,
+                 scene.getTestCameras(),
+                 gaussians,
+                 pipeline,
+                 background,
+                 dataset.train_test_exp,
+                 separate_sh,
+                 save_by_image_name,
+                 save_renderer_support,
+                 save_opacity_proxy,
+             )
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -154,6 +492,12 @@ if __name__ == "__main__":
     parser.add_argument("--benchmark_output", type=str, default="")
     parser.add_argument("--benchmark_only", action="store_true", default=False,
                         help="Skip PNG rendering and run only the opt-in efficiency benchmark.")
+    parser.add_argument("--save_by_image_name", action="store_true", default=False,
+                        help="Opt in to image_name-stem render/GT filenames and a deterministic mapping manifest.")
+    parser.add_argument("--save_renderer_support", action="store_true", default=False,
+                        help="Save a native renderer alpha/accumulation/opacity/support map as float32 NPY; fail if unavailable.")
+    parser.add_argument("--save_opacity_proxy", action="store_true", default=False,
+                        help="Save the established black-background/white-override opacity proxy as float32 NPY.")
     args = get_combined_args(parser)
     if args.benchmark_only and not args.benchmark_efficiency:
         parser.error("--benchmark_only requires --benchmark_efficiency")
@@ -180,4 +524,7 @@ if __name__ == "__main__":
         benchmark_repeats=args.benchmark_repeats,
         benchmark_output=args.benchmark_output,
         benchmark_only=args.benchmark_only,
+        save_by_image_name=args.save_by_image_name,
+        save_renderer_support=args.save_renderer_support,
+        save_opacity_proxy=args.save_opacity_proxy,
     )

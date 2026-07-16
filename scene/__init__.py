@@ -49,6 +49,8 @@ class Scene:
                 args.train_test_exp,
                 train_list=getattr(args, "train_list", ""),
                 test_list=getattr(args, "test_list", ""),
+                train_list_sha256=getattr(args, "train_list_sha256", ""),
+                test_list_sha256=getattr(args, "test_list_sha256", ""),
             )
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")

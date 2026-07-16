@@ -11,6 +11,7 @@
 
 import os
 import sys
+import hashlib
 from PIL import Image
 from typing import NamedTuple
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
@@ -142,10 +143,23 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def _read_camera_name_list(list_path, scene_path):
+def _read_camera_name_list(list_path, scene_path, expected_sha256="", label="camera"):
     if not list_path:
         return None
     resolved = list_path if os.path.isabs(list_path) else os.path.join(scene_path, list_path)
+    if expected_sha256:
+        expected = str(expected_sha256).strip().lower()
+        if len(expected) != 64 or any(char not in "0123456789abcdef" for char in expected):
+            raise ValueError(f"Invalid expected SHA-256 for {label} list: {expected_sha256}")
+        digest = hashlib.sha256()
+        with open(resolved, "rb") as binary_file:
+            for chunk in iter(lambda: binary_file.read(1024 * 1024), b""):
+                digest.update(chunk)
+        actual = digest.hexdigest()
+        if actual != expected:
+            raise ValueError(
+                f"{label.capitalize()} camera list SHA-256 mismatch: expected={expected} actual={actual}"
+            )
     with open(resolved, "r", encoding="utf-8-sig") as file:
         names = [line.strip() for line in file if line.strip()]
     if not names:
@@ -153,7 +167,10 @@ def _read_camera_name_list(list_path, scene_path):
     return names
 
 
-def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8, train_list="", test_list=""):
+def readColmapSceneInfo(
+    path, images, depths, eval, train_test_exp, llffhold=8,
+    train_list="", test_list="", train_list_sha256="", test_list_sha256="",
+):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -187,8 +204,12 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8, 
             print(f"An unexpected error occurred when trying to open depth_params.json file: {e}")
             sys.exit(1)
 
-    explicit_train_names = _read_camera_name_list(train_list, path)
-    explicit_test_names = _read_camera_name_list(test_list, path)
+    explicit_train_names = _read_camera_name_list(
+        train_list, path, train_list_sha256, label="train"
+    )
+    explicit_test_names = _read_camera_name_list(
+        test_list, path, test_list_sha256, label="test"
+    )
     known_camera_names = {cam.name for cam in cam_extrinsics.values()}
     for label, names in (("train", explicit_train_names), ("test", explicit_test_names)):
         if names is None:

@@ -210,3 +210,70 @@ primary result with missing inputs has status `completed_with_missing`; it is
 never labeled simply `complete`.
 The all-pixel result is diagnostic only.  These quantities are not absolute
 thermometry, true surface temperature, or physical ground truth.
+
+## Float-temperature undistortion
+
+Do not infer temperature by inverting a palette image after COLMAP
+undistortion.  Remap decoded float32 Celsius maps directly with the input and
+output sparse models:
+
+```powershell
+python tools/thermal_radiometry/undistort_temperature.py `
+  --temperature-root DERIVED/temperature_c/Building `
+  --input-model DATASET/distorted/sparse/0 `
+  --output-model DATASET/undistorted/sparse/0 `
+  --output-root DERIVED/undistorted_temperature/Building
+```
+
+The input temperature shape must exactly match its distorted COLMAP camera.
+The supported path is `SIMPLE_RADIAL`, `RADIAL`, `SIMPLE_PINHOLE`, or `PINHOLE`
+input to `PINHOLE`/`SIMPLE_PINHOLE` output.  All image associations, camera
+models, poses, float32 dtypes, finite values, and shapes are preflighted before
+an output directory is atomically published.  Each output map has a mirrored
+boolean `valid_support` NPY; border-filled values outside that mask must not be
+used for evaluation.  `manifest.json` pins model parameters and hashes of the
+model, source maps, remapped maps, and masks.
+
+## Formal shared support domain
+
+Formal temperature evaluation uses one support domain shared by every Stage-2
+method.  First render the frozen RGB anchor with image-name outputs and the
+existing depth-evaluation opacity proxy:
+
+```powershell
+python render.py `
+  -m OUTPUT/RGB_ANCHOR `
+  --iteration 30000 `
+  --skip_train `
+  --save_by_image_name `
+  --save_opacity_proxy
+```
+
+The proxy is explicitly
+`black_bg_plus_white_override_color_render`; it is not described as native
+rasterizer alpha.  Combine it once with the float-remap validity masks:
+
+```powershell
+python tools/thermal_radiometry/combine_formal_support.py `
+  --split-manifest DERIVED/splits/guard4/scenes/Building.split.json `
+  --valid-support-root DERIVED/undistorted_temperature/Building/valid_support `
+  --valid-support-manifest DERIVED/undistorted_temperature/Building/manifest.json `
+  --opacity-proxy-root OUTPUT/RGB_ANCHOR/test/ours_30000/opacity_proxy `
+  --opacity-proxy-manifest OUTPUT/RGB_ANCHOR/test/ours_30000/render_mapping_manifest.json `
+  --opacity-threshold 0.01 `
+  --expected-test-count 80 `
+  --output-root DERIVED/formal_support/Building
+```
+
+`--opacity-threshold` is deliberately explicit; `0.01` is the formal Building
+example rather than a hidden evaluator default.  The command requires exactly
+the 80 frozen test names, verifies both source manifests and every selected
+source-file SHA-256, checks boolean/float32 dtypes and identical shapes, and
+fails if any frame has empty combined support.  It atomically writes equivalent
+boolean and float32 NPY trees plus a path-portable deterministic manifest,
+portable content hash, and `manifest.sha256`.
+
+Use the same generated float (or boolean) tree for L, C3, and F3.  Because the
+threshold has already been applied by the combiner, formal evaluator calls use
+`--mask-root DERIVED/formal_support/Building/float --alpha-threshold 0` with
+`--require-support`; do not rebuild support from each thermal model.

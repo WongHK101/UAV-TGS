@@ -536,6 +536,53 @@ def _build_image_name_alias_dir(src_dir: Path, required_names: List[str], alias_
     return linked, missing
 
 
+def _resolve_explicit_camera_lists(train_list: str, test_list: str) -> Tuple[str, str]:
+    """Validate and normalise an explicit train/test camera split.
+
+    Supplying only one list is never allowed: doing so would let the dataset
+    loader silently fill the other side from the legacy LLFF hold-out rule.
+    The file contents are checked here as an early pipeline preflight; the
+    dataset reader still performs the authoritative COLMAP-name checks.
+    """
+    raw_train = str(train_list or "").strip()
+    raw_test = str(test_list or "").strip()
+    if bool(raw_train) != bool(raw_test):
+        raise ValueError("--train_list and --test_list must be supplied together")
+    if not raw_train:
+        return "", ""
+
+    resolved: List[str] = []
+    name_sets: List[set[str]] = []
+    for label, value in (("train", raw_train), ("test", raw_test)):
+        path = Path(value).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"Explicit {label} camera list does not exist: {path}")
+        names = [line.strip() for line in path.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+        if not names:
+            raise ValueError(f"Explicit {label} camera list is empty: {path}")
+        if len(names) != len(set(names)):
+            raise ValueError(f"Explicit {label} camera list contains duplicate camera names: {path}")
+        resolved.append(str(path))
+        name_sets.append(set(names))
+
+    overlap = sorted(name_sets[0] & name_sets[1])
+    if overlap:
+        raise ValueError(f"Explicit train/test camera lists overlap: {overlap[:8]}")
+    return resolved[0], resolved[1]
+
+
+def _append_explicit_camera_lists(
+    command: List[str], train_list: str, test_list: str,
+    train_list_sha256: str = "", test_list_sha256: str = "",
+) -> None:
+    if train_list:
+        command.extend(["--train_list", train_list, "--test_list", test_list])
+        command.extend([
+            "--train_list_sha256", train_list_sha256,
+            "--test_list_sha256", test_list_sha256,
+        ])
+
+
 def contains_any_file(root: Path, names: Tuple[str, ...], max_depth: int = 2) -> bool:
     """
     Returns True if any file with basename in `names` exists within `root` up to `max_depth`.
@@ -968,6 +1015,22 @@ def main() -> None:
 
     ap.add_argument("--rgb_dir", default="", help="RGB directory. Default: <data_root>/RGB, or <data_root>/rgb if RGB is absent")
     ap.add_argument("--th_dir", default="", help="Thermal directory. Default: <data_root>/thermal")
+    ap.add_argument(
+        "--train_list", default="",
+        help="Explicit COLMAP camera-name list for training. Must be supplied with --test_list.",
+    )
+    ap.add_argument(
+        "--test_list", default="",
+        help="Explicit COLMAP camera-name list for evaluation. Must be supplied with --train_list.",
+    )
+    ap.add_argument(
+        "--thermal_train_list", default="",
+        help="Optional Stage-2 camera-name list (for example canonical .png names). Must be paired.",
+    )
+    ap.add_argument(
+        "--thermal_test_list", default="",
+        help="Optional Stage-2 evaluation list. Defaults to the RGB lists when both are omitted.",
+    )
 
     ap.add_argument("--colmap", default="colmap", help="COLMAP executable (default: colmap). Can be colmap.exe / colmap.bat / full path.")
     ap.add_argument("--exiftool", default="exiftool", help="ExifTool executable (default: exiftool)")
@@ -1367,6 +1430,27 @@ def main() -> None:
 
     args = ap.parse_args()
     cli_args = sys.argv[1:]
+    try:
+        args.train_list, args.test_list = _resolve_explicit_camera_lists(
+            args.train_list, args.test_list
+        )
+        args.thermal_train_list, args.thermal_test_list = _resolve_explicit_camera_lists(
+            args.thermal_train_list, args.thermal_test_list
+        )
+    except (OSError, ValueError) as exc:
+        ap.error(str(exc))
+    if args.thermal_train_list and not args.train_list:
+        ap.error("thermal camera lists require the explicit RGB train/test lists")
+    if not args.thermal_train_list:
+        args.thermal_train_list, args.thermal_test_list = args.train_list, args.test_list
+    args.train_list_sha256 = _sha256_file(Path(args.train_list)) if args.train_list else ""
+    args.test_list_sha256 = _sha256_file(Path(args.test_list)) if args.test_list else ""
+    args.thermal_train_list_sha256 = (
+        _sha256_file(Path(args.thermal_train_list)) if args.thermal_train_list else ""
+    )
+    args.thermal_test_list_sha256 = (
+        _sha256_file(Path(args.thermal_test_list)) if args.thermal_test_list else ""
+    )
     thermal_protocol_requested = {
         "thermal_recipe": args.thermal_recipe,
         "artifact_save_semantics": args.artifact_save_semantics,
@@ -2703,6 +2787,10 @@ def main() -> None:
         "--densify_grad_threshold", str(args.rgb_densify_grad),
         "--lambda_dssim", str(args.rgb_lambda_dssim),
     ]
+    _append_explicit_camera_lists(
+        train1_cmd, args.train_list, args.test_list,
+        args.train_list_sha256, args.test_list_sha256,
+    )
     if bool(getattr(args, "baseline_modules_off", False)):
         train1_cmd.append("--baseline_modules_off")
     if args.grouped_ablation_mode == "m00_plus_ssp":
@@ -2755,6 +2843,10 @@ def main() -> None:
 
     # Render RGB (keep -r consistent with training to avoid mismatched intrinsics/resolution)
     render1_cmd = [py, "render.py", "-m", str(model_rgb), "-s", str(data_root), "-r", str(args.rgb_res)]
+    _append_explicit_camera_lists(
+        render1_cmd, args.train_list, args.test_list,
+        args.train_list_sha256, args.test_list_sha256,
+    )
     if args.benchmark_efficiency:
         render1_cmd.extend([
             "--benchmark_efficiency",
@@ -2950,6 +3042,10 @@ def main() -> None:
         "--iterations", str(args.t_iter),
         "--checkpoint_iterations", *[str(iteration) for iteration in thermal_checkpoint_iterations],
     ]
+    _append_explicit_camera_lists(
+        train2_cmd, args.thermal_train_list, args.thermal_test_list,
+        args.thermal_train_list_sha256, args.thermal_test_list_sha256,
+    )
     if thermal_checkpoint_offsets_applied:
         train2_cmd.extend([
             "--save_iterations",
@@ -3052,6 +3148,10 @@ def main() -> None:
             write_marker(marker_path(state_dir, "10_train_thermal"), "10_train_thermal", train2_cmd, cwd=gs_root)
 
     render2_cmd = [py, "render.py", "-m", str(model_t), "-s", str(thermal_ud), "-r", str(args.t_res)]
+    _append_explicit_camera_lists(
+        render2_cmd, args.thermal_train_list, args.thermal_test_list,
+        args.thermal_train_list_sha256, args.thermal_test_list_sha256,
+    )
     if args.benchmark_efficiency:
         render2_cmd.extend([
             "--benchmark_efficiency",
