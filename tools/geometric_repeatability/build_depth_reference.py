@@ -190,6 +190,102 @@ def _normalized_image_name(name: str) -> str:
     return Path(str(name).replace("\\", "/")).as_posix().lstrip("./").casefold()
 
 
+def _partition_stem_map(path: Path, label: str) -> Dict[str, str]:
+    by_stem: Dict[str, str] = {}
+    for name in _load_name_list(path):
+        normalized = _normalized_image_name(name)
+        suffix = Path(normalized).suffix
+        if not suffix:
+            raise ValueError(f"{label} entry has no image extension: {name!r}")
+        stem = normalized[: -len(suffix)]
+        if stem in by_stem:
+            raise ValueError(
+                f"{label} contains duplicate image stems: "
+                f"{by_stem[stem]!r} and {name!r}"
+            )
+        by_stem[stem] = normalized
+    return by_stem
+
+
+def _validate_probe_camera_partition_stems(
+    reference_train_list: Path,
+    reference_probe_exclusion_list: Path,
+    probe_camera_train_list: Path,
+    probe_camera_test_list: Path,
+) -> Dict[str, Any]:
+    reference_train = _partition_stem_map(reference_train_list, "reference train list")
+    reference_probe = _partition_stem_map(
+        reference_probe_exclusion_list, "reference probe-exclusion list"
+    )
+    camera_train = _partition_stem_map(probe_camera_train_list, "probe-camera train list")
+    camera_test = _partition_stem_map(probe_camera_test_list, "probe-camera test list")
+
+    for partition, reference, camera in (
+        ("train", reference_train, camera_train),
+        ("probe", reference_probe, camera_test),
+    ):
+        missing_camera = sorted(reference.keys() - camera.keys())
+        extra_camera = sorted(camera.keys() - reference.keys())
+        if missing_camera or extra_camera:
+            raise RuntimeError(
+                "RGB reference and probe-camera partitions differ beyond image "
+                f"extensions for {partition}: missing_camera_stems={missing_camera[:10]} "
+                f"extra_camera_stems={extra_camera[:10]}"
+            )
+
+    reference_overlap = sorted(reference_train.keys() & reference_probe.keys())
+    camera_overlap = sorted(camera_train.keys() & camera_test.keys())
+    if reference_overlap or camera_overlap:
+        raise RuntimeError(
+            "Train/probe stem partitions overlap: "
+            f"reference={reference_overlap[:10]} probe_camera={camera_overlap[:10]}"
+        )
+
+    return {
+        "status": "passed",
+        "comparison_rule": "normalized_relative_path_without_final_extension",
+        "train_stem_count": len(reference_train),
+        "probe_stem_count": len(reference_probe),
+        "reference_train_extensions": sorted(
+            {Path(name).suffix for name in reference_train.values()}
+        ),
+        "reference_probe_extensions": sorted(
+            {Path(name).suffix for name in reference_probe.values()}
+        ),
+        "probe_camera_train_extensions": sorted(
+            {Path(name).suffix for name in camera_train.values()}
+        ),
+        "probe_camera_test_extensions": sorted(
+            {Path(name).suffix for name in camera_test.values()}
+        ),
+    }
+
+
+def _resolve_reference_protocol_paths(strict: Dict[str, Any]) -> Dict[str, Any]:
+    artifacts = strict["artifacts"]
+    lists = strict["lists"]
+    return {
+        "workspace_root": Path(artifacts["train_union_source_root"]).resolve(),
+        "strict_thermal_root": Path(artifacts["strict_thermal_root"]).resolve(),
+        "probe_camera_root": Path(
+            artifacts.get("probe_camera_root", artifacts["strict_thermal_root"])
+        ).resolve(),
+        "train_union_list": Path(lists["train_union"]).resolve(),
+        "probe_camera_train_list": Path(
+            lists.get("probe_camera_train", lists["train_union"])
+        ).resolve(),
+        "probe_list": Path(lists["probe_test"]).resolve(),
+        "reference_probe_exclusion_list": Path(
+            lists.get("reference_probe_exclusion", lists["probe_test"])
+        ).resolve(),
+        "extended_probe_camera_interface": (
+            "probe_camera_root" in artifacts
+            or "probe_camera_train" in lists
+            or "reference_probe_exclusion" in lists
+        ),
+    }
+
+
 def _validate_training_only_partition(
     source_workspace_root: Path,
     train_union_list: Path,
@@ -954,24 +1050,36 @@ def main() -> None:
     out_dir = Path(args.out_dir).resolve()
     strict = load_json(strict_manifest_path)
     scene_name = str(strict["scene_name"])
-    artifacts = strict["artifacts"]
-    lists = strict["lists"]
-    workspace_root = Path(artifacts["train_union_source_root"]).resolve()
-    strict_thermal_root = Path(artifacts["strict_thermal_root"]).resolve()
-    train_union_list = Path(lists["train_union"]).resolve()
-    probe_list = Path(lists["probe_test"]).resolve()
+    resolved = _resolve_reference_protocol_paths(strict)
+    workspace_root = resolved["workspace_root"]
+    strict_thermal_root = resolved["strict_thermal_root"]
+    probe_camera_root = resolved["probe_camera_root"]
+    train_union_list = resolved["train_union_list"]
+    probe_camera_train_list = resolved["probe_camera_train_list"]
+    probe_list = resolved["probe_list"]
+    reference_probe_exclusion_list = resolved["reference_probe_exclusion_list"]
+    extended_probe_camera_interface = bool(resolved["extended_probe_camera_interface"])
 
     _, _, colmap_binary_model = _validate_colmap_source_workspace(workspace_root)
     for required_path, label in (
         (strict_thermal_root, "strict thermal root"),
+        (probe_camera_root, "probe-camera root"),
         (train_union_list, "train-union list"),
+        (probe_camera_train_list, "probe-camera train list"),
         (probe_list, "probe list"),
+        (reference_probe_exclusion_list, "reference probe-exclusion list"),
     ):
         if not required_path.exists():
             raise FileNotFoundError(f"Missing {label}: {required_path}")
     partition_audit = _validate_training_only_partition(
         workspace_root,
         train_union_list,
+        reference_probe_exclusion_list,
+    )
+    probe_camera_partition_stem_audit = _validate_probe_camera_partition_stems(
+        train_union_list,
+        reference_probe_exclusion_list,
+        probe_camera_train_list,
         probe_list,
     )
 
@@ -1001,6 +1109,17 @@ def main() -> None:
         "commands": command_plan,
         "construction_overrides": _construction_overrides(args),
     }
+    if extended_probe_camera_interface:
+        plan_payload.update(
+            {
+                "probe_camera_root": str(probe_camera_root),
+                "probe_camera_train_list_sha256": _sha256_file(probe_camera_train_list),
+                "reference_probe_exclusion_list_sha256": _sha256_file(
+                    reference_probe_exclusion_list
+                ),
+                "probe_camera_partition_stem_audit": probe_camera_partition_stem_audit,
+            }
+        )
     plan_sha256 = _canonical_sha256(plan_payload)
     if args.dry_run:
         print(json.dumps(plan_payload, indent=2, ensure_ascii=False))
@@ -1125,10 +1244,10 @@ def main() -> None:
     # OpenMVS and it prevents an unrelated/stale manifest from being adopted by
     # mere path existence.
     camera_manifest = build_probe_view_manifest(
-        source_path=strict_thermal_root,
+        source_path=probe_camera_root,
         images_dir_name="images",
         resolution_arg=int(args.resolution_arg),
-        train_list=train_union_list,
+        train_list=probe_camera_train_list,
         test_list=probe_list,
         scene_name=scene_name,
     )
@@ -1235,18 +1354,25 @@ def main() -> None:
         },
     )
     build_manifest_path = out_dir / "reference_build_manifest.json"
-    save_json(
-        build_manifest_path,
-        {
-            **common_manifest,
-            "source_workspace_root": str(workspace_root),
-            "strict_thermal_root": str(strict_thermal_root),
-            "train_union_list": str(train_union_list),
-            "probe_list": str(probe_list),
-            "reference_depth_manifest": str(ref_manifest_path),
-            "camera_manifest_path": str(camera_manifest_path),
-        },
-    )
+    build_manifest = {
+        **common_manifest,
+        "source_workspace_root": str(workspace_root),
+        "strict_thermal_root": str(strict_thermal_root),
+        "train_union_list": str(train_union_list),
+        "probe_list": str(probe_list),
+        "reference_depth_manifest": str(ref_manifest_path),
+        "camera_manifest_path": str(camera_manifest_path),
+    }
+    if extended_probe_camera_interface:
+        build_manifest.update(
+            {
+                "probe_camera_root": str(probe_camera_root),
+                "probe_camera_train_list": str(probe_camera_train_list),
+                "reference_probe_exclusion_list": str(reference_probe_exclusion_list),
+                "probe_camera_partition_stem_audit": probe_camera_partition_stem_audit,
+            }
+        )
+    save_json(build_manifest_path, build_manifest)
     print(f"REFERENCE_DEPTH_MANIFEST {ref_manifest_path}")
     print(f"REFERENCE_BUILD_MANIFEST {build_manifest_path}")
 
