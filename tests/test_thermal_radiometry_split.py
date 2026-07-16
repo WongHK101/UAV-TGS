@@ -48,8 +48,12 @@ class BuildSplitTests(unittest.TestCase):
         for block in expected_test_blocks:
             start = block * 16
             end = start + 16
-            expected_guards.update(range(max(0, start - 2), start))
-            expected_guards.update(range(end, min(160, end + 2)))
+            expected_guards.update(
+                range(max(0, start - build_split.DEFAULT_GUARD_FRAMES), start)
+            )
+            expected_guards.update(
+                range(end, min(160, end + build_split.DEFAULT_GUARD_FRAMES))
+            )
         expected_guards.difference_update(test_positions)
         actual_guards = {
             r["position_in_strip"] for r in result["records"] if r["split"] == "guard"

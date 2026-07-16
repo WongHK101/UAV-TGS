@@ -71,8 +71,9 @@
     "minimum_train_frames_after_selected_test": 16,
     "test_fraction_of_scene_range": [0.08, 0.16],
     "guard_candidates_frames": [2, 4],
-    "guard_frames_selected": null,
-    "guard_selection_status": "pending_gpt_review"
+    "guard_frames_selected": 4,
+    "guard_selection_status": "frozen_formal_protocol",
+    "guard_2_status": "development_qa_only"
   },
   "implementation_order": [
     "legacy-fixtures",

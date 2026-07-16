@@ -94,9 +94,11 @@ stratum; a largest-remainder allocation distributes the scene budget across
 strata, and stable hashes select blocks within each stratum.  Short unsupported
 strata therefore remain entirely in training instead of being forced into test.
 Adjacent frames on each side of a selected block are `guard` and never train.
+The frozen AAAI protocol uses four guard frames on each side; this is also the
+default of `build_split.py`.
 
-Before choosing a formal guard width, produce a side-by-side QA report for the
-fixed candidates 2 and 4 (the tool deliberately makes no selection):
+The earlier side-by-side guard=2/4 comparison remains available as development
+QA only; guard=2 is not part of the formal protocol:
 
 ```powershell
 python tools/thermal_radiometry/split_qa.py `
@@ -107,8 +109,21 @@ python tools/thermal_radiometry/split_qa.py `
 The report includes per-scene budget and test fraction, scene/stratum/strip
 counts, strata without a test block, fail-closed validation, cross-guard test
 set overlap, metadata coverage/fallback, and for every test frame its nearest
-usable train observation by time, GPS, and gimbal angle.  Guard selection stays
-pending until the comparison is reviewed.
+usable train observation by time, GPS, and gimbal angle.
+
+Freeze the complete 11-scene protocol, including a collection hash and one
+manifest per scene, with:
+
+```powershell
+python tools/thermal_radiometry/build_formal_split.py `
+  --manifest DERIVED/manifests/all_scenes_audit.jsonl `
+  --output-root DERIVED/splits/aaai27_guard4
+```
+
+This command is intentionally fixed to block size 16, period 8, guard 4, and a
+minimum of 16 training frames in every related strip and stratum.  A stratum may
+legitimately receive no test block; leaving any strip or stratum without train
+frames fails closed.
 
 After decoded NPY paths have been attached to the split records, estimate a
 fixed range using training frames only:
