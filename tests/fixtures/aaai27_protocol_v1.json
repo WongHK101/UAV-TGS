@@ -55,6 +55,19 @@
     "thermal_checkpoint_offsets": [10000, 20000, 30000],
     "thermal_checkpoint_offsets_applied": true
   },
+  "opacity_adaptive_stage2_defaults": {
+    "thermal_recipe": "geometry_frozen_opacity_adaptive",
+    "artifact_save_semantics": "aligned",
+    "thermal_max_sh_degree": 3,
+    "thermal_optimizer_state": "fresh",
+    "thermal_freeze_mode": "geometry_frozen_opacity_adaptive",
+    "thermal_scale_clamp": "off",
+    "thermal_checkpoint_offsets": [10000, 20000, 30000],
+    "thermal_checkpoint_offsets_applied": true,
+    "optimizer_groups": ["f_dc", "f_rest", "opacity"],
+    "opacity_lr": 0.0002,
+    "topology_fixed": true
+  },
   "continuous_unfrozen_defaults": {
     "t_unfrozen_position_lr": 0.0000016,
     "t_unfrozen_scaling_lr": 0.005,

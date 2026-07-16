@@ -52,6 +52,7 @@ except:
 
 
 _STRICT_FREEZE_FIELDS = ("_xyz", "_scaling", "_rotation", "_opacity")
+_OPACITY_ADAPTIVE_FREEZE_FIELDS = ("_xyz", "_scaling", "_rotation")
 
 
 def _tensor_sha256(tensor):
@@ -114,6 +115,75 @@ def _write_strict_freeze_audit(model_path, gaussians, before, start_iteration, f
     return payload
 
 
+def _snapshot_opacity_adaptive_freeze_fields(gaussians):
+    return {
+        name: getattr(gaussians, name).detach().cpu().contiguous().clone()
+        for name in _OPACITY_ADAPTIVE_FREEZE_FIELDS
+    }
+
+
+def _write_opacity_adaptive_freeze_audit(
+    model_path, gaussians, before, start_iteration, final_iteration
+):
+    fields = {}
+    all_unchanged = True
+    for name, expected in before.items():
+        actual = getattr(gaussians, name).detach().cpu().contiguous()
+        same_shape = tuple(actual.shape) == tuple(expected.shape)
+        same_dtype = actual.dtype == expected.dtype
+        unchanged = bool(same_shape and same_dtype and torch.equal(actual, expected))
+        all_unchanged = all_unchanged and unchanged
+        max_abs_diff = None
+        if same_shape and actual.numel() > 0:
+            max_abs_diff = float(torch.max(torch.abs(actual - expected)).item())
+        elif same_shape:
+            max_abs_diff = 0.0
+        fields[name] = {
+            "shape": list(actual.shape),
+            "dtype": str(actual.dtype),
+            "before_sha256": _tensor_sha256(expected),
+            "after_sha256": _tensor_sha256(actual),
+            "max_abs_diff": max_abs_diff,
+            "unchanged": unchanged,
+        }
+
+    opacity = gaussians.get_opacity.detach().cpu().contiguous().reshape(-1)
+    opacity_finite = bool(torch.isfinite(opacity).all().item())
+    opacity_summary = {
+        "count": int(opacity.numel()),
+        "finite": opacity_finite,
+        "min": float(torch.min(opacity).item()) if opacity.numel() and opacity_finite else None,
+        "max": float(torch.max(opacity).item()) if opacity.numel() and opacity_finite else None,
+    }
+    passed = all_unchanged and opacity_finite
+    payload = {
+        "schema": "uav-tgs-opacity-adaptive-freeze-audit-v1",
+        "status": "passed" if passed else "failed",
+        "start_iteration": int(start_iteration),
+        "final_iteration": int(final_iteration),
+        "frozen_fields": fields,
+        "activated_opacity": opacity_summary,
+    }
+    output_path = os.path.join(model_path, "opacity_adaptive_freeze_audit.json")
+    temporary_path = output_path + f".tmp-{os.getpid()}"
+    os.makedirs(model_path, exist_ok=True)
+    with open(temporary_path, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary_path, output_path)
+    if not passed:
+        changed = [name for name, item in fields.items() if not item["unchanged"]]
+        if not opacity_finite:
+            changed.append("activated_opacity_nonfinite")
+        raise RuntimeError(
+            "Opacity-adaptive thermal invariant failed for: " + ", ".join(changed)
+        )
+    print(f"[INFO] OpacityAdaptiveFreezeAudit: passed path={output_path}")
+    return payload
+
+
 def _save_iteration_artifacts(
     scene,
     gaussians,
@@ -145,10 +215,10 @@ def _resolve_artifact_save_semantics(thermal_recipe, requested_semantics):
     requested = None if requested_semantics is None else str(requested_semantics)
     if requested not in (None, "legacy", "aligned"):
         raise ValueError(f"Unsupported artifact save semantics: {requested!r}")
-    if recipe == "aaai_strict":
+    if recipe in ("aaai_strict", "geometry_frozen_opacity_adaptive"):
         if requested == "legacy":
             raise ValueError(
-                "--thermal_recipe aaai_strict requires "
+                f"--thermal_recipe {recipe} requires "
                 "--artifact_save_semantics aligned"
             )
         return "aligned"
@@ -162,7 +232,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     thermal_freeze_mode = str(getattr(args, "thermal_freeze_mode", "legacy"))
     strict_freeze = thermal_freeze_mode == "strict"
-    topology_frozen = thermal_freeze_mode in ("strict", "continuous_unfrozen")
+    opacity_adaptive = thermal_freeze_mode == "geometry_frozen_opacity_adaptive"
+    topology_frozen = thermal_freeze_mode in (
+        "strict", "continuous_unfrozen", "geometry_frozen_opacity_adaptive"
+    )
     artifact_save_semantics = _resolve_artifact_save_semantics(
         getattr(args, "thermal_recipe", "legacy"),
         getattr(args, "artifact_save_semantics", None),
@@ -173,7 +246,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             "[INFO] AAAIArtifactSaveSemantics: "
             "semantics=aligned aligned_post_optimizer_step=1"
         )
-    if (strict_freeze or thermal_freeze_mode == "continuous_unfrozen") and not checkpoint:
+    if topology_frozen and not checkpoint:
         raise RuntimeError(f"thermal_freeze_mode={thermal_freeze_mode} requires a start checkpoint")
 
     first_iter = 0
@@ -276,6 +349,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # checkpoint format before thermal fine-tuning can start.
         (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         optimizer_restore_mode = str(getattr(args, "thermal_optimizer_state", "restore"))
+        if opacity_adaptive and optimizer_restore_mode == "restore":
+            checkpoint_groups = tuple(
+                group.get("name") for group in model_params[10].get("param_groups", [])
+            )
+            expected_checkpoint_groups = ("f_dc", "f_rest", "opacity")
+            if checkpoint_groups != expected_checkpoint_groups:
+                raise RuntimeError(
+                    "Opacity-adaptive resume requires an A3 checkpoint optimizer: "
+                    f"expected={expected_checkpoint_groups} actual={checkpoint_groups}"
+                )
         gaussians.restore(model_params, opt, optimizer_restore_mode=optimizer_restore_mode)
         if optimizer_restore_mode == "fresh":
             state_entries = len(gaussians.optimizer.state)
@@ -378,6 +461,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         )
 
     strict_freeze_snapshot = None
+    opacity_adaptive_freeze_snapshot = None
     if strict_freeze:
         strict_freeze_snapshot = _snapshot_strict_freeze_fields(gaussians)
         preserve_feature_state = str(
@@ -400,6 +484,84 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print(
             "[INFO] StrictThermalFreeze: appearance_only=1 "
             f"optimizer_groups={optimizer_groups} preserve_feature_state={int(preserve_feature_state)}"
+        )
+    elif opacity_adaptive:
+        opacity_adaptive_freeze_snapshot = _snapshot_opacity_adaptive_freeze_fields(gaussians)
+        preserve_optimizer_state = str(
+            getattr(args, "thermal_optimizer_state", "restore")
+        ) == "restore"
+        gaussians.training_setup_geometry_frozen_opacity_adaptive(
+            opt,
+            sh_degree_cap=thermal_max_sh_degree,
+            preserve_optimizer_state=preserve_optimizer_state,
+        )
+        optimizer_groups = [group.get("name") for group in gaussians.optimizer.param_groups]
+        expected_groups = ["f_dc", "f_rest", "opacity"]
+        if optimizer_groups != expected_groups:
+            raise RuntimeError(
+                "Opacity-adaptive thermal optimizer contains unexpected groups: "
+                f"expected={expected_groups} actual={optimizer_groups}"
+            )
+        trainability = {
+            "xyz": bool(gaussians._xyz.requires_grad),
+            "f_dc": bool(gaussians._features_dc.requires_grad),
+            "f_rest": bool(gaussians._features_rest.requires_grad),
+            "opacity": bool(gaussians._opacity.requires_grad),
+            "scaling": bool(gaussians._scaling.requires_grad),
+            "rotation": bool(gaussians._rotation.requires_grad),
+            "exposure": bool(gaussians._exposure.requires_grad),
+        }
+        expected_trainability = {
+            "xyz": False,
+            "f_dc": True,
+            "f_rest": True,
+            "opacity": True,
+            "scaling": False,
+            "rotation": False,
+            "exposure": False,
+        }
+        if trainability != expected_trainability:
+            raise RuntimeError(
+                "Opacity-adaptive parameter trainability mismatch: "
+                f"expected={expected_trainability} actual={trainability}"
+            )
+        if gaussians.exposure_optimizer is not None:
+            raise RuntimeError("Opacity-adaptive thermal mode must disable the exposure optimizer")
+        optimizer_lrs = {
+            group.get("name"): float(group.get("lr", 0.0))
+            for group in gaussians.optimizer.param_groups
+        }
+        if not torch.isfinite(torch.tensor(optimizer_lrs["opacity"])) or optimizer_lrs["opacity"] <= 0.0:
+            raise RuntimeError(f"Invalid opacity-adaptive opacity LR: {optimizer_lrs['opacity']}")
+        runtime_protocol = {
+            "schema": "uav-tgs-opacity-adaptive-runtime-protocol-v1",
+            "status": "passed",
+            "thermal_recipe": str(getattr(args, "thermal_recipe", "legacy")),
+            "thermal_freeze_mode": thermal_freeze_mode,
+            "thermal_optimizer_state": str(getattr(args, "thermal_optimizer_state", "restore")),
+            "thermal_max_sh_degree": thermal_max_sh_degree,
+            "thermal_scale_clamp": str(getattr(args, "thermal_scale_clamp", "legacy")),
+            "artifact_save_semantics": artifact_save_semantics,
+            "optimizer_groups": optimizer_groups,
+            "optimizer_lrs": optimizer_lrs,
+            "trainability": trainability,
+            "topology_frozen": True,
+            "densification": False,
+            "pruning": False,
+            "opacity_reset": False,
+        }
+        runtime_path = os.path.join(scene.model_path, "opacity_adaptive_protocol.json")
+        runtime_temporary = runtime_path + f".tmp-{os.getpid()}"
+        with open(runtime_temporary, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(runtime_protocol, handle, indent=2, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(runtime_temporary, runtime_path)
+        print(
+            "[INFO] GeometryFrozenOpacityAdaptive: "
+            f"optimizer_groups={optimizer_groups} preserve_optimizer_state={int(preserve_optimizer_state)} "
+            f"opacity_lr={optimizer_lrs['opacity']:.8f}"
         )
 
     def _reapply_lrs_after_restore() -> None:
@@ -487,7 +649,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     use_sparse_adam = (
         opt.optimizer_type == "sparse_adam"
         and SPARSE_ADAM_AVAILABLE
-        and not strict_freeze
+        and not topology_frozen
     )
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
 
@@ -752,6 +914,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             start_iteration=start_iteration,
             final_iteration=int(opt.iterations),
         )
+    elif opacity_adaptive:
+        _write_opacity_adaptive_freeze_audit(
+            scene.model_path,
+            gaussians,
+            opacity_adaptive_freeze_snapshot,
+            start_iteration=start_iteration,
+            final_iteration=int(opt.iterations),
+        )
 
     return {
         "start_iteration": start_iteration,
@@ -889,7 +1059,9 @@ if __name__ == "__main__":
         help="Thermal checkpoint optimizer state (default: restore). fresh starts a new Adam state."
     )
     parser.add_argument(
-        "--thermal_recipe", choices=["legacy", "aaai_strict"], default="legacy",
+        "--thermal_recipe",
+        choices=["legacy", "aaai_strict", "geometry_frozen_opacity_adaptive"],
+        default="legacy",
         help="Stage-2 protocol preset. legacy preserves the ACM behavior by default."
     )
     parser.add_argument(
@@ -898,14 +1070,20 @@ if __name__ == "__main__":
         default=None,
         help=(
             "PLY/checkpoint save ordering. Unset resolves to legacy, while "
-            "aaai_strict resolves to aligned post-step endpoints."
+            "formal Stage-2 recipes resolve to aligned post-step endpoints."
         ),
     )
     parser.add_argument(
         "--thermal_freeze_mode",
-        choices=["legacy", "strict", "continuous_unfrozen"],
+        choices=[
+            "legacy", "strict", "continuous_unfrozen",
+            "geometry_frozen_opacity_adaptive",
+        ],
         default="legacy",
-        help="Stage-2 parameter update mode. strict trains SH appearance only.",
+        help=(
+            "Stage-2 parameter update mode. strict trains SH appearance only; "
+            "geometry_frozen_opacity_adaptive trains SH plus opacity."
+        ),
     )
     parser.add_argument(
         "--thermal_scale_clamp", choices=["legacy", "off"], default="legacy",
@@ -1005,13 +1183,81 @@ if __name__ == "__main__":
         args.ss_prune_before_thermal = False
         args.sgf_disable = False
 
-    if args.thermal_freeze_mode in ("strict", "continuous_unfrozen"):
+    if args.thermal_recipe == "geometry_frozen_opacity_adaptive":
+        if not args.start_checkpoint:
+            parser.error(
+                "--thermal_recipe geometry_frozen_opacity_adaptive requires --start_checkpoint"
+            )
+        if args.baseline_modules_off or args.baseline_restore_ssp or args.baseline_restore_stt:
+            parser.error(
+                "--thermal_recipe geometry_frozen_opacity_adaptive cannot be combined "
+                "with baseline recipe flags"
+            )
+        if _option_was_set("--sgf_disable"):
+            parser.error(
+                "--thermal_recipe geometry_frozen_opacity_adaptive does not use --sgf_disable"
+            )
+        if _option_was_set("--thermal_max_sh_degree") and args.thermal_max_sh_degree != 3:
+            parser.error(
+                "--thermal_recipe geometry_frozen_opacity_adaptive requires "
+                "--thermal_max_sh_degree 3"
+            )
+        if _option_was_set("--thermal_freeze_mode") and (
+            args.thermal_freeze_mode != "geometry_frozen_opacity_adaptive"
+        ):
+            parser.error(
+                "--thermal_recipe geometry_frozen_opacity_adaptive requires "
+                "--thermal_freeze_mode geometry_frozen_opacity_adaptive"
+            )
+        if _option_was_set("--thermal_scale_clamp") and args.thermal_scale_clamp != "off":
+            parser.error(
+                "--thermal_recipe geometry_frozen_opacity_adaptive requires "
+                "--thermal_scale_clamp off"
+            )
+        if _option_was_set("--opacity_lr") and args.opacity_lr != 2e-4:
+            parser.error(
+                "--thermal_recipe geometry_frozen_opacity_adaptive requires --opacity_lr 0.0002"
+            )
+        if _option_was_set("--ss_enable") or _option_was_set("--ss_prune_before_thermal"):
+            parser.error(
+                "--thermal_recipe geometry_frozen_opacity_adaptive does not permit "
+                "Stage-2 sparse-support pruning"
+            )
+        resume_mode = (
+            _option_was_set("--thermal_optimizer_state")
+            and args.thermal_optimizer_state == "restore"
+        )
+        if resume_mode and _option_was_set("--thermal_reset_features"):
+            parser.error(
+                "Opacity-adaptive resume must not repeat --thermal_reset_features"
+            )
+        args.thermal_max_sh_degree = 3
+        args.thermal_optimizer_state = "restore" if resume_mode else "fresh"
+        args.thermal_freeze_mode = "geometry_frozen_opacity_adaptive"
+        args.thermal_scale_clamp = "off"
+        args.opacity_lr = 2e-4
+        args.thermal_reset_features = not resume_mode
+        args.ss_enable = False
+        args.ss_prune_before_thermal = False
+        args.sgf_disable = False
+
+    if args.thermal_freeze_mode in (
+        "strict", "continuous_unfrozen", "geometry_frozen_opacity_adaptive"
+    ):
         if not args.start_checkpoint:
             parser.error(f"--thermal_freeze_mode {args.thermal_freeze_mode} requires --start_checkpoint")
         args.ss_prune_before_thermal = False
         args.ss_enable = False
     if args.thermal_freeze_mode == "strict" and args.thermal_scale_clamp != "off":
         parser.error("--thermal_freeze_mode strict requires --thermal_scale_clamp off")
+    if (
+        args.thermal_freeze_mode == "geometry_frozen_opacity_adaptive"
+        and args.thermal_scale_clamp != "off"
+    ):
+        parser.error(
+            "--thermal_freeze_mode geometry_frozen_opacity_adaptive requires "
+            "--thermal_scale_clamp off"
+        )
 
     # Thermal-stage default: if user did not explicitly pass --opacity_lr and a
     # checkpoint is provided, use a conservative opacity lr to avoid geometry drift.

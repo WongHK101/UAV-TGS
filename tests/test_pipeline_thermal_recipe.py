@@ -124,6 +124,46 @@ class PipelineThermalRecipeTests(unittest.TestCase):
         self.assertEqual(self._value(tokens, "--opacity_lr"), "0")
         self.assertNotIn("--clamp_scale_max", tokens)
 
+    def test_opacity_adaptive_recipe_is_explicit_and_three_group_only(self):
+        payload, tokens = self._dry_run(
+            "--thermal_recipe", "geometry_frozen_opacity_adaptive"
+        )
+        protocol = payload["protocol"]["thermal_stage2"]
+
+        self.assertEqual(protocol["thermal_recipe"], "geometry_frozen_opacity_adaptive")
+        self.assertEqual(protocol["artifact_save_semantics"], "aligned")
+        self.assertEqual(
+            protocol["thermal_freeze_mode"], "geometry_frozen_opacity_adaptive"
+        )
+        self.assertEqual(protocol["thermal_scale_clamp"], "off")
+        self.assertEqual(protocol["thermal_max_sh_degree"], 3)
+        self.assertEqual(protocol["thermal_optimizer_state"], "fresh")
+        self.assertEqual(protocol["optimizer_groups"], ["f_dc", "f_rest", "opacity"])
+        self.assertEqual(protocol["trainable_fields"], ["f_dc", "f_rest", "opacity"])
+        self.assertEqual(
+            protocol["frozen_fields"], ["xyz", "scaling", "rotation", "exposure"]
+        )
+        self.assertEqual(protocol["thermal_checkpoint_iterations"], [40000, 50000, 60000])
+        self.assertTrue(protocol["topology_fixed"])
+        self.assertIsNone(protocol["scale_clamp_effective"])
+
+        self.assertEqual(
+            self._value(tokens, "--thermal_recipe"),
+            "geometry_frozen_opacity_adaptive",
+        )
+        self.assertEqual(self._value(tokens, "--artifact_save_semantics"), "aligned")
+        self.assertEqual(
+            self._value(tokens, "--thermal_freeze_mode"),
+            "geometry_frozen_opacity_adaptive",
+        )
+        self.assertEqual(self._value(tokens, "--thermal_max_sh_degree"), "3")
+        self.assertEqual(self._value(tokens, "--thermal_optimizer_state"), "fresh")
+        self.assertEqual(float(self._value(tokens, "--opacity_lr")), 2e-4)
+        self.assertEqual(float(self._value(tokens, "--position_lr_init")), 0.0)
+        self.assertEqual(float(self._value(tokens, "--scaling_lr")), 0.0)
+        self.assertEqual(float(self._value(tokens, "--rotation_lr")), 0.0)
+        self.assertNotIn("--clamp_scale_max", tokens)
+
     def test_explicit_aligned_semantics_are_recorded_and_forwarded(self):
         payload, tokens = self._dry_run(
             "--artifact_save_semantics", "aligned"
@@ -157,6 +197,10 @@ class PipelineThermalRecipeTests(unittest.TestCase):
         self.assertEqual(float(self._value(tokens, "--position_lr_final")), 1.6e-6)
         self.assertEqual(float(self._value(tokens, "--scaling_lr")), 0.005)
         self.assertEqual(float(self._value(tokens, "--rotation_lr")), 0.001)
+        expected_groups = ["xyz", "f_dc", "f_rest", "opacity", "scaling", "rotation"]
+        self.assertEqual(protocol["optimizer_groups"], expected_groups)
+        self.assertEqual(protocol["trainable_fields"], expected_groups)
+        self.assertEqual(protocol["frozen_fields"], ["exposure"])
 
         for flag in (
             "--position_lr_init",
@@ -219,6 +263,47 @@ class PipelineThermalRecipeTests(unittest.TestCase):
             pipeline._resolve_artifact_save_semantics(
                 "aaai_strict", "legacy"
             )
+        self.assertEqual(
+            pipeline._resolve_artifact_save_semantics(
+                "geometry_frozen_opacity_adaptive", None
+            ),
+            "aligned",
+        )
+        with self.assertRaisesRegex(ValueError, "requires"):
+            pipeline._resolve_artifact_save_semantics(
+                "geometry_frozen_opacity_adaptive", "legacy"
+            )
+
+    def test_opacity_adaptive_recipe_rejects_noncanonical_controls(self):
+        cases = (
+            ("--thermal_max_sh_degree", "1"),
+            ("--thermal_optimizer_state", "restore"),
+            ("--thermal_freeze_mode", "continuous_unfrozen"),
+            ("--thermal_scale_clamp", "legacy"),
+            ("--t_opacity_lr", "0.001"),
+        )
+        for option, value in cases:
+            with self.subTest(option=option):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    completed = subprocess.run(
+                        [
+                            sys.executable,
+                            "-B",
+                            str(PIPELINE),
+                            "--data_root", str(root / "data"),
+                            "--out_root", str(root / "out"),
+                            "--from_step", "10", "--to_step", "10", "--dry_run",
+                            "--thermal_recipe", "geometry_frozen_opacity_adaptive",
+                            option, value,
+                        ],
+                        cwd=REPO_ROOT,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertNotEqual(completed.returncode, 0)
+                    self.assertIn("geometry_frozen_opacity_adaptive requires", completed.stderr)
 
 
 if __name__ == "__main__":

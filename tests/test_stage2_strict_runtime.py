@@ -84,11 +84,11 @@ class Stage2StrictRuntimeTests(unittest.TestCase):
 
     def test_train_source_enforces_strict_topology_and_exposure_freeze(self):
         source = TRAIN_PATH.read_text(encoding="utf-8")
-        self.assertIn('thermal_freeze_mode in ("strict", "continuous_unfrozen")', source)
+        self.assertIn('"strict", "continuous_unfrozen", "geometry_frozen_opacity_adaptive"', source)
         self.assertIn("if (not topology_frozen) and iteration < opt.densify_until_iter:", source)
         self.assertIn("if gaussians.exposure_optimizer is not None:", source)
         self.assertIn("Strict thermal freeze invariant failed", source)
-        self.assertIn('"--thermal_recipe", choices=["legacy", "aaai_strict"]', source)
+        self.assertIn('"geometry_frozen_opacity_adaptive"', source)
         self.assertIn('"--thermal_scale_clamp", choices=["legacy", "off"]', source)
 
 

@@ -121,6 +121,7 @@ class GaussianModel:
             group.get("name") for group in opt_dict.get("param_groups", [])
         )
         appearance_only_groups = (("f_dc",), ("f_dc", "f_rest"))
+        opacity_adaptive_groups = ("f_dc", "f_rest", "opacity")
         if (
             optimizer_restore_mode == "restore"
             and checkpoint_group_names in appearance_only_groups
@@ -134,6 +135,15 @@ class GaussianModel:
                 training_args,
                 sh_degree_cap=optimizer_cap,
             )
+        elif (
+            optimizer_restore_mode == "restore"
+            and checkpoint_group_names == opacity_adaptive_groups
+        ):
+            # Geometry-frozen, opacity-adaptive Stage-2 checkpoints use a
+            # dedicated three-group Adam.  Recreate that exact layout before
+            # loading the state so save/resume preserves every Adam step and
+            # never falls back to the legacy six-group optimizer.
+            self.training_setup_geometry_frozen_opacity_adaptive(training_args)
         else:
             self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
@@ -736,6 +746,69 @@ class GaussianModel:
                     self.optimizer.state[group["params"][0]] = inherited_state[name]
 
         # Exposure is intentionally immutable in strict Stage 2.
+        self.exposure_optimizer = None
+
+    def training_setup_geometry_frozen_opacity_adaptive(
+        self,
+        training_args,
+        sh_degree_cap=None,
+        preserve_optimizer_state=False,
+    ):
+        """Train SH appearance and opacity while freezing Gaussian geometry.
+
+        This is deliberately separate from both the legacy six-group setup
+        and the strict appearance-only setup.  The optimizer layout is part
+        of the checkpoint contract and must remain, in order, ``f_dc``,
+        ``f_rest``, ``opacity``.
+        """
+        cap = self.max_sh_degree if sh_degree_cap is None else int(sh_degree_cap)
+        if cap != self.max_sh_degree:
+            raise ValueError(
+                "Geometry-frozen opacity-adaptive Stage 2 requires the full "
+                f"SH degree {self.max_sh_degree}, got {cap}"
+            )
+
+        inherited_state = {}
+        if preserve_optimizer_state and self.optimizer is not None:
+            for group in self.optimizer.param_groups:
+                name = group.get("name")
+                if name not in ("f_dc", "f_rest", "opacity") or not group.get("params"):
+                    continue
+                state = self.optimizer.state.get(group["params"][0])
+                if state:
+                    inherited_state[name] = copy.deepcopy(state)
+
+        self.percent_dense = training_args.percent_dense
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+
+        for parameter in (self._xyz, self._scaling, self._rotation, self._exposure):
+            parameter.requires_grad_(False)
+        for parameter in (self._features_dc, self._features_rest, self._opacity):
+            parameter.requires_grad_(True)
+
+        groups = [
+            {"params": [self._features_dc], "lr": training_args.feature_lr, "name": "f_dc"},
+            {
+                "params": [self._features_rest],
+                "lr": training_args.feature_lr / 20.0,
+                "name": "f_rest",
+            },
+            {"params": [self._opacity], "lr": training_args.opacity_lr, "name": "opacity"},
+        ]
+
+        if self.optimizer_type not in ("default", "sparse_adam"):
+            raise ValueError(f"Unsupported optimizer_type: {self.optimizer_type!r}")
+        # Fixed-topology Stage 2 uses standard Adam; no visibility-aware
+        # geometry update signature is valid for this three-group optimizer.
+        self.optimizer = torch.optim.Adam(groups, lr=0.0, eps=1e-15)
+        if preserve_optimizer_state:
+            for group in self.optimizer.param_groups:
+                name = group.get("name")
+                if name in inherited_state:
+                    self.optimizer.state[group["params"][0]] = inherited_state[name]
+
+        # Exposure remains part of the frozen RGB anchor state.
         self.exposure_optimizer = None
 
     def update_learning_rate(self, iteration):

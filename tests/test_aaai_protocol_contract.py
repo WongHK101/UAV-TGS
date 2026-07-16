@@ -59,6 +59,28 @@ class AaaiProtocolContractTests(unittest.TestCase):
         self.assertEqual(strict["thermal_scale_clamp"], "off")
         self.assertEqual(strict["thermal_checkpoint_offsets"], [10000, 20000, 30000])
         self.assertTrue(strict["thermal_checkpoint_offsets_applied"])
+
+        adaptive = self.protocol["opacity_adaptive_stage2_defaults"]
+        self.assertEqual(
+            adaptive["thermal_recipe"], "geometry_frozen_opacity_adaptive"
+        )
+        self.assertEqual(adaptive["artifact_save_semantics"], "aligned")
+        self.assertEqual(adaptive["thermal_max_sh_degree"], 3)
+        self.assertEqual(adaptive["thermal_optimizer_state"], "fresh")
+        self.assertEqual(
+            adaptive["thermal_freeze_mode"],
+            "geometry_frozen_opacity_adaptive",
+        )
+        self.assertEqual(adaptive["thermal_scale_clamp"], "off")
+        self.assertEqual(
+            adaptive["thermal_checkpoint_offsets"], [10000, 20000, 30000]
+        )
+        self.assertTrue(adaptive["thermal_checkpoint_offsets_applied"])
+        self.assertEqual(
+            adaptive["optimizer_groups"], ["f_dc", "f_rest", "opacity"]
+        )
+        self.assertEqual(adaptive["opacity_lr"], 0.0002)
+        self.assertTrue(adaptive["topology_fixed"])
         self.assertIn("gpu-training", self.protocol["deferred_until_pilot_review"])
 
     def test_locked_terminology_and_claim_boundaries(self):
