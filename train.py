@@ -113,6 +113,31 @@ def _write_strict_freeze_audit(model_path, gaussians, before, start_iteration, f
     print(f"[INFO] StrictFreezeAudit: passed path={output_path}")
     return payload
 
+
+def _save_iteration_artifacts(
+    scene,
+    gaussians,
+    iteration,
+    *,
+    save_gaussians,
+    save_checkpoint,
+    thermal_max_sh_degree=None,
+):
+    """Save requested artifacts from one unchanged in-memory model state."""
+    if not (save_gaussians or save_checkpoint):
+        return
+    if thermal_max_sh_degree is not None:
+        gaussians.zero_sh_above_degree_(thermal_max_sh_degree)
+    if save_gaussians:
+        print("\n[ITER {}] Saving Gaussians".format(iteration))
+        scene.save(iteration)
+    if save_checkpoint:
+        print("\n[ITER {}] Saving Checkpoint".format(iteration))
+        torch.save(
+            (gaussians.capture(), iteration),
+            os.path.join(scene.model_path, "chkpnt" + str(iteration) + ".pth"),
+        )
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, ss_args=None):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
@@ -121,6 +146,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     thermal_freeze_mode = str(getattr(args, "thermal_freeze_mode", "legacy"))
     strict_freeze = thermal_freeze_mode == "strict"
     topology_frozen = thermal_freeze_mode in ("strict", "continuous_unfrozen")
+    aligned_artifact_saves = (
+        str(getattr(args, "thermal_recipe", "legacy")) == "aaai_strict"
+    )
+    if aligned_artifact_saves:
+        print("[INFO] AAAIArtifactSaveSemantics: aligned_post_optimizer_step=1")
     if (strict_freeze or thermal_freeze_mode == "continuous_unfrozen") and not checkpoint:
         raise RuntimeError(f"thermal_freeze_mode={thermal_freeze_mode} requires a start checkpoint")
 
@@ -580,7 +610,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
-            if (iteration in saving_iterations):
+            # Legacy compatibility: PLY is written before the optimizer step.
+            if (not aligned_artifact_saves) and (iteration in saving_iterations):
                 if thermal_max_sh_degree is not None:
                     gaussians.zero_sh_above_degree_(thermal_max_sh_degree)
                 if debug_stats and iteration == opt.iterations:
@@ -633,7 +664,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
 
-            if (iteration in checkpoint_iterations):
+            if aligned_artifact_saves:
+                # AAAI recipe: both artifacts are written after the same optimizer
+                # step, so equal iteration labels identify one model/Adam state.
+                save_gaussians = iteration in saving_iterations
+                save_checkpoint = iteration in checkpoint_iterations
+                if debug_stats and save_gaussians and iteration == opt.iterations:
+                    _log_gaussian_stats("before_save")
+                _save_iteration_artifacts(
+                    scene,
+                    gaussians,
+                    iteration,
+                    save_gaussians=save_gaussians,
+                    save_checkpoint=save_checkpoint,
+                    thermal_max_sh_degree=thermal_max_sh_degree,
+                )
+            elif iteration in checkpoint_iterations:
+                # Preserve the historical post-step checkpoint behavior.
                 if thermal_max_sh_degree is not None:
                     gaussians.zero_sh_above_degree_(thermal_max_sh_degree)
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
