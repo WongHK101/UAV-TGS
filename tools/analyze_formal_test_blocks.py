@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Fail-closed 60k paired analysis for the five formal Building test blocks.
+"""Fail-closed 60k paired analysis for complete formal 16-view test blocks.
 
-Inputs are the frozen test list and bound split plus L/C3/F3/A3 ``per_view.json``
-and formal temperature reports.  Every input SHA-256 must be declared on the
-command line.  The analysis is deliberately limited to 60k; it does not replace
-the required A3 40k/50k/60k aggregate evaluation.
+Inputs are the frozen test list and bound split plus matching groups of
+``per_view.json`` and formal temperature reports.  Every input SHA-256 must be
+declared on the command line.  The analysis is deliberately limited to 60k; it
+does not replace the required A3 40k/50k/60k aggregate evaluation.
 """
 
 from __future__ import annotations
@@ -24,13 +24,15 @@ import numpy as np
 
 
 SCHEMA = "uav-tgs-formal-test-block-analysis-v1"
+# Retained as the canonical legacy ordering for Building callers and outputs.
+# New formal scenes may provide only L/A3; the actual groups are derived from
+# the repeated CLI assignments and validated to match across both input types.
 GROUPS = ("L", "C3", "F3", "A3")
 BASELINES = ("C3", "F3", "L")
 METHOD_KEY = "ours_60000"
-EXPECTED_TEST_VIEWS = 80
-EXPECTED_BLOCKS = 5
 EXPECTED_VIEWS_PER_BLOCK = 16
 SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+GROUP_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 # These tolerances are frozen in code so the direction counts cannot be tuned
 # after seeing A3.  Off-LUT values remain directional diagnostics (zero
@@ -104,13 +106,33 @@ def _parse_assignments(values: Sequence[str], label: str) -> dict[str, str]:
     return result
 
 
+def _ordered_groups(groups: Iterable[str]) -> tuple[str, ...]:
+    group_set = set(groups)
+    legacy = [group for group in GROUPS if group in group_set]
+    extras = sorted(group_set - set(GROUPS))
+    return tuple([*legacy, *extras])
+
+
+def _baseline_groups(groups: Sequence[str]) -> tuple[str, ...]:
+    group_set = set(groups) - {"A3"}
+    legacy = [group for group in BASELINES if group in group_set]
+    extras = sorted(group_set - set(BASELINES))
+    return tuple([*legacy, *extras])
+
+
 def _group_paths(values: Sequence[str], label: str) -> dict[str, Path]:
     parsed = _parse_assignments(values, label)
-    if set(parsed) != set(GROUPS):
+    invalid = sorted(group for group in parsed if not GROUP_RE.fullmatch(group))
+    if invalid:
+        raise BlockAnalysisError(f"invalid {label} group names: {invalid}")
+    if not parsed:
+        raise BlockAnalysisError(f"at least one {label} group is required")
+    groups = _ordered_groups(parsed)
+    if "L" not in groups or "A3" not in groups:
         raise BlockAnalysisError(
-            f"{label} groups must be exactly {list(GROUPS)}; got {sorted(parsed)}"
+            f"{label} groups must include L and A3; got {sorted(parsed)}"
         )
-    return {group: Path(parsed[group]).resolve() for group in GROUPS}
+    return {group: Path(parsed[group]).resolve() for group in groups}
 
 
 def _verify_all_hashes(
@@ -155,9 +177,14 @@ def _read_test_list(path: Path) -> list[str]:
     lines = path.read_text(encoding="utf-8").splitlines()
     if any(not line.strip() or line != line.strip() for line in lines):
         raise BlockAnalysisError("test list contains blank or whitespace-padded entries")
-    if len(lines) != EXPECTED_TEST_VIEWS or len(set(lines)) != EXPECTED_TEST_VIEWS:
+    if not lines:
+        raise BlockAnalysisError("test list must not be empty")
+    if len(set(lines)) != len(lines):
+        raise BlockAnalysisError("test list must contain unique entries")
+    if len(lines) % EXPECTED_VIEWS_PER_BLOCK != 0:
         raise BlockAnalysisError(
-            f"test list must contain exactly {EXPECTED_TEST_VIEWS} unique entries"
+            f"test list has {len(lines)} entries; expected a multiple of "
+            f"{EXPECTED_VIEWS_PER_BLOCK}"
         )
     for name in lines:
         if Path(name).name != name or Path(name).suffix.lower() != ".png":
@@ -174,9 +201,12 @@ def _load_blocks(
     if not isinstance(records, list):
         raise BlockAnalysisError("bound split has no records list")
     test_records = [record for record in records if isinstance(record, dict) and record.get("split") == "test"]
-    if len(test_records) != EXPECTED_TEST_VIEWS:
+    expected_test_views = len(test_names)
+    expected_blocks = expected_test_views // EXPECTED_VIEWS_PER_BLOCK
+    if len(test_records) != expected_test_views:
         raise BlockAnalysisError(
-            f"bound split must contain exactly {EXPECTED_TEST_VIEWS} test records"
+            f"bound split has {len(test_records)} test records; "
+            f"test list has {expected_test_views}"
         )
     record_names = [str(record.get("thermal_camera_name", "")) for record in test_records]
     if record_names != list(test_names):
@@ -204,8 +234,11 @@ def _load_blocks(
             record.get("hash"),
         )
         grouped[(strip_id, block_index)].append(record)
-    if len(grouped) != EXPECTED_BLOCKS:
-        raise BlockAnalysisError(f"expected exactly {EXPECTED_BLOCKS} test blocks, got {len(grouped)}")
+    if len(grouped) != expected_blocks:
+        raise BlockAnalysisError(
+            f"expected exactly {expected_blocks} complete test blocks from "
+            f"{expected_test_views} test views, got {len(grouped)}"
+        )
 
     blocks: list[dict[str, Any]] = []
     test_position = {name: index for index, name in enumerate(test_names)}
@@ -310,6 +343,7 @@ def _load_temperature(
     test_names: Sequence[str],
     bound_split_sha256: str,
     expected_assignments: Mapping[str, tuple[Any, ...]],
+    expected_test_views: int,
 ) -> tuple[dict[str, dict[str, float]], dict[str, tuple[Any, ...]]]:
     payload = _load_json(path)
     if payload.get("status") != "complete" or payload.get("completed_with_missing") is not False:
@@ -322,10 +356,16 @@ def _load_temperature(
             f"temperature report bound-split SHA differs for {group}: {split.get('sha256')!r}"
         )
     files = payload.get("files")
-    if not isinstance(files, list) or len(files) != EXPECTED_TEST_VIEWS:
-        raise BlockAnalysisError(f"temperature report {group} must contain exactly 80 file records")
+    if not isinstance(files, list) or len(files) != expected_test_views:
+        raise BlockAnalysisError(
+            f"temperature report {group} must contain exactly "
+            f"{expected_test_views} file records"
+        )
     summary = payload.get("summary")
-    if not isinstance(summary, dict) or summary.get("evaluated_file_count") != EXPECTED_TEST_VIEWS:
+    if (
+        not isinstance(summary, dict)
+        or summary.get("evaluated_file_count") != expected_test_views
+    ):
         raise BlockAnalysisError(f"temperature summary count differs for {group}")
 
     expected_stems = {Path(name).stem for name in test_names}
@@ -375,12 +415,15 @@ def _load_temperature(
 def _check_temperature_fairness(
     fairness_by_group: Mapping[str, Mapping[str, tuple[Any, ...]]],
     stems: Sequence[str],
+    groups: Sequence[str],
 ) -> None:
     for stem in stems:
         reference = fairness_by_group["L"][stem]
         if not isinstance(reference[0], str) or not isinstance(reference[1], str) or reference[2] <= 0:
             raise BlockAnalysisError(f"temperature fairness metadata is incomplete for L/{stem}")
-        for group in GROUPS[1:]:
+        for group in groups:
+            if group == "L":
+                continue
             if fairness_by_group[group][stem] != reference:
                 raise BlockAnalysisError(
                     f"ground truth/support/split metadata differs for {group}/{stem}"
@@ -391,11 +434,12 @@ def _block_group_means(
     block: Mapping[str, Any],
     per_view: Mapping[str, Mapping[str, Mapping[str, float]]],
     temperature: Mapping[str, Mapping[str, Mapping[str, float]]],
+    groups: Sequence[str],
 ) -> dict[str, dict[str, float]]:
     names = list(block["views"])
     stems = [Path(name).stem for name in names]
     output: dict[str, dict[str, float]] = {}
-    for group in GROUPS:
+    for group in groups:
         metrics: dict[str, float] = {}
         for metric in ("PSNR", "SSIM", "LPIPS"):
             metrics[metric] = float(np.mean([per_view[group][name][metric] for name in names]))
@@ -442,17 +486,19 @@ def analyze_blocks(
     blocks: Sequence[Mapping[str, Any]],
     per_view: Mapping[str, Mapping[str, Mapping[str, float]]],
     temperature: Mapping[str, Mapping[str, Mapping[str, float]]],
+    groups: Sequence[str] = GROUPS,
+    baselines: Sequence[str] = BASELINES,
 ) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     counts: dict[str, dict[str, Counter[str]]] = {
-        baseline: {metric: Counter() for metric in METRIC_SPECS} for baseline in BASELINES
+        baseline: {metric: Counter() for metric in METRIC_SPECS} for baseline in baselines
     }
-    combined_count = 0
+    combined_counts = {baseline: 0 for baseline in baselines}
     combined_metrics = [metric for metric, spec in METRIC_SPECS.items() if spec["combined"]]
     for block in blocks:
-        group_means = _block_group_means(block, per_view, temperature)
+        group_means = _block_group_means(block, per_view, temperature, groups)
         comparisons: dict[str, Any] = {}
-        for baseline in BASELINES:
+        for baseline in baselines:
             metric_results: dict[str, Any] = {}
             for metric in METRIC_SPECS:
                 result = _classify(metric, group_means["A3"][metric], group_means[baseline][metric])
@@ -476,8 +522,8 @@ def analyze_blocks(
                 "combined_non_degraded": combined_non_degraded,
                 "combined_metrics": combined_metrics,
             }
-            if baseline == "F3" and combined_non_degraded:
-                combined_count += 1
+            if combined_non_degraded:
+                combined_counts[baseline] += 1
         records.append({
             "block": dict(block),
             "group_means": group_means,
@@ -485,7 +531,7 @@ def analyze_blocks(
         })
 
     count_payload: dict[str, Any] = {}
-    for baseline in BASELINES:
+    for baseline in baselines:
         count_payload[f"A3_minus_{baseline}"] = {
             metric: {
                 "improved": counts[baseline][metric]["improved"],
@@ -494,18 +540,23 @@ def analyze_blocks(
             }
             for metric in METRIC_SPECS
         }
-    return {
+    result = {
         "blocks": records,
         "classification_counts": count_payload,
-        "a3_vs_f3_combined_judgment": {
+    }
+    # Preserve the preregistered Building-only 3/5 judgment exactly.  New
+    # scenes expose block counts and paired tables but do not silently invent
+    # a new even-block decision threshold.
+    if "F3" in baselines and len(blocks) == 5:
+        result["a3_vs_f3_combined_judgment"] = {
             "rule": "at least 3 of 5 blocks are non-degraded on every combined metric",
             "combined_metrics": combined_metrics,
-            "non_degraded_blocks": combined_count,
+            "non_degraded_blocks": combined_counts["F3"],
             "required_blocks": 3,
-            "total_blocks": len(blocks),
-            "passed": combined_count >= 3,
-        },
-    }
+            "total_blocks": 5,
+            "passed": combined_counts["F3"] >= 3,
+        }
+    return result
 
 
 CSV_FIELDS = (
@@ -622,11 +673,23 @@ def run_analysis(
     temperature_paths: Mapping[str, Path],
     expected_sha256: Sequence[str],
 ) -> dict[str, Any]:
-    for label, paths in (("per_view", per_view_paths), ("temperature", temperature_paths)):
-        if set(paths) != set(GROUPS):
-            raise BlockAnalysisError(
-                f"{label} groups must be exactly {list(GROUPS)}; got {sorted(paths)}"
-            )
+    per_view_groups = set(per_view_paths)
+    temperature_groups = set(temperature_paths)
+    if per_view_groups != temperature_groups:
+        raise BlockAnalysisError(
+            "per_view and temperature group sets must match exactly; "
+            f"per_view={sorted(per_view_groups)} "
+            f"temperature={sorted(temperature_groups)}"
+        )
+    if "L" not in per_view_groups or "A3" not in per_view_groups:
+        raise BlockAnalysisError(
+            f"input groups must include L and A3; got {sorted(per_view_groups)}"
+        )
+    invalid = sorted(group for group in per_view_groups if not GROUP_RE.fullmatch(group))
+    if invalid:
+        raise BlockAnalysisError(f"invalid input group names: {invalid}")
+    groups = _ordered_groups(per_view_groups)
+    baselines = _baseline_groups(groups)
     test_list_path = test_list_path.resolve()
     bound_split_path = bound_split_path.resolve()
     inputs = _verify_all_hashes(
@@ -643,35 +706,54 @@ def run_analysis(
     bound_sha = inputs["bound_split"]["sha256"]
 
     per_view = {
-        group: _load_per_view(per_view_paths[group], group, test_names) for group in GROUPS
+        group: _load_per_view(per_view_paths[group], group, test_names) for group in groups
     }
     temperature: dict[str, dict[str, dict[str, float]]] = {}
     fairness: dict[str, dict[str, tuple[Any, ...]]] = {}
-    for group in GROUPS:
+    for group in groups:
         temperature[group], fairness[group] = _load_temperature(
             temperature_paths[group],
             group,
             test_names,
             bound_sha,
             expected_assignments,
+            len(test_names),
         )
-    _check_temperature_fairness(fairness, [Path(name).stem for name in test_names])
-    analysis = analyze_blocks(blocks=blocks, per_view=per_view, temperature=temperature)
+    _check_temperature_fairness(
+        fairness, [Path(name).stem for name in test_names], groups
+    )
+    analysis = analyze_blocks(
+        blocks=blocks,
+        per_view=per_view,
+        temperature=temperature,
+        groups=groups,
+        baselines=baselines,
+    )
+    legacy_building_shape = (
+        groups == GROUPS and len(test_names) == 80 and len(blocks) == 5
+    )
+    claim_boundary = (
+        "Paired analysis of the fixed five 16-view Building test blocks at 60k only; "
+        "this does not replace required A3 aggregate evaluation at 40k, 50k, and 60k."
+        if legacy_building_shape
+        else (
+            f"Paired analysis of {len(blocks)} fixed 16-view test blocks "
+            f"({len(test_names)} views) at 60k only; this does not replace required "
+            "A3 aggregate evaluation at 40k, 50k, and 60k."
+        )
+    )
     return {
         "schema": SCHEMA,
         "status": "complete",
         "iteration": 60000,
-        "claim_boundary": (
-            "Paired analysis of the fixed five 16-view Building test blocks at 60k only; "
-            "this does not replace required A3 aggregate evaluation at 40k, 50k, and 60k."
-        ),
+        "claim_boundary": claim_boundary,
         "aggregation": "unweighted frame-macro mean within each fixed 16-view block",
         "inputs": inputs,
         "protocol": {
-            "groups": list(GROUPS),
+            "groups": list(groups),
             "method_key": METHOD_KEY,
-            "test_views": EXPECTED_TEST_VIEWS,
-            "block_count": EXPECTED_BLOCKS,
+            "test_views": len(test_names),
+            "block_count": len(blocks),
             "views_per_block": EXPECTED_VIEWS_PER_BLOCK,
             "selected_test_blocks_hash": selected_blocks_hash,
             "metric_specs": METRIC_SPECS,
@@ -689,14 +771,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="GROUP=PATH",
-        help="Repeat exactly once for L, C3, F3, and A3.",
+        help="Repeat once per group; groups must include L and A3.",
     )
     parser.add_argument(
         "--temperature",
         action="append",
         default=[],
         metavar="GROUP=PATH",
-        help="Repeat exactly once for L, C3, F3, and A3.",
+        help="Repeat once per group, matching --per-view exactly.",
     )
     parser.add_argument(
         "--expected-sha256",
@@ -728,16 +810,15 @@ def main(argv: Iterable[str] | None = None) -> int:
     rows = _csv_rows(payload)
     _write_json(args.output, payload, args.overwrite)
     _write_csv(args.csv, rows, args.overwrite)
+    summary: dict[str, Any] = {
+        "status": payload["status"],
+        "output": str(args.output),
+        "csv": str(args.csv),
+    }
+    if "a3_vs_f3_combined_judgment" in payload:
+        summary["combined_passed"] = payload["a3_vs_f3_combined_judgment"]["passed"]
     print(
-        json.dumps(
-            {
-                "status": payload["status"],
-                "combined_passed": payload["a3_vs_f3_combined_judgment"]["passed"],
-                "output": str(args.output),
-                "csv": str(args.csv),
-            },
-            sort_keys=True,
-        )
+        json.dumps(summary, sort_keys=True)
     )
     return 0
 

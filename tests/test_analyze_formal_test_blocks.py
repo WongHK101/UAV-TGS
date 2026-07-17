@@ -17,6 +17,11 @@ class FormalTestBlockAnalysisTests(unittest.TestCase):
         ("tg-0002", 2, range(327, 343), "oblique:p-060"),
         ("tg-0004", 4, range(570, 586), "oblique:p-075"),
     )
+    FOUR_BLOCKS = BLOCKS[:4]
+    SIX_BLOCKS = (
+        *BLOCKS,
+        ("tg-0005", 1, range(600, 616), "oblique:p-030"),
+    )
 
     @staticmethod
     def _write_json(path: Path, payload: dict) -> None:
@@ -29,12 +34,19 @@ class FormalTestBlockAnalysisTests(unittest.TestCase):
     def _hex(index: int, salt: int = 0) -> str:
         return f"{index + salt:064x}"[-64:]
 
-    def _build_fixture(self, root: Path) -> dict:
+    def _build_fixture(
+        self,
+        root: Path,
+        *,
+        blocks: tuple | None = None,
+        groups: tuple[str, ...] = analyze_formal_test_blocks.GROUPS,
+    ) -> dict:
+        blocks = self.BLOCKS if blocks is None else blocks
         records = []
         test_names = []
         block_by_name = {}
         global_index = 0
-        for block_order, (strip_id, block_index, identifiers, stratum) in enumerate(self.BLOCKS):
+        for block_order, (strip_id, block_index, identifiers, stratum) in enumerate(blocks):
             for block_offset, identifier in enumerate(identifiers):
                 stem = f"{identifier:04d}"
                 name = f"{stem}.png"
@@ -77,13 +89,17 @@ class FormalTestBlockAnalysisTests(unittest.TestCase):
         )
         image_base = {"PSNR": 20.0, "SSIM": 0.8, "LPIPS": 0.2}
         per_view_paths = {}
-        for group in analyze_formal_test_blocks.GROUPS:
+        for group in groups:
             method = {}
             for metric, base in image_base.items():
                 values = {}
                 for name in test_names:
                     block_order = block_by_name[name]
-                    delta = a3_image_deltas[block_order][metric] if group == "A3" else 0.0
+                    delta = (
+                        a3_image_deltas[block_order % len(a3_image_deltas)][metric]
+                        if group == "A3"
+                        else 0.0
+                    )
                     values[name] = base + delta
                 method[metric] = values
             path = root / f"per_view_{group}.json"
@@ -120,13 +136,17 @@ class FormalTestBlockAnalysisTests(unittest.TestCase):
             "p95_rgb_distance": 4.0,
         }
         temperature_paths = {}
-        for group in analyze_formal_test_blocks.GROUPS:
+        for group in groups:
             files = []
             for global_index, record in enumerate(records):
                 name = record["thermal_camera_name"]
                 stem = Path(name).stem
                 block_order = block_by_name[name]
-                delta = a3_temperature_deltas[block_order] if group == "A3" else {}
+                delta = (
+                    a3_temperature_deltas[block_order % len(a3_temperature_deltas)]
+                    if group == "A3"
+                    else {}
+                )
                 temperature = {
                     key: value + delta.get(key, 0.0)
                     for key, value in temperature_base.items()
@@ -167,7 +187,7 @@ class FormalTestBlockAnalysisTests(unittest.TestCase):
                     "status": "complete",
                     "completed_with_missing": False,
                     "split": {"subset": "test", "sha256": bound_sha},
-                    "summary": {"evaluated_file_count": 80},
+                    "summary": {"evaluated_file_count": len(test_names)},
                     "files": files,
                 },
             )
@@ -179,6 +199,8 @@ class FormalTestBlockAnalysisTests(unittest.TestCase):
             "per_view_paths": per_view_paths,
             "temperature_paths": temperature_paths,
             "test_names": test_names,
+            "groups": groups,
+            "blocks": blocks,
         }
 
     @staticmethod
@@ -189,14 +211,15 @@ class FormalTestBlockAnalysisTests(unittest.TestCase):
             "bound_split="
             + analyze_formal_test_blocks.sha256_file(fixture["bound_split_path"]),
         ]
-        for group in analyze_formal_test_blocks.GROUPS:
+        for group, path in fixture["per_view_paths"].items():
             declarations.append(
                 f"per_view:{group}="
-                + analyze_formal_test_blocks.sha256_file(fixture["per_view_paths"][group])
+                + analyze_formal_test_blocks.sha256_file(path)
             )
+        for group, path in fixture["temperature_paths"].items():
             declarations.append(
                 f"temperature:{group}="
-                + analyze_formal_test_blocks.sha256_file(fixture["temperature_paths"][group])
+                + analyze_formal_test_blocks.sha256_file(path)
             )
         return declarations
 
@@ -215,6 +238,9 @@ class FormalTestBlockAnalysisTests(unittest.TestCase):
 
             self.assertEqual(payload["iteration"], 60000)
             self.assertIn("40k, 50k, and 60k", payload["claim_boundary"])
+            self.assertEqual(payload["protocol"]["groups"], ["L", "C3", "F3", "A3"])
+            self.assertEqual(payload["protocol"]["test_views"], 80)
+            self.assertEqual(payload["protocol"]["block_count"], 5)
             self.assertEqual(len(payload["blocks"]), 5)
             actual_keys = []
             for record in payload["blocks"]:
@@ -265,7 +291,7 @@ class FormalTestBlockAnalysisTests(unittest.TestCase):
                 "--bound-split",
                 str(fixture["bound_split_path"]),
             ]
-            for group in analyze_formal_test_blocks.GROUPS:
+            for group in fixture["groups"]:
                 argv.extend(["--per-view", f"{group}={fixture['per_view_paths'][group]}"])
                 argv.extend(
                     ["--temperature", f"{group}={fixture['temperature_paths'][group]}"]
@@ -312,7 +338,7 @@ class FormalTestBlockAnalysisTests(unittest.TestCase):
                     expected_sha256=declarations,
                 )
 
-    def test_non_5_by_16_bound_blocks_fail_closed(self) -> None:
+    def test_incomplete_16_view_bound_block_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             fixture = self._build_fixture(Path(temp))
             payload = json.loads(fixture["bound_split_path"].read_text(encoding="utf-8"))
@@ -321,7 +347,7 @@ class FormalTestBlockAnalysisTests(unittest.TestCase):
             self._write_json(fixture["bound_split_path"], payload)
             with self.assertRaisesRegex(
                 analyze_formal_test_blocks.BlockAnalysisError,
-                "expected exactly 5 test blocks|has 15 views|has 17 views",
+                "expected exactly 5 complete test blocks|has 15 views|has 17 views",
             ):
                 self._run(fixture)
 
@@ -348,7 +374,98 @@ class FormalTestBlockAnalysisTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(
                 analyze_formal_test_blocks.BlockAnalysisError,
-                "80 unique entries",
+                "unique entries",
+            ):
+                self._run(fixture)
+
+    def test_l_a3_internalroad_64_views_four_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fixture = self._build_fixture(
+                root, blocks=self.FOUR_BLOCKS, groups=("L", "A3")
+            )
+            payload = self._run(fixture)
+
+            self.assertEqual(payload["protocol"]["groups"], ["L", "A3"])
+            self.assertEqual(payload["protocol"]["test_views"], 64)
+            self.assertEqual(payload["protocol"]["block_count"], 4)
+            self.assertEqual(len(payload["blocks"]), 4)
+            for record in payload["blocks"]:
+                self.assertEqual(set(record["group_means"]), {"L", "A3"})
+                self.assertEqual(
+                    set(record["paired_comparisons"]), {"A3_minus_L"}
+                )
+            self.assertEqual(set(payload["classification_counts"]), {"A3_minus_L"})
+            self.assertNotIn("a3_vs_l_combined_judgment", payload)
+            self.assertEqual(
+                sum(
+                    record["paired_comparisons"]["A3_minus_L"][
+                        "combined_non_degraded"
+                    ]
+                    for record in payload["blocks"]
+                ),
+                3,
+            )
+
+            output = root / "l_a3_analysis.json"
+            csv_path = root / "l_a3_analysis.csv"
+            argv = [
+                "--test-list",
+                str(fixture["test_list_path"]),
+                "--bound-split",
+                str(fixture["bound_split_path"]),
+            ]
+            for group in fixture["groups"]:
+                argv.extend(
+                    ["--per-view", f"{group}={fixture['per_view_paths'][group]}"]
+                )
+                argv.extend(
+                    [
+                        "--temperature",
+                        f"{group}={fixture['temperature_paths'][group]}",
+                    ]
+                )
+            for declaration in self._declarations(fixture):
+                argv.extend(["--expected-sha256", declaration])
+            argv.extend(["--output", str(output), "--csv", str(csv_path)])
+            self.assertEqual(analyze_formal_test_blocks.main(argv), 0)
+            written = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(written["protocol"]["groups"], ["L", "A3"])
+            with csv_path.open("r", encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(len(rows), 120)
+
+    def test_l_a3_urban20k_96_views_six_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = self._build_fixture(
+                Path(temp), blocks=self.SIX_BLOCKS, groups=("L", "A3")
+            )
+            payload = self._run(fixture)
+
+            self.assertEqual(payload["protocol"]["groups"], ["L", "A3"])
+            self.assertEqual(payload["protocol"]["test_views"], 96)
+            self.assertEqual(payload["protocol"]["block_count"], 6)
+            self.assertEqual(len(payload["blocks"]), 6)
+            self.assertNotIn("a3_vs_l_combined_judgment", payload)
+            self.assertEqual(
+                sum(
+                    record["paired_comparisons"]["A3_minus_L"][
+                        "combined_non_degraded"
+                    ]
+                    for record in payload["blocks"]
+                ),
+                4,
+            )
+
+    def test_per_view_and_temperature_group_sets_must_match(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = self._build_fixture(
+                Path(temp), blocks=self.FOUR_BLOCKS, groups=("L", "A3")
+            )
+            del fixture["temperature_paths"]["A3"]
+            with self.assertRaisesRegex(
+                analyze_formal_test_blocks.BlockAnalysisError,
+                "group sets must match exactly",
             ):
                 self._run(fixture)
 
