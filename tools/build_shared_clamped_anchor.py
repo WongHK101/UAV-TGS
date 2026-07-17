@@ -343,6 +343,9 @@ def _load_gaussian_model_class():
     """
 
     module_path = Path(__file__).resolve().parents[1] / "scene" / "gaussian_model.py"
+    repository_root = str(module_path.parents[1])
+    if repository_root not in sys.path:
+        sys.path.insert(0, repository_root)
     spec = importlib.util.spec_from_file_location(
         "_uav_tgs_shared_anchor_gaussian_model", module_path
     )
