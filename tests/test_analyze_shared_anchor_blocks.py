@@ -157,6 +157,7 @@ class SharedAnchorBlockAnalysisTests(unittest.TestCase):
                 block["groups"]["S"]["depth_pixel_micro"]["abs_depth_error_mean"],
                 block["groups"]["Anchor"]["depth_pixel_micro"]["abs_depth_error_mean"],
             )
+            json.dumps(payload)
 
 
 if __name__ == "__main__":

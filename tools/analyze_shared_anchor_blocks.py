@@ -350,7 +350,7 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
             },
             "depth": {
                 group: {
-                    key: value
+                    key: str(value) if key.endswith("_path") else value
                     for key, value in inputs.items()
                     if key.endswith("_path") or key.endswith("_sha256")
                 }
