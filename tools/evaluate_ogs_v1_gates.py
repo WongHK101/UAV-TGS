@@ -957,8 +957,9 @@ def evaluate_rgb_direction_gate(input_path: Path) -> dict[str, Any]:
         "psnr_loss_db": reference["psnr"] - candidate["psnr"],
         "ssim_loss": reference["ssim"] - candidate["ssim"],
         "lpips_increase": candidate["lpips"] - reference["lpips"],
-        "front_at_1m_improvement": candidate["front_at_1m"]
-        - reference["front_at_1m"],
+        # front@1m is the FrontIntrusionRate, so lower is better.
+        "front_at_1m_improvement": reference["front_at_1m"]
+        - candidate["front_at_1m"],
         "mean_error_relative_improvement": _relative_improvement(
             reference["mean_error_m"],
             candidate["mean_error_m"],

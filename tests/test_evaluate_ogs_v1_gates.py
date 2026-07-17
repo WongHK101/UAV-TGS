@@ -372,7 +372,7 @@ class OgsEndpointDirectionGateTests(unittest.TestCase):
                                 "lpips": 0.104,
                             },
                             "depth": {
-                                "front_at_1m": 0.255,
+                                "front_at_1m": 0.145,
                                 "mean_error_m": 0.97,
                                 "missing_rate": 0.011,
                             },
