@@ -29,13 +29,15 @@ FORMAL_PROTOCOL_SCHEMA = "uav-tgs.radiometry-protocol.v1"
 FORMAL_DECODE_SCHEMA = "uav-tgs.temperature-decode.v1"
 FORMAL_ADAPTER = "builtin:dji_irp"
 FORMAL_ADAPTER_BACKEND = "official-dji-irp"
+LEGACY_PROTOCOL_BASIS = "legacy_frozen_v1"
+ROBUST_LRF_PROTOCOL_BASIS = "robust_lrf_v1"
+PROTOCOL_BASIS_CHOICES = (LEGACY_PROTOCOL_BASIS, ROBUST_LRF_PROTOCOL_BASIS)
 
-# This is deliberately the protocol basis used by the manifest that actually
-# produced the frozen Building Celsius maps (decode_protocol_used_v1.jsonl).
-# A later regenerated protocol added robust-inlier fields and therefore has a
-# different collection hash even when many resolved parameter values happen to
-# be equal.  Formal binding must not silently relabel old arrays with that newer
-# protocol.
+# This is deliberately the default protocol basis used by the manifest that
+# actually produced the frozen Building Celsius maps
+# (decode_protocol_used_v1.jsonl).  A later protocol records robust-inlier
+# fields and has a different collection hash.  It is accepted only through the
+# explicit robust_lrf_v1 basis, so old arrays cannot be silently relabelled.
 FORMAL_PROTOCOL_BASIS_FIELDS = (
     "scene",
     "frame_id",
@@ -55,6 +57,23 @@ FORMAL_PROTOCOL_BASIS_FIELDS = (
 LATER_PROTOCOL_ONLY_FIELDS = (
     "raw_lrf_robust_inlier",
     "raw_lrf_robust_outlier",
+)
+ROBUST_LRF_PROTOCOL_BASIS_FIELDS = (
+    "scene",
+    "frame_id",
+    "pair_id",
+    "source_path",
+    "strip_id",
+    "decode_parameters",
+    "raw_lrf_distance_m",
+    "raw_lrf_status",
+    "raw_lrf_valid",
+    *LATER_PROTOCOL_ONLY_FIELDS,
+    "used_distance_m",
+    "used_distance_source",
+    "distance_fallback_reason",
+    "source_audit_record_hash",
+    "protocol_record_hash",
 )
 PARAMETER_NAMES = (
     "distance_m",
@@ -141,7 +160,15 @@ def _validate_protocol_collection(
     rows: Sequence[Mapping[str, Any]],
     *,
     expected_protocol_hash: str,
+    protocol_basis_variant: str,
 ) -> str:
+    if protocol_basis_variant not in PROTOCOL_BASIS_CHOICES:
+        raise ValueError(f"unsupported decode protocol basis: {protocol_basis_variant!r}")
+    basis_fields = (
+        FORMAL_PROTOCOL_BASIS_FIELDS
+        if protocol_basis_variant == LEGACY_PROTOCOL_BASIS
+        else ROBUST_LRF_PROTOCOL_BASIS_FIELDS
+    )
     basis: list[dict[str, Any]] = []
     for index, row in enumerate(rows, 1):
         if row.get("schema_version") != FORMAL_PROTOCOL_SCHEMA:
@@ -149,12 +176,57 @@ def _validate_protocol_collection(
                 f"protocol row {index} schema mismatch: {row.get('schema_version')!r}"
             )
         later_fields = [field for field in LATER_PROTOCOL_ONLY_FIELDS if field in row]
-        if later_fields:
-            raise ValueError(
-                "decode protocol is not the frozen decode_protocol_used_v1 schema; "
-                f"later-only fields present in row {index}: {later_fields}"
+        if protocol_basis_variant == LEGACY_PROTOCOL_BASIS:
+            if later_fields:
+                raise ValueError(
+                    "decode protocol is not the frozen decode_protocol_used_v1 schema; "
+                    f"later-only fields present in row {index}: {later_fields}"
+                )
+        else:
+            if set(later_fields) != set(LATER_PROTOCOL_ONLY_FIELDS):
+                raise ValueError(
+                    f"robust_lrf_v1 protocol row {index} must contain both "
+                    f"{list(LATER_PROTOCOL_ONLY_FIELDS)}, got {later_fields}"
+                )
+            robust_inlier = row["raw_lrf_robust_inlier"]
+            robust_outlier = row["raw_lrf_robust_outlier"]
+            if robust_inlier is not None and type(robust_inlier) is not bool:
+                raise ValueError(
+                    f"robust_lrf_v1 protocol row {index} raw_lrf_robust_inlier "
+                    "must be boolean or null"
+                )
+            if type(robust_outlier) is not bool:
+                raise ValueError(
+                    f"robust_lrf_v1 protocol row {index} raw_lrf_robust_outlier "
+                    "must be boolean"
+                )
+            if robust_outlier is not (robust_inlier is False):
+                raise ValueError(
+                    f"robust_lrf_v1 protocol row {index} robust inlier/outlier "
+                    "fields are not complementary"
+                )
+            metadata = _require_mapping(
+                f"protocol row {index} metadata", row.get("metadata")
             )
-        missing = [field for field in FORMAL_PROTOCOL_BASIS_FIELDS if field not in row]
+            radiometry = _require_mapping(
+                f"protocol row {index} metadata.radiometry_protocol",
+                metadata.get("radiometry_protocol"),
+            )
+            nested_missing = [
+                field for field in LATER_PROTOCOL_ONLY_FIELDS if field not in radiometry
+            ]
+            if nested_missing:
+                raise ValueError(
+                    f"robust_lrf_v1 protocol row {index} nested metadata is missing "
+                    f"{nested_missing}"
+                )
+            for field in LATER_PROTOCOL_ONLY_FIELDS:
+                _require_equal(
+                    f"robust_lrf_v1 protocol row {index} nested {field}",
+                    radiometry[field],
+                    row[field],
+                )
+        missing = [field for field in basis_fields if field not in row]
         if missing:
             raise ValueError(f"protocol row {index} is missing frozen-basis fields: {missing}")
         record_hash = _require_sha256(
@@ -171,7 +243,7 @@ def _validate_protocol_collection(
             record_hash,
         )
         _parameter_values(row.get("decode_parameters"), label=f"protocol row {index} parameters")
-        basis.append({field: row[field] for field in FORMAL_PROTOCOL_BASIS_FIELDS})
+        basis.append({field: row[field] for field in basis_fields})
 
     computed = _json_hash(basis)
     expected = _require_sha256("expected decode protocol hash", expected_protocol_hash)
@@ -393,6 +465,7 @@ def bind_formal_scene(
     expected_decode_protocol_hash: str,
     expected_adapter_executable_sha256: str,
     expected_adapter: str = FORMAL_ADAPTER,
+    decode_protocol_basis: str = LEGACY_PROTOCOL_BASIS,
     camera_extension: str = ".JPG",
     thermal_camera_extension: str = ".png",
 ) -> tuple[dict[str, Any], dict[str, list[str]], dict[str, Any]]:
@@ -402,6 +475,8 @@ def bind_formal_scene(
     decode_protocol_path = decode_protocol_path.resolve()
     temperature_root = temperature_root.resolve()
     raw_thermal_root = raw_thermal_root.resolve()
+    if decode_protocol_basis not in PROTOCOL_BASIS_CHOICES:
+        raise ValueError(f"unsupported decode protocol basis: {decode_protocol_basis!r}")
     if sfm_image_scope not in ALLOWED_SFM_SCOPES:
         raise ValueError(f"unsupported sfm_image_scope: {sfm_image_scope}")
     if not raw_thermal_root.is_dir():
@@ -515,6 +590,7 @@ def bind_formal_scene(
     protocol_collection_hash = _validate_protocol_collection(
         protocol_rows,
         expected_protocol_hash=expected_decode_protocol_hash,
+        protocol_basis_variant=decode_protocol_basis,
     )
     decode_index = _unique_index(decode_rows, scene=scene, label="decode")
     protocol_index = _unique_index(protocol_rows, scene=scene, label="protocol")
@@ -636,6 +712,7 @@ def bind_formal_scene(
         "decode_manifest_sha256": _sha256(decode_manifest_path),
         "decode_protocol_sha256": _sha256(decode_protocol_path),
         "protocol_hash": protocol_collection_hash,
+        "protocol_basis_variant": decode_protocol_basis,
         "temperature_root": str(temperature_root),
         "raw_thermal_root": str(raw_thermal_root),
         "verified_temperature_file_hashes": True,
@@ -658,6 +735,7 @@ def bind_formal_scene(
         "decode_manifest_sha256": _sha256(decode_manifest_path),
         "decode_protocol_sha256": _sha256(decode_protocol_path),
         "decode_protocol_hash": protocol_collection_hash,
+        "decode_protocol_basis": decode_protocol_basis,
         "formal_protocol_schema": FORMAL_PROTOCOL_SCHEMA,
         "formal_decode_schema": FORMAL_DECODE_SCHEMA,
         "adapter": expected_adapter,
@@ -707,6 +785,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-scene-split-hash", required=True)
     parser.add_argument("--expected-scene-rule-hash", required=True)
     parser.add_argument("--expected-decode-protocol-hash", required=True)
+    parser.add_argument(
+        "--decode-protocol-basis",
+        choices=PROTOCOL_BASIS_CHOICES,
+        default=LEGACY_PROTOCOL_BASIS,
+    )
     parser.add_argument("--expected-adapter", default=FORMAL_ADAPTER, choices=(FORMAL_ADAPTER,))
     parser.add_argument("--expected-adapter-executable-sha256", required=True)
     parser.add_argument("--camera-extension", default=".JPG")
@@ -749,6 +832,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         expected_scene_split_hash=args.expected_scene_split_hash,
         expected_scene_rule_hash=args.expected_scene_rule_hash,
         expected_decode_protocol_hash=args.expected_decode_protocol_hash,
+        decode_protocol_basis=args.decode_protocol_basis,
         expected_adapter=args.expected_adapter,
         expected_adapter_executable_sha256=args.expected_adapter_executable_sha256,
         camera_extension=args.camera_extension,

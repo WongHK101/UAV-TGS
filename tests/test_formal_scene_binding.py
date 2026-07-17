@@ -223,8 +223,58 @@ class FormalSceneBindingTests(unittest.TestCase):
             },
         }
 
+    def _upgrade_fixture_to_robust_lrf(
+        self, fixture: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        protocol_rows = [
+            json.loads(line)
+            for line in fixture["protocol_path"].read_text(encoding="utf-8").splitlines()
+        ]
+        decode_rows = [
+            json.loads(line)
+            for line in fixture["decode_path"].read_text(encoding="utf-8").splitlines()
+        ]
+        for index, (protocol, decode) in enumerate(zip(protocol_rows, decode_rows, strict=True)):
+            robust_inlier = index != 1
+            robust_outlier = not robust_inlier
+            protocol["raw_lrf_robust_inlier"] = robust_inlier
+            protocol["raw_lrf_robust_outlier"] = robust_outlier
+            protocol_metadata = protocol["metadata"]["radiometry_protocol"]
+            protocol_metadata["raw_lrf_robust_inlier"] = robust_inlier
+            protocol_metadata["raw_lrf_robust_outlier"] = robust_outlier
+            decode["metadata"] = protocol["metadata"]
+            request_path = (
+                fixture["decode_path"].parent
+                / "decode_requests"
+                / f"Fixture--{protocol['pair_id']}.json"
+            )
+            request = json.loads(request_path.read_text(encoding="utf-8"))
+            request["metadata"] = protocol["metadata"]
+            _write_json(request_path, request)
+
+            protocol.pop("protocol_hash", None)
+            protocol.pop("protocol_record_hash", None)
+            protocol["protocol_record_hash"] = _json_hash(protocol)
+
+        protocol_basis = [
+            {field: row[field] for field in binding.ROBUST_LRF_PROTOCOL_BASIS_FIELDS}
+            for row in protocol_rows
+        ]
+        protocol_hash = _json_hash(protocol_basis)
+        for row in protocol_rows:
+            row["protocol_hash"] = protocol_hash
+        _write_jsonl(fixture["protocol_path"], protocol_rows)
+        _write_jsonl(fixture["decode_path"], decode_rows)
+        fixture["protocol_hash"] = protocol_hash
+        fixture["expected"]["expected_decode_protocol_hash"] = protocol_hash
+        return protocol_rows
+
     @staticmethod
-    def _bind(fixture: dict[str, Any]):
+    def _bind(
+        fixture: dict[str, Any],
+        *,
+        decode_protocol_basis: str = binding.LEGACY_PROTOCOL_BASIS,
+    ):
         return binding.bind_formal_scene(
             scene_manifest_path=fixture["scene_path"],
             collection_manifest_path=fixture["collection_path"],
@@ -234,6 +284,7 @@ class FormalSceneBindingTests(unittest.TestCase):
             raw_thermal_root=fixture["raw_root"],
             scene="Fixture",
             sfm_image_scope="shared_sfm_all_images",
+            decode_protocol_basis=decode_protocol_basis,
             **fixture["expected"],
         )
 
@@ -255,6 +306,13 @@ class FormalSceneBindingTests(unittest.TestCase):
             self.assertEqual(bound["records"][0]["temperature_npy"], "Fixture/0001.npy")
             self.assertEqual(manifest["status"], "passed")
             self.assertEqual(manifest["decode_protocol_hash"], fixture["protocol_hash"])
+            self.assertEqual(
+                manifest["decode_protocol_basis"], binding.LEGACY_PROTOCOL_BASIS
+            )
+            self.assertEqual(
+                bound["decode_binding"]["protocol_basis_variant"],
+                binding.LEGACY_PROTOCOL_BASIS,
+            )
             self.assertEqual(manifest["adapter_executable_sha256"], fixture["adapter_sha"])
             self.assertEqual(
                 manifest["counts"], {"total": 3, "train": 1, "test": 1, "guard": 1}
@@ -279,6 +337,54 @@ class FormalSceneBindingTests(unittest.TestCase):
             _write_jsonl(fixture["protocol_path"], rows)
             with self.assertRaisesRegex(ValueError, "not the frozen decode_protocol_used_v1 schema"):
                 self._bind(fixture)
+
+    def test_explicit_robust_lrf_protocol_binds_full_decode_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self._fixture(Path(temporary))
+            self._upgrade_fixture_to_robust_lrf(fixture)
+            bound, _, manifest = self._bind(
+                fixture, decode_protocol_basis=binding.ROBUST_LRF_PROTOCOL_BASIS
+            )
+            self.assertEqual(
+                manifest["decode_protocol_basis"], binding.ROBUST_LRF_PROTOCOL_BASIS
+            )
+            self.assertEqual(
+                bound["decode_binding"]["protocol_basis_variant"],
+                binding.ROBUST_LRF_PROTOCOL_BASIS,
+            )
+
+    def test_explicit_robust_lrf_protocol_rejects_mixed_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self._fixture(Path(temporary))
+            rows = self._upgrade_fixture_to_robust_lrf(fixture)
+            rows[-1].pop("raw_lrf_robust_inlier")
+            _write_jsonl(fixture["protocol_path"], rows)
+            with self.assertRaisesRegex(ValueError, "must contain both"):
+                self._bind(
+                    fixture, decode_protocol_basis=binding.ROBUST_LRF_PROTOCOL_BASIS
+                )
+
+    def test_explicit_robust_lrf_protocol_rejects_inconsistent_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self._fixture(Path(temporary))
+            rows = self._upgrade_fixture_to_robust_lrf(fixture)
+            rows[0]["raw_lrf_robust_outlier"] = True
+            _write_jsonl(fixture["protocol_path"], rows)
+            with self.assertRaisesRegex(ValueError, "not complementary"):
+                self._bind(
+                    fixture, decode_protocol_basis=binding.ROBUST_LRF_PROTOCOL_BASIS
+                )
+
+    def test_explicit_robust_lrf_protocol_rejects_nested_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self._fixture(Path(temporary))
+            rows = self._upgrade_fixture_to_robust_lrf(fixture)
+            rows[0]["metadata"]["radiometry_protocol"]["raw_lrf_robust_inlier"] = False
+            _write_jsonl(fixture["protocol_path"], rows)
+            with self.assertRaisesRegex(ValueError, "nested raw_lrf_robust_inlier mismatch"):
+                self._bind(
+                    fixture, decode_protocol_basis=binding.ROBUST_LRF_PROTOCOL_BASIS
+                )
 
     def test_protocol_record_hash_tamper_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
