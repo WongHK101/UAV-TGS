@@ -240,11 +240,11 @@ class OgsScaleAndPairedGateTests(unittest.TestCase):
         ) as handle:
             writer = csv.DictWriter(
                 handle,
-                fieldnames=("target_index", "control_index", "weak_eigengap"),
+                fieldnames=("clamp_index", "control_index", "weak_eigengap"),
             )
             writer.writeheader()
             writer.writerow(
-                {"target_index": 0, "control_index": 1, "weak_eigengap": 0.5}
+                {"clamp_index": 0, "control_index": 1, "weak_eigengap": 0.5}
             )
 
     def test_checkpoint_scale_safety_and_fixed_mapping_diagnostics(self) -> None:

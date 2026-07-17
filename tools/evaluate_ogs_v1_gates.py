@@ -504,7 +504,7 @@ def _load_audit_mapping(directory: Path, gaussian_count: int) -> dict[str, Any]:
     target_set = set(clamp_indices)
     control_indices: list[int] = []
     for row in control_rows:
-        target = _integer(row.get("target_index"), "control target_index")
+        target = _integer(row.get("clamp_index"), "control clamp_index")
         control = _integer(row.get("control_index"), "control_index")
         if target not in target_set:
             raise OgsGateEvidenceError("control mapping names a non-clamp target")
