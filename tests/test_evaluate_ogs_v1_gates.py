@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,6 +20,20 @@ from tools.evaluate_ogs_v1_gates import (
     summarize_gradient_smoke,
 )
 from utils.ogs_v1 import build_ogs_cache, save_ogs_cache
+
+
+class TestGateCliEntrypoint(unittest.TestCase):
+    def test_direct_script_help_resolves_repository_imports(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        result = subprocess.run(
+            [sys.executable, str(repository / "tools" / "evaluate_ogs_v1_gates.py"), "--help"],
+            cwd=Path(tempfile.gettempdir()),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("usage:", result.stdout)
 
 
 def _smoke_record(update: int, ratio: float = 0.1) -> dict:

@@ -14,11 +14,16 @@ import hashlib
 import json
 import math
 import os
+import sys
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 import torch
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils.ogs_v1 import load_ogs_cache, ogs_v1_loss, summarize_scale_safety
 
