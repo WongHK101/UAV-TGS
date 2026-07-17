@@ -4,8 +4,8 @@
 The PLY ``opacity`` property is a raw logit.  This tool applies a sigmoid
 before reporting opacity statistics and deltas.  It also proves that every
 spatial field is byte-exact between the RGB anchor and A3.  Optionally, it
-compares the 80 named ``opacity_proxy`` NPY outputs declared by render mapping
-manifests.
+compares the complete named ``opacity_proxy`` NPY outputs declared by matching
+render mapping manifests.
 """
 
 from __future__ import annotations
@@ -38,7 +38,9 @@ STRUCTURAL_FIELDS = (
     "rot_3",
 )
 DELTA_THRESHOLDS = (0.01, 0.05, 0.10)
-EXPECTED_PROXY_VIEWS = 80
+SATURATION_LOW_MAX = 1e-4
+SATURATION_HIGH_MIN = 1.0 - 1e-4
+SATURATION_CATASTROPHIC_FRACTION = 0.99
 SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
@@ -144,6 +146,47 @@ def _delta_summary(anchor: np.ndarray, candidate: np.ndarray) -> dict[str, Any]:
     return result
 
 
+def _saturation_summary(values: np.ndarray) -> dict[str, Any]:
+    array = _require_finite(
+        np.asarray(values, dtype=np.float64),
+        "activated opacity saturation array",
+    )
+    if array.size == 0:
+        raise OpacityAuditError("cannot audit saturation of an empty opacity array")
+    low_fraction = float(np.mean(array <= SATURATION_LOW_MAX))
+    high_fraction = float(np.mean(array >= SATURATION_HIGH_MIN))
+    return {
+        "low_fraction": low_fraction,
+        "high_fraction": high_fraction,
+        "detected": bool(
+            low_fraction >= SATURATION_CATASTROPHIC_FRACTION
+            or high_fraction >= SATURATION_CATASTROPHIC_FRACTION
+        ),
+    }
+
+
+def _catastrophic_saturation_audit(
+    anchor: np.ndarray,
+    candidate: np.ndarray,
+) -> dict[str, Any]:
+    anchor_summary = _saturation_summary(anchor)
+    a3_summary = _saturation_summary(candidate)
+    return {
+        "definition": (
+            "candidate A3 catastrophic only when at least 0.99 of activated "
+            "opacities collapse to the low or high endpoint"
+        ),
+        "thresholds": {
+            "low_activated_opacity_lte": SATURATION_LOW_MAX,
+            "high_activated_opacity_gte": SATURATION_HIGH_MIN,
+            "catastrophic_fraction_gte": SATURATION_CATASTROPHIC_FRACTION,
+        },
+        "anchor": anchor_summary,
+        "a3": a3_summary,
+        "detected": a3_summary["detected"],
+    }
+
+
 def audit_ply_pair(anchor_ply: Path, a3_ply: Path) -> dict[str, Any]:
     anchor = _read_vertices(anchor_ply)
     candidate = _read_vertices(a3_ply)
@@ -201,6 +244,9 @@ def audit_ply_pair(anchor_ply: Path, a3_ply: Path) -> dict[str, Any]:
             "anchor": _distribution(activated_anchor),
             "a3": _distribution(activated_a3),
             "a3_minus_anchor": _delta_summary(activated_anchor, activated_a3),
+            "catastrophic_saturation": _catastrophic_saturation_audit(
+                activated_anchor, activated_a3
+            ),
             "raw_array_sha256": {
                 "anchor": _array_sha256("opacity", raw_anchor),
                 "a3": _array_sha256("opacity", raw_a3),
@@ -222,7 +268,10 @@ def _safe_manifest_output(manifest_path: Path, relative: str) -> Path:
     return target
 
 
-def _manifest_proxy_index(manifest_path: Path) -> tuple[dict[str, Path], dict[str, Any]]:
+def _manifest_proxy_index(
+    manifest_path: Path,
+    expected_proxy_views: int | None = None,
+) -> tuple[dict[str, Path], dict[str, Any]]:
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -236,13 +285,27 @@ def _manifest_proxy_index(manifest_path: Path) -> tuple[dict[str, Path], dict[st
             f"{manifest.get('opacity_proxy_semantics')!r}"
         )
     entries = manifest.get("entries")
-    if not isinstance(entries, list) or len(entries) != EXPECTED_PROXY_VIEWS:
+    if not isinstance(entries, list) or not entries:
         raise OpacityAuditError(
-            f"manifest must contain exactly {EXPECTED_PROXY_VIEWS} entries: {manifest_path}"
+            f"manifest must contain a non-empty entries list: {manifest_path}"
         )
+    if expected_proxy_views is not None:
+        if (
+            isinstance(expected_proxy_views, bool)
+            or not isinstance(expected_proxy_views, int)
+            or expected_proxy_views <= 0
+        ):
+            raise OpacityAuditError("expected proxy views must be a positive integer")
+        if len(entries) != expected_proxy_views:
+            raise OpacityAuditError(
+                "opacity proxy manifest view count mismatch: "
+                f"expected={expected_proxy_views} actual={len(entries)} path={manifest_path}"
+            )
 
     index: dict[str, Path] = {}
     declared_hashes: dict[str, str] = {}
+    indexed_paths: set[Path] = set()
+    proxy_directories: set[Path] = set()
     for entry in entries:
         if not isinstance(entry, dict):
             raise OpacityAuditError(f"non-object mapping entry in {manifest_path}")
@@ -261,6 +324,10 @@ def _manifest_proxy_index(manifest_path: Path) -> tuple[dict[str, Path], dict[st
         path = _safe_manifest_output(manifest_path, relative)
         if path.suffix.lower() != ".npy" or not path.is_file():
             raise OpacityAuditError(f"opacity proxy is missing or not NPY: {path}")
+        if path in indexed_paths:
+            raise OpacityAuditError(
+                f"duplicate opacity proxy output path in {manifest_path}: {path}"
+            )
         actual = sha256_file(path)
         expected = _validate_expected_sha256(declared, f"opacity proxy {source_name}")
         if actual != expected:
@@ -269,11 +336,32 @@ def _manifest_proxy_index(manifest_path: Path) -> tuple[dict[str, Path], dict[st
             )
         index[source_stem] = path
         declared_hashes[source_stem] = expected
+        indexed_paths.add(path)
+        proxy_directories.add(path.parent)
+    if len(proxy_directories) != 1:
+        raise OpacityAuditError(
+            f"manifest opacity proxies must share one output directory: {manifest_path}"
+        )
+    proxy_directory = next(iter(proxy_directories))
+    directory_paths = {
+        path.resolve()
+        for path in proxy_directory.rglob("*.npy")
+        if path.is_file()
+    }
+    if directory_paths != indexed_paths:
+        missing = sorted(str(path) for path in indexed_paths - directory_paths)
+        extra = sorted(str(path) for path in directory_paths - indexed_paths)
+        raise OpacityAuditError(
+            "opacity proxy manifest/directory files differ: "
+            f"missing={missing} extra={extra} directory={proxy_directory}"
+        )
     return index, {
         "path": str(manifest_path.resolve()),
         "sha256": sha256_file(manifest_path),
         "semantics": expected_semantics,
         "view_count": len(index),
+        "proxy_directory": str(proxy_directory),
+        "directory_npy_count": len(directory_paths),
         "opacity_proxy_sha256": declared_hashes,
     }
 
@@ -313,16 +401,18 @@ def _proxy_row(scope: str, view_id: str, anchor: np.ndarray, candidate: np.ndarr
 def compare_opacity_proxy_manifests(
     anchor_manifest: Path,
     a3_manifest: Path,
+    expected_proxy_views: int | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    anchor_index, anchor_meta = _manifest_proxy_index(anchor_manifest)
-    a3_index, a3_meta = _manifest_proxy_index(a3_manifest)
+    anchor_index, anchor_meta = _manifest_proxy_index(
+        anchor_manifest, expected_proxy_views=expected_proxy_views
+    )
+    a3_index, a3_meta = _manifest_proxy_index(
+        a3_manifest, expected_proxy_views=expected_proxy_views
+    )
     if set(anchor_index) != set(a3_index):
         missing = sorted(set(anchor_index) - set(a3_index))
         extra = sorted(set(a3_index) - set(anchor_index))
         raise OpacityAuditError(f"opacity proxy view sets differ: missing={missing} extra={extra}")
-    if len(anchor_index) != EXPECTED_PROXY_VIEWS:
-        raise OpacityAuditError(f"opacity proxy comparison requires exactly {EXPECTED_PROXY_VIEWS} views")
-
     rows: list[dict[str, Any]] = []
     all_anchor: list[np.ndarray] = []
     all_a3: list[np.ndarray] = []
@@ -348,6 +438,7 @@ def compare_opacity_proxy_manifests(
         "anchor_manifest": anchor_meta,
         "a3_manifest": a3_meta,
         "view_count": len(rows),
+        "expected_proxy_views": expected_proxy_views,
         "pixel_micro": aggregate,
         "frame_macro": frame_macro,
     }, rows
@@ -410,6 +501,7 @@ def run_audit(
     a3_opacity_manifest: Path | None = None,
     anchor_opacity_manifest_sha256: str | None = None,
     a3_opacity_manifest_sha256: str | None = None,
+    expected_proxy_views: int | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     anchor_ply = anchor_ply.resolve()
     a3_ply = a3_ply.resolve()
@@ -452,6 +544,10 @@ def run_audit(
             "anchor/A3 opacity manifests and both expected manifest SHA-256 values "
             "must all be supplied or all be omitted"
         )
+    if expected_proxy_views is not None and anchor_opacity_manifest is None:
+        raise OpacityAuditError(
+            "expected proxy views requires anchor/A3 opacity manifests"
+        )
     proxy_audit = None
     if anchor_opacity_manifest is not None and a3_opacity_manifest is not None:
         assert anchor_opacity_manifest_sha256 is not None
@@ -469,6 +565,7 @@ def run_audit(
         proxy_audit, proxy_rows = compare_opacity_proxy_manifests(
             anchor_opacity_manifest.resolve(),
             a3_opacity_manifest.resolve(),
+            expected_proxy_views=expected_proxy_views,
         )
         if proxy_audit["anchor_manifest"]["sha256"] != anchor_manifest_sha:
             raise OpacityAuditError("anchor opacity manifest changed during audit")
@@ -504,6 +601,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--a3-opacity-manifest", type=Path)
     parser.add_argument("--anchor-opacity-manifest-sha256")
     parser.add_argument("--a3-opacity-manifest-sha256")
+    parser.add_argument("--expected-proxy-views", type=int)
     parser.add_argument("--report", required=True, type=Path)
     parser.add_argument("--csv", required=True, type=Path)
     parser.add_argument("--overwrite", action="store_true")
@@ -521,6 +619,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         a3_opacity_manifest=args.a3_opacity_manifest,
         anchor_opacity_manifest_sha256=args.anchor_opacity_manifest_sha256,
         a3_opacity_manifest_sha256=args.a3_opacity_manifest_sha256,
+        expected_proxy_views=args.expected_proxy_views,
     )
     _write_json(args.report, payload, args.overwrite)
     _write_csv(args.csv, rows, args.overwrite)

@@ -143,6 +143,103 @@ class OpacityAdaptationAuditTests(unittest.TestCase):
                 {"0.01": 0.75, "0.05": 0.5, "0.10": 0.25},
             )
 
+    def test_catastrophic_saturation_fraction_is_inclusive_at_0_99(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            anchor_ply = root / "anchor.ply"
+            a3_ply = root / "a3.ply"
+            self._write_ply(anchor_ply, np.zeros(100, dtype=np.float32))
+            activated = np.concatenate(
+                [np.full(99, 1e-5, dtype=np.float64), np.asarray([0.5])]
+            )
+            raw = np.log(activated / (1.0 - activated)).astype(np.float32)
+            self._write_ply(a3_ply, raw)
+            payload, _ = audit_opacity_adaptation.run_audit(
+                anchor_ply=anchor_ply,
+                a3_ply=a3_ply,
+                anchor_ply_sha256=self._sha256(anchor_ply),
+                a3_ply_sha256=self._sha256(a3_ply),
+            )
+            saturation = payload["ply_audit"]["activated_opacity"][
+                "catastrophic_saturation"
+            ]
+            self.assertEqual(
+                saturation["thresholds"],
+                {
+                    "low_activated_opacity_lte": 1e-4,
+                    "high_activated_opacity_gte": 1.0 - 1e-4,
+                    "catastrophic_fraction_gte": 0.99,
+                },
+            )
+            self.assertAlmostEqual(saturation["a3"]["low_fraction"], 0.99)
+            self.assertEqual(saturation["a3"]["high_fraction"], 0.0)
+            self.assertTrue(saturation["a3"]["detected"])
+            self.assertTrue(saturation["detected"])
+
+    def test_catastrophic_saturation_below_0_99_is_not_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            anchor_ply = root / "anchor.ply"
+            a3_ply = root / "a3.ply"
+            self._write_ply(anchor_ply, np.zeros(100, dtype=np.float32))
+            activated = np.concatenate(
+                [np.full(98, 1.0 - 1e-5, dtype=np.float64), np.full(2, 0.5)]
+            )
+            raw = np.log(activated / (1.0 - activated)).astype(np.float32)
+            self._write_ply(a3_ply, raw)
+            payload, _ = audit_opacity_adaptation.run_audit(
+                anchor_ply=anchor_ply,
+                a3_ply=a3_ply,
+                anchor_ply_sha256=self._sha256(anchor_ply),
+                a3_ply_sha256=self._sha256(a3_ply),
+            )
+            saturation = payload["ply_audit"]["activated_opacity"][
+                "catastrophic_saturation"
+            ]
+            self.assertAlmostEqual(saturation["a3"]["high_fraction"], 0.98)
+            self.assertFalse(saturation["detected"])
+
+    def test_high_endpoint_saturation_is_inclusive_at_0_99(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            anchor_ply = root / "anchor.ply"
+            a3_ply = root / "a3.ply"
+            self._write_ply(anchor_ply, np.zeros(100, dtype=np.float32))
+            activated = np.concatenate(
+                [np.full(99, 1.0 - 1e-5, dtype=np.float64), np.asarray([0.5])]
+            )
+            raw = np.log(activated / (1.0 - activated)).astype(np.float32)
+            self._write_ply(a3_ply, raw)
+            payload, _ = audit_opacity_adaptation.run_audit(
+                anchor_ply=anchor_ply,
+                a3_ply=a3_ply,
+                anchor_ply_sha256=self._sha256(anchor_ply),
+                a3_ply_sha256=self._sha256(a3_ply),
+            )
+            saturation = payload["ply_audit"]["activated_opacity"][
+                "catastrophic_saturation"
+            ]
+            self.assertAlmostEqual(saturation["a3"]["high_fraction"], 0.99)
+            self.assertTrue(saturation["detected"])
+
+    def test_nonfinite_opacity_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            anchor_ply = root / "anchor.ply"
+            a3_ply = root / "a3.ply"
+            self._write_ply(anchor_ply, np.zeros(2, dtype=np.float32))
+            self._write_ply(a3_ply, np.asarray([0.0, np.nan], dtype=np.float32))
+            with self.assertRaisesRegex(
+                audit_opacity_adaptation.OpacityAuditError,
+                "A3 raw opacity contains non-finite values",
+            ):
+                audit_opacity_adaptation.run_audit(
+                    anchor_ply=anchor_ply,
+                    a3_ply=a3_ply,
+                    anchor_ply_sha256=self._sha256(anchor_ply),
+                    a3_ply_sha256=self._sha256(a3_ply),
+                )
+
     def test_structural_change_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -219,6 +316,8 @@ class OpacityAdaptationAuditTests(unittest.TestCase):
                     self._sha256(anchor_manifest),
                     "--a3-opacity-manifest-sha256",
                     self._sha256(a3_manifest),
+                    "--expected-proxy-views",
+                    "80",
                     "--report",
                     str(report_path),
                     "--csv",
@@ -231,6 +330,8 @@ class OpacityAdaptationAuditTests(unittest.TestCase):
             self.assertEqual(proxy["view_count"], 80)
             self.assertEqual(proxy["anchor_manifest"]["view_count"], 80)
             self.assertEqual(proxy["a3_manifest"]["view_count"], 80)
+            self.assertEqual(proxy["anchor_manifest"]["directory_npy_count"], 80)
+            self.assertEqual(proxy["a3_manifest"]["directory_npy_count"], 80)
             micro = proxy["pixel_micro"]
             expected_delta = float(np.float32(0.22) - np.float32(0.20))
             self.assertEqual(micro["count"], 160)
@@ -250,6 +351,71 @@ class OpacityAdaptationAuditTests(unittest.TestCase):
             self.assertEqual(len(csv_rows), 82)  # PLY + 80 views + pixel-micro.
             self.assertEqual(csv_rows[-1]["scope"], "opacity_proxy_pixel_micro")
             self.assertEqual(csv_rows[-1]["view_id"], "ALL")
+
+    def test_dynamic_64_and_96_view_proxy_manifests(self) -> None:
+        for view_count in (64, 96):
+            with self.subTest(view_count=view_count), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                stems = [f"{index:04d}" for index in range(view_count)]
+                anchor_manifest = self._write_proxy_manifest(
+                    root / "anchor_render", stems, value=0.20
+                )
+                a3_manifest = self._write_proxy_manifest(
+                    root / "a3_render", stems, value=0.22
+                )
+                payload, rows = audit_opacity_adaptation.compare_opacity_proxy_manifests(
+                    anchor_manifest, a3_manifest, expected_proxy_views=view_count
+                )
+                self.assertEqual(payload["view_count"], view_count)
+                self.assertEqual(payload["expected_proxy_views"], view_count)
+                self.assertEqual(
+                    payload["anchor_manifest"]["directory_npy_count"], view_count
+                )
+                self.assertEqual(
+                    payload["a3_manifest"]["directory_npy_count"], view_count
+                )
+                self.assertEqual(len(rows), view_count)
+
+    def test_proxy_manifest_directory_extra_file_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stems = ["0001", "0002"]
+            anchor_manifest = self._write_proxy_manifest(
+                root / "anchor_render", stems, value=0.20
+            )
+            a3_manifest = self._write_proxy_manifest(
+                root / "a3_render", stems, value=0.22
+            )
+            np.save(
+                anchor_manifest.parent / "opacity_proxy" / "unlisted.npy",
+                np.zeros((1, 1), dtype=np.float32),
+                allow_pickle=False,
+            )
+            with self.assertRaisesRegex(
+                audit_opacity_adaptation.OpacityAuditError,
+                "manifest/directory files differ",
+            ):
+                audit_opacity_adaptation.compare_opacity_proxy_manifests(
+                    anchor_manifest, a3_manifest
+                )
+
+    def test_expected_proxy_view_count_mismatch_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stems = ["0001", "0002"]
+            anchor_manifest = self._write_proxy_manifest(
+                root / "anchor_render", stems, value=0.20
+            )
+            a3_manifest = self._write_proxy_manifest(
+                root / "a3_render", stems, value=0.22
+            )
+            with self.assertRaisesRegex(
+                audit_opacity_adaptation.OpacityAuditError,
+                "view count mismatch: expected=64 actual=2",
+            ):
+                audit_opacity_adaptation.compare_opacity_proxy_manifests(
+                    anchor_manifest, a3_manifest, expected_proxy_views=64
+                )
 
     def test_proxy_manifest_declared_hash_mismatch_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
