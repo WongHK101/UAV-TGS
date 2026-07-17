@@ -141,6 +141,19 @@ class SharedClampedAnchorTests(unittest.TestCase):
             self.assertEqual(manifest["counts"]["actual_clamped_gaussians"], 2)
             self.assertEqual(manifest["counts"]["changed_scaling_rows"], 2)
             self.assertEqual(manifest["counts"]["changed_scaling_elements"], 3)
+            self.assertEqual(
+                manifest["scale_summary"]["all_gaussians_before"]["count"], 4
+            )
+            self.assertEqual(
+                manifest["scale_summary"]["clamped_rows_after"]["count"], 2
+            )
+            self.assertAlmostEqual(
+                manifest["scale_summary"]["all_gaussians_after"]["percentiles"][
+                    "per_gaussian_max"
+                ]["p100"],
+                10.0,
+                places=5,
+            )
             self.assertTrue(manifest["invariants"]["only_scaling_changed"])
             self.assertTrue(manifest["invariants"]["input_anchor_unchanged"])
             self.assertEqual(

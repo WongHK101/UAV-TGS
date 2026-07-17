@@ -43,6 +43,7 @@ MODEL_FIELDS = {
 }
 UNCHANGED_MODEL_FIELDS = tuple(name for name in MODEL_FIELDS if name != "scaling")
 COPIED_MODEL_FILES = ("cfg_args", "cameras.json", "exposure.json")
+SCALE_PERCENTILES = (0, 1, 5, 25, 50, 75, 95, 99, 100)
 
 
 def _sha256(path: Path) -> str:
@@ -70,6 +71,52 @@ def _tensor_sha256(tensor: torch.Tensor) -> str:
     digest.update(b"\0")
     digest.update(array.tobytes(order="C"))
     return digest.hexdigest()
+
+
+def _percentile_summary(values: np.ndarray) -> dict[str, float]:
+    array = np.asarray(values, dtype=np.float64).reshape(-1)
+    if array.size == 0:
+        return {}
+    if not np.all(np.isfinite(array)):
+        raise SharedAnchorError("scale distribution contains NaN/Inf")
+    return {
+        f"p{percentile}": float(np.percentile(array, percentile))
+        for percentile in SCALE_PERCENTILES
+    }
+
+
+def _scale_distribution(
+    activated_scaling: torch.Tensor,
+    selected_indices: list[int] | None = None,
+) -> dict[str, Any]:
+    scales = activated_scaling.detach().cpu().numpy().astype(np.float64, copy=False)
+    if selected_indices is not None:
+        scales = scales[np.asarray(selected_indices, dtype=np.int64)]
+    if scales.ndim != 2 or scales.shape[1] != 3:
+        raise SharedAnchorError(
+            f"activated scaling must have shape (N, 3), got {scales.shape}"
+        )
+    if scales.shape[0] == 0:
+        return {"count": 0, "percentiles": {}}
+    if not np.all(np.isfinite(scales)) or np.any(scales <= 0):
+        raise SharedAnchorError("activated scaling distribution must be finite and positive")
+
+    maximum = np.max(scales, axis=1)
+    minimum = np.min(scales, axis=1)
+    geometric_mean = np.exp(np.mean(np.log(scales), axis=1))
+    return {
+        "count": int(scales.shape[0]),
+        "percentiles": {
+            "axis_0": _percentile_summary(scales[:, 0]),
+            "axis_1": _percentile_summary(scales[:, 1]),
+            "axis_2": _percentile_summary(scales[:, 2]),
+            "per_gaussian_max": _percentile_summary(maximum),
+            "per_gaussian_min": _percentile_summary(minimum),
+            "anisotropy_max_over_min": _percentile_summary(maximum / minimum),
+            "geometric_mean": _percentile_summary(geometric_mean),
+            "volume_proxy": _percentile_summary(np.prod(scales, axis=1)),
+        },
+    }
 
 
 def _array_sha256(array: np.ndarray) -> str:
@@ -536,6 +583,14 @@ def build_shared_anchor(args: argparse.Namespace) -> dict[str, Any]:
             "scale_summary": {
                 "before_global_max": before_smax,
                 "after_global_max": after_smax,
+                "all_gaussians_before": _scale_distribution(before_activated),
+                "all_gaussians_after": _scale_distribution(after_activated),
+                "clamped_rows_before": _scale_distribution(
+                    before_activated, selected_indices
+                ),
+                "clamped_rows_after": _scale_distribution(
+                    after_activated, selected_indices
+                ),
             },
             "clamped_indices": selected_indices,
             "clamped_indices_sha256": _canonical_json_sha256(selected_indices),
