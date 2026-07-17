@@ -10,8 +10,11 @@ deviations) and raw quaternions in the repository's ``(w, x, y, z)`` order.
 
 from __future__ import annotations
 
+import ast
 import hashlib
+import inspect
 import json
+import textwrap
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
 
@@ -20,6 +23,29 @@ import torch
 
 
 OGS_CACHE_SCHEMA_VERSION = "ogs_v1_anchor_cache_v1"
+OGS_V1_FORMULA_CONTRACT_SCHEMA = "uav-tgs-ogs-v1-formula-contract-v1"
+OGS_V1_MIN_VISIBLE_VIEWS = 8
+OGS_V1_MIN_ACTIVATED_OPACITY = 0.01
+OGS_V1_RHO = 3.0
+OGS_V1_LOSS_EPS = 1e-8
+OGS_V1_VARIANCE_EPS = 1e-16
+OGS_V1_RECALIBRATED_LAMBDA_MODE = (
+    "train_only_gradient_probe_recalibrated_1_1"
+)
+OGS_V1_INITIAL_LAMBDA_MODE = "initial_1e-3"
+OGS_V1_RECALIBRATION = {
+    "calibration_source": "train_only_gradient_probe",
+    "previous_unweighted_lr_scaled_ratio_median": 0.01832437506695896,
+    "target_lower_ratio": 0.02,
+    "derived_lambda": 1.0914424053708873,
+    "deployed_lambda": 1.1,
+}
+# This is intentionally a literal pin rather than a value computed at import.
+# ``verify_ogs_v1_formula_hash`` recomputes the versioned semantic contract and
+# normalized implementation AST, then fails closed if either drifts.
+OGS_V1_FORMULA_SHA256 = (
+    "110c632eb36d19a1a76882ff4c91f50f90825ff01a85fb75685396603be344e2"
+)
 _CACHE_TENSOR_KEYS = (
     "observability",
     "weakest_direction",
@@ -27,6 +53,100 @@ _CACHE_TENSOR_KEYS = (
     "eligible_mask",
     "visible_count",
 )
+
+
+def ogs_v1_formula_contract() -> Dict[str, Any]:
+    """Return the versioned semantic contract hashed by the OGS-v1 pilot.
+
+    Expressions are deliberately explicit rather than prose summaries.  The
+    hash additionally covers normalized AST for the implementation functions
+    listed in ``_ogs_v1_formula_implementation`` below.
+    """
+
+    return {
+        "schema": OGS_V1_FORMULA_CONTRACT_SCHEMA,
+        "observability": {
+            "visibility": "projected_radii_strict_gt_0",
+            "bearing": "unit(camera_center-gaussian_xyz)",
+            "moment_accumulation_dtype": "float64",
+            "M": "mean(v*v^T)",
+            "H": "I-M",
+            "symmetrize_M_and_H": True,
+            "weakest_direction": "eigenvector_of_lambda_min(H)",
+            "normalized_observability": (
+                "clip(3*lambda_min(H)/(trace(H)+eps),0,1)"
+            ),
+        },
+        "eligibility": {
+            "fixed_at_anchor": True,
+            "minimum_projected_visible_views_inclusive": (
+                OGS_V1_MIN_VISIBLE_VIEWS
+            ),
+            "minimum_activated_opacity_strict_gt": (
+                OGS_V1_MIN_ACTIVATED_OPACITY
+            ),
+        },
+        "anchor_thickness": {
+            "t_parallel0_squared": "n^T*Sigma0*n",
+            "t_perp0_squared": (
+                "max((trace(Sigma0)-t_parallel0_squared)/2,variance_eps)"
+            ),
+            "detached": ["observability", "weakest_direction", "t_perp0"],
+        },
+        "dynamic_thickness": {
+            "Sigma": "R*diag(activated_scale^2)*R^T",
+            "t_parallel": "sqrt(max(n^T*Sigma*n,variance_eps))",
+            "dynamic_fields": ["scaling", "rotation"],
+        },
+        "loss": {
+            "rho": OGS_V1_RHO,
+            "eps": OGS_V1_LOSS_EPS,
+            "penalty": (
+                "relu(log(t_parallel+eps)-log(rho*t_perp0+eps))^2"
+            ),
+            "risk": "(1-observability)^2*penalty",
+            "reduction": "sum(eligible*risk)/fixed_eligible_count",
+            "zero_eligible": "fail_closed",
+            "gradient_scope": ["scaling", "rotation"],
+        },
+        "topology": {
+            "fixed": True,
+            "densification": False,
+            "pruning": False,
+        },
+        "numeric": {
+            "loss_eps": OGS_V1_LOSS_EPS,
+            "variance_eps": OGS_V1_VARIANCE_EPS,
+        },
+    }
+
+
+def build_ogs_eligibility_mask(
+    visible_count: torch.Tensor,
+    activated_opacity: torch.Tensor,
+    min_visible_views: int = OGS_V1_MIN_VISIBLE_VIEWS,
+    min_activated_opacity: float = OGS_V1_MIN_ACTIVATED_OPACITY,
+) -> torch.Tensor:
+    """Return the fixed anchor-side OGS-v1 eligibility mask."""
+
+    if visible_count.ndim != 1:
+        raise ValueError("visible_count must have shape (N,)")
+    opacity = activated_opacity.reshape(-1)
+    if opacity.shape != visible_count.shape:
+        raise ValueError("activated_opacity and visible_count must have the same length")
+    if min_visible_views != OGS_V1_MIN_VISIBLE_VIEWS:
+        raise ValueError(
+            "OGS-v1 pins minimum visible views to "
+            f"{OGS_V1_MIN_VISIBLE_VIEWS}"
+        )
+    if float(min_activated_opacity) != OGS_V1_MIN_ACTIVATED_OPACITY:
+        raise ValueError(
+            "OGS-v1 pins the strict opacity threshold to "
+            f"{OGS_V1_MIN_ACTIVATED_OPACITY}"
+        )
+    return (
+        visible_count >= OGS_V1_MIN_VISIBLE_VIEWS
+    ) & (opacity.to(device=visible_count.device) > OGS_V1_MIN_ACTIVATED_OPACITY)
 
 
 def _require_shape(tensor: torch.Tensor, shape_tail: Tuple[int, ...], name: str) -> None:
@@ -302,9 +422,9 @@ def build_ogs_cache(
     anchor_scales: torch.Tensor,
     anchor_rotations: torch.Tensor,
     metadata: Optional[Mapping[str, Any]] = None,
-    min_visible_views: int = 8,
-    min_activated_opacity: float = 0.01,
-    eps: float = 1e-16,
+    min_visible_views: int = OGS_V1_MIN_VISIBLE_VIEWS,
+    min_activated_opacity: float = OGS_V1_MIN_ACTIVATED_OPACITY,
+    eps: float = OGS_V1_VARIANCE_EPS,
 ) -> Dict[str, Any]:
     """Build the detached, compact float32 cache used during OGS training."""
 
@@ -326,9 +446,6 @@ def build_ogs_cache(
     )
     if any(length != gaussian_count for length in lengths):
         raise ValueError("all anchor tensors must have the same Gaussian count")
-    if min_visible_views < 1:
-        raise ValueError("min_visible_views must be positive")
-
     cache_device = anchor_scales.device
     cache_dtype = anchor_scales.dtype
     directions = weakest_direction.to(device=cache_device, dtype=cache_dtype).detach()
@@ -344,9 +461,12 @@ def build_ogs_cache(
         directions,
         variance_eps=eps,
     )
-    eligible_mask = (
-        visible_count.to(device=cache_device) >= min_visible_views
-    ) & (opacity.to(device=cache_device) > min_activated_opacity)
+    eligible_mask = build_ogs_eligibility_mask(
+        visible_count.to(device=cache_device),
+        opacity.to(device=cache_device),
+        min_visible_views=min_visible_views,
+        min_activated_opacity=min_activated_opacity,
+    )
     cache: Dict[str, Any] = {
         "schema_version": OGS_CACHE_SCHEMA_VERSION,
         "gaussian_count": gaussian_count,
@@ -447,8 +567,11 @@ def validate_ogs_cache(
         raise ValueError("perpendicular_thickness must be finite and positive")
     if bool((counts < 0).any()):
         raise ValueError("visible_count cannot be negative")
-    if bool((eligible & (counts < 8)).any()):
-        raise ValueError("eligible_mask contains a Gaussian with fewer than 8 views")
+    if bool((eligible & (counts < OGS_V1_MIN_VISIBLE_VIEWS)).any()):
+        raise ValueError(
+            "eligible_mask contains a Gaussian with fewer than "
+            f"{OGS_V1_MIN_VISIBLE_VIEWS} views"
+        )
 
     metadata = cache.get("metadata")
     if not isinstance(metadata, Mapping):
@@ -503,16 +626,18 @@ def ogs_v1_loss(
     scales: torch.Tensor,
     rotations: torch.Tensor,
     cache: Mapping[str, Any],
-    rho: float = 3.0,
-    eps: float = 1e-8,
+    rho: float = OGS_V1_RHO,
+    eps: float = OGS_V1_LOSS_EPS,
 ) -> Dict[str, Any]:
     """Evaluate the fixed-anchor OGS-v1 loss and diagnostics.
 
     The denominator is the fixed eligible count, never the current active count.
     """
 
-    if rho <= 0 or eps <= 0:
-        raise ValueError("rho and eps must be positive")
+    if float(rho) != OGS_V1_RHO:
+        raise ValueError(f"OGS-v1 pins rho to {OGS_V1_RHO}")
+    if float(eps) != OGS_V1_LOSS_EPS:
+        raise ValueError(f"OGS-v1 pins loss eps to {OGS_V1_LOSS_EPS}")
     gaussian_count = scales.shape[0]
     if int(cache.get("gaussian_count", -1)) != gaussian_count:
         raise ValueError("OGS cache and current Gaussian count differ")
@@ -559,6 +684,95 @@ def ogs_v1_loss(
         "risk": risk,
         "active_mask": active,
     }
+
+
+def _normalized_ast_payload(value: Any) -> Any:
+    """Return a Python-version-stable representation of an AST value."""
+
+    if isinstance(value, ast.AST):
+        ignored_fields = {"type_comment", "type_ignores", "type_params"}
+        return {
+            "node": value.__class__.__name__,
+            "fields": {
+                name: _normalized_ast_payload(field_value)
+                for name, field_value in ast.iter_fields(value)
+                if name not in ignored_fields
+            },
+        }
+    if isinstance(value, list):
+        return [_normalized_ast_payload(item) for item in value]
+    return value
+
+
+def _normalized_function_ast(function: Any) -> Any:
+    source = textwrap.dedent(inspect.getsource(function))
+    tree = ast.parse(source)
+    return _normalized_ast_payload(tree)
+
+
+def _ogs_v1_formula_implementation() -> Dict[str, Any]:
+    """Return normalized AST for every implementation component in the pin."""
+
+    functions = (
+        quaternion_to_rotation,
+        covariance_thickness,
+        compute_observability_from_moments,
+        build_ogs_eligibility_mask,
+        ogs_v1_loss,
+    )
+    return {
+        function.__name__: _normalized_function_ast(function)
+        for function in functions
+    }
+
+
+def compute_ogs_v1_formula_hash() -> str:
+    """Hash the semantic contract plus normalized formula implementation AST."""
+
+    payload = {
+        "contract": ogs_v1_formula_contract(),
+        "implementation_ast": _ogs_v1_formula_implementation(),
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def verify_ogs_v1_formula_hash(expected_sha256: Optional[str] = None) -> str:
+    """Fail closed on semantic/implementation drift or an external hash mismatch."""
+
+    actual = compute_ogs_v1_formula_hash()
+    if actual != OGS_V1_FORMULA_SHA256:
+        raise RuntimeError(
+            "OGS-v1 formula implementation drifted from the repository pin: "
+            f"pinned={OGS_V1_FORMULA_SHA256} actual={actual}"
+        )
+    if expected_sha256 is not None:
+        expected = str(expected_sha256).strip().lower()
+        if expected != actual:
+            raise RuntimeError(
+                "OGS-v1 formula SHA-256 mismatch: "
+                f"expected={expected} actual={actual}"
+            )
+    return actual
+
+
+def ogs_v1_recalibration_manifest() -> Dict[str, Any]:
+    """Return an isolated copy of the approved train-only calibration record."""
+
+    calibration = dict(OGS_V1_RECALIBRATION)
+    derived = (
+        calibration["target_lower_ratio"]
+        / calibration["previous_unweighted_lr_scaled_ratio_median"]
+    )
+    if abs(float(derived) - float(calibration["derived_lambda"])) > 1e-15:
+        raise RuntimeError("OGS-v1 recalibration derivation no longer matches its pin")
+    return calibration
 
 
 def _percentiles(values: torch.Tensor, points: Sequence[float]) -> Dict[str, float]:

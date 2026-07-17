@@ -7,14 +7,22 @@ import numpy as np
 import torch
 
 from utils.ogs_v1 import (
+    OGS_V1_FORMULA_SHA256,
+    OGS_V1_RECALIBRATED_LAMBDA_MODE,
+    OGS_V1_RECALIBRATION,
+    build_ogs_eligibility_mask,
     build_ogs_cache,
+    compute_ogs_v1_formula_hash,
     compute_observability_from_moments,
     covariance_thickness,
     load_ogs_cache,
     match_scale_controls,
     moments_from_bearings,
     ogs_v1_loss,
+    ogs_v1_formula_contract,
+    ogs_v1_recalibration_manifest,
     save_ogs_cache,
+    verify_ogs_v1_formula_hash,
 )
 
 
@@ -179,6 +187,75 @@ class OgsLossTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "zero fixed eligible"):
             ogs_v1_loss(scales, rotations, cache)
+
+    def test_eligibility_thresholds_are_protocol_pins(self):
+        counts = torch.tensor([7, 8, 9], dtype=torch.int64)
+        opacity = torch.tensor([0.5, 0.01, 0.010001])
+        mask = build_ogs_eligibility_mask(counts, opacity)
+        torch.testing.assert_close(
+            mask, torch.tensor([False, False, True]), rtol=0, atol=0
+        )
+        with self.assertRaisesRegex(ValueError, "minimum visible views"):
+            build_ogs_eligibility_mask(
+                counts, opacity, min_visible_views=7
+            )
+        with self.assertRaisesRegex(ValueError, "opacity threshold"):
+            build_ogs_eligibility_mask(
+                counts, opacity, min_activated_opacity=0.02
+            )
+
+
+class OgsFormulaProtocolTests(unittest.TestCase):
+    def test_formula_hash_matches_repository_pin_and_external_binding(self):
+        actual = compute_ogs_v1_formula_hash()
+        self.assertEqual(actual, OGS_V1_FORMULA_SHA256)
+        self.assertEqual(verify_ogs_v1_formula_hash(actual), actual)
+        with self.assertRaisesRegex(RuntimeError, "formula SHA-256 mismatch"):
+            verify_ogs_v1_formula_hash("0" * 64)
+
+    def test_formula_contract_pins_eligibility_risk_and_reduction(self):
+        contract = ogs_v1_formula_contract()
+        self.assertEqual(
+            contract["eligibility"][
+                "minimum_projected_visible_views_inclusive"
+            ],
+            8,
+        )
+        self.assertEqual(
+            contract["eligibility"][
+                "minimum_activated_opacity_strict_gt"
+            ],
+            0.01,
+        )
+        self.assertEqual(
+            contract["loss"]["risk"],
+            "(1-observability)^2*penalty",
+        )
+        self.assertEqual(
+            contract["loss"]["reduction"],
+            "sum(eligible*risk)/fixed_eligible_count",
+        )
+
+    def test_recalibration_manifest_is_exact_and_isolated(self):
+        calibration = ogs_v1_recalibration_manifest()
+        self.assertEqual(
+            OGS_V1_RECALIBRATED_LAMBDA_MODE,
+            "train_only_gradient_probe_recalibrated_1_1",
+        )
+        self.assertEqual(
+            calibration,
+            {
+                "calibration_source": "train_only_gradient_probe",
+                "previous_unweighted_lr_scaled_ratio_median": (
+                    0.01832437506695896
+                ),
+                "target_lower_ratio": 0.02,
+                "derived_lambda": 1.0914424053708873,
+                "deployed_lambda": 1.1,
+            },
+        )
+        calibration["deployed_lambda"] = 99.0
+        self.assertEqual(OGS_V1_RECALIBRATION["deployed_lambda"], 1.1)
 
 
 class OgsCacheTests(unittest.TestCase):

@@ -28,6 +28,7 @@ import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
 from utils.camera_sequence import (
+    camera_parameters_hash,
     camera_lookup,
     load_sequence_manifest,
     ordered_camera_names,
@@ -280,6 +281,30 @@ def _file_sha256(path, chunk_size=8 * 1024 * 1024):
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _normalized_sha256(value, label):
+    normalized = str(value or "").strip().lower()
+    if len(normalized) != 64 or any(
+        character not in "0123456789abcdef" for character in normalized
+    ):
+        raise RuntimeError(f"{label} must be a lowercase 64-character SHA-256")
+    return normalized
+
+
+def _verified_sha256_binding(label, expected, actual):
+    expected_sha256 = _normalized_sha256(expected, f"expected {label} SHA-256")
+    actual_sha256 = _normalized_sha256(actual, f"actual {label} SHA-256")
+    if actual_sha256 != expected_sha256:
+        raise RuntimeError(
+            f"{label} SHA-256 mismatch: "
+            f"expected={expected_sha256} actual={actual_sha256}"
+        )
+    return {
+        "expected_sha256": expected_sha256,
+        "actual_sha256": actual_sha256,
+        "verified": True,
+    }
 
 
 def _snapshot_strict_freeze_fields(gaussians):
@@ -948,6 +973,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     fixed_camera_map = None
     continuation_checkpoint_sha256 = None
     continuation_train_list_sha256 = None
+    ogs_cache_file_sha256 = None
+    ogs_formula_sha256 = None
+    ogs_binding_verification = None
+    ogs_lambda_calibration = None
+    ogs_camera_parameters_sha256 = None
     if rgb_continuation:
         camera_names = ordered_camera_names(train_cameras)
         fixed_camera_manifest = load_sequence_manifest(
@@ -1008,7 +1038,123 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     ogs_cache = None
     if ogs_enabled:
-        from utils.ogs_v1 import load_ogs_cache
+        from utils.ogs_v1 import (
+            OGS_V1_FORMULA_SHA256,
+            OGS_V1_INITIAL_LAMBDA_MODE,
+            OGS_V1_LOSS_EPS,
+            OGS_V1_MIN_ACTIVATED_OPACITY,
+            OGS_V1_MIN_VISIBLE_VIEWS,
+            OGS_V1_RECALIBRATED_LAMBDA_MODE,
+            OGS_V1_RHO,
+            OGS_V1_VARIANCE_EPS,
+            compute_ogs_cache_hash,
+            load_ogs_cache,
+            ogs_v1_recalibration_manifest,
+            verify_ogs_v1_formula_hash,
+        )
+
+        lambda_protocol = str(
+            getattr(args, "ogs_v1_lambda_protocol", OGS_V1_INITIAL_LAMBDA_MODE)
+        )
+        if lambda_protocol not in (
+            OGS_V1_INITIAL_LAMBDA_MODE,
+            OGS_V1_RECALIBRATED_LAMBDA_MODE,
+        ):
+            raise RuntimeError(f"Unsupported OGS-v1 lambda protocol: {lambda_protocol}")
+
+        expected_formula_sha = (
+            _normalized_sha256(
+                getattr(args, "expected_ogs_formula_sha256", ""),
+                "expected OGS formula SHA-256",
+            )
+            if getattr(args, "expected_ogs_formula_sha256", "")
+            else OGS_V1_FORMULA_SHA256
+        )
+        ogs_formula_sha256 = verify_ogs_v1_formula_hash(expected_formula_sha)
+
+        expected_anchor_sha = (
+            _normalized_sha256(
+                getattr(args, "expected_ogs_anchor_sha256", ""),
+                "expected OGS anchor SHA-256",
+            )
+            if getattr(args, "expected_ogs_anchor_sha256", "")
+            else continuation_checkpoint_sha256
+        )
+        expected_camera_sha = (
+            _normalized_sha256(
+                getattr(args, "expected_ogs_camera_sha256", ""),
+                "expected OGS ordered-camera SHA-256",
+            )
+            if getattr(args, "expected_ogs_camera_sha256", "")
+            else fixed_camera_manifest["ordered_camera_sha256"]
+        )
+        ogs_camera_parameters_sha256 = camera_parameters_hash(train_cameras)
+        expected_camera_parameters_sha = (
+            _normalized_sha256(
+                getattr(args, "expected_ogs_camera_parameters_sha256", ""),
+                "expected OGS camera-parameters SHA-256",
+            )
+            if getattr(args, "expected_ogs_camera_parameters_sha256", "")
+            else ogs_camera_parameters_sha256
+        )
+        expected_sequence_sha = (
+            _normalized_sha256(
+                getattr(args, "expected_ogs_sequence_sha256", ""),
+                "expected OGS fixed-sequence SHA-256",
+            )
+            if getattr(args, "expected_ogs_sequence_sha256", "")
+            else fixed_camera_manifest["sequence_sha256"]
+        )
+        expected_sequence_manifest_sha = (
+            _normalized_sha256(
+                getattr(args, "expected_ogs_sequence_manifest_sha256", ""),
+                "expected OGS fixed-sequence manifest SHA-256",
+            )
+            if getattr(args, "expected_ogs_sequence_manifest_sha256", "")
+            else fixed_camera_manifest["manifest_sha256"]
+        )
+        anchor_binding = _verified_sha256_binding(
+            "OGS-v1 anchor",
+            expected_anchor_sha,
+            continuation_checkpoint_sha256,
+        )
+        ordered_camera_binding = _verified_sha256_binding(
+            "OGS-v1 ordered-camera",
+            expected_camera_sha,
+            fixed_camera_manifest["ordered_camera_sha256"],
+        )
+        camera_parameters_binding = _verified_sha256_binding(
+            "OGS-v1 camera-parameters",
+            expected_camera_parameters_sha,
+            ogs_camera_parameters_sha256,
+        )
+        sequence_binding = _verified_sha256_binding(
+            "OGS-v1 fixed-sequence",
+            expected_sequence_sha,
+            fixed_camera_manifest["sequence_sha256"],
+        )
+        sequence_manifest_binding = _verified_sha256_binding(
+            "OGS-v1 fixed-sequence manifest",
+            expected_sequence_manifest_sha,
+            fixed_camera_manifest["manifest_sha256"],
+        )
+
+        cache_path = str(getattr(args, "ogs_cache"))
+        ogs_cache_file_sha256 = _file_sha256(cache_path)
+        expected_cache_file_sha = (
+            _normalized_sha256(
+                getattr(args, "expected_ogs_cache_sha256", ""),
+                "expected OGS cache file SHA-256",
+            )
+            if getattr(args, "expected_ogs_cache_sha256", "")
+            else ogs_cache_file_sha256
+        )
+        if ogs_cache_file_sha256 != expected_cache_file_sha:
+            raise RuntimeError(
+                "OGS-v1 cache file SHA-256 mismatch: "
+                f"expected={expected_cache_file_sha} "
+                f"actual={ogs_cache_file_sha256}"
+            )
 
         expected_cache_metadata = {
             "scene_name": sequence_metadata.get("scene"),
@@ -1017,6 +1163,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             "ordered_train_camera_names_sha256": fixed_camera_manifest[
                 "ordered_camera_sha256"
             ],
+            "camera_parameters_sha256": expected_camera_parameters_sha,
         }
         missing_expected = [
             key for key, value in expected_cache_metadata.items() if not value
@@ -1027,11 +1174,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 + ", ".join(missing_expected)
             )
         ogs_cache = load_ogs_cache(
-            getattr(args, "ogs_cache"),
+            cache_path,
             device=gaussians.get_xyz.device,
             expected_gaussian_count=int(gaussians.get_xyz.shape[0]),
             expected_metadata=expected_cache_metadata,
         )
+        cache_semantic_declared_sha = ogs_cache["cache_sha256"]
+        cache_semantic_actual_sha = compute_ogs_cache_hash(ogs_cache)
+        if cache_semantic_actual_sha != cache_semantic_declared_sha:
+            raise RuntimeError(
+                "OGS-v1 cache semantic SHA-256 mismatch after device load: "
+                f"declared={cache_semantic_declared_sha} "
+                f"actual={cache_semantic_actual_sha}"
+            )
         current_raw_hashes = {
             "xyz": _ogs_anchor_tensor_sha256(gaussians._xyz),
             "scaling": _ogs_anchor_tensor_sha256(gaussians._scaling),
@@ -1049,6 +1204,84 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             )
         if int(ogs_cache["eligible_mask"].sum().item()) <= 0:
             raise RuntimeError("OGS-v1 cache has zero eligible Gaussians")
+        cache_metadata = ogs_cache.get("metadata", {})
+        formula_metadata_checks = {
+            "rho": cache_metadata.get("rho") == OGS_V1_RHO,
+            "eps": cache_metadata.get("eps") == OGS_V1_LOSS_EPS,
+            "variance_eps": (
+                cache_metadata.get("variance_eps") == OGS_V1_VARIANCE_EPS
+            ),
+            "renderer_visibility": (
+                cache_metadata.get("renderer_visibility") == "radii>0"
+            ),
+            "minimum_visible_views": (
+                cache_metadata.get("eligibility", {}).get(
+                    "minimum_visible_views"
+                )
+                == OGS_V1_MIN_VISIBLE_VIEWS
+            ),
+            "minimum_activated_opacity_strict_gt": (
+                cache_metadata.get("eligibility", {}).get(
+                    "minimum_activated_opacity_strict_gt"
+                )
+                == OGS_V1_MIN_ACTIVATED_OPACITY
+            ),
+        }
+        if not all(formula_metadata_checks.values()):
+            failed = [
+                key for key, passed in formula_metadata_checks.items() if not passed
+            ]
+            raise RuntimeError(
+                "OGS-v1 cache metadata is incompatible with the pinned formula: "
+                + ", ".join(failed)
+            )
+        cache_formula_sha = cache_metadata.get("ogs_v1_formula_sha256")
+        if cache_formula_sha is not None and cache_formula_sha != ogs_formula_sha256:
+            raise RuntimeError(
+                "OGS-v1 cache formula SHA-256 mismatch: "
+                f"cache={cache_formula_sha} current={ogs_formula_sha256}"
+            )
+        if lambda_protocol == OGS_V1_RECALIBRATED_LAMBDA_MODE:
+            ogs_lambda_calibration = ogs_v1_recalibration_manifest()
+
+        ogs_binding_verification = {
+            "status": "passed",
+            "anchor_checkpoint": anchor_binding,
+            "ordered_camera_set": ordered_camera_binding,
+            "camera_parameters": {
+                **camera_parameters_binding,
+                "cache_sha256": cache_metadata[
+                    "camera_parameters_sha256"
+                ],
+                "cache_verified": (
+                    cache_metadata["camera_parameters_sha256"]
+                    == camera_parameters_binding["actual_sha256"]
+                ),
+            },
+            "fixed_5000_camera_sequence": {
+                "sequence": sequence_binding,
+                "manifest": sequence_manifest_binding,
+                "internal_manifest_integrity_verified": True,
+            },
+            "cache_file": {
+                "expected_sha256": expected_cache_file_sha,
+                "actual_sha256": ogs_cache_file_sha256,
+                "verified": True,
+            },
+            "cache_semantic": {
+                "expected_sha256": cache_semantic_declared_sha,
+                "actual_sha256": cache_semantic_actual_sha,
+                "verified": True,
+            },
+            "formula": {
+                "expected_sha256": expected_formula_sha,
+                "actual_sha256": ogs_formula_sha256,
+                "repository_pin_sha256": OGS_V1_FORMULA_SHA256,
+                "cache_declared_sha256": cache_formula_sha,
+                "cache_metadata_contract_verified": formula_metadata_checks,
+                "verified": True,
+            },
+        }
         print(
             "[INFO] OGSV1Cache: "
             f"eligible={int(ogs_cache['eligible_mask'].sum().item())} "
@@ -1119,6 +1352,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             "ogs_cache_sha256": (
                 ogs_cache.get("cache_sha256") if ogs_enabled else None
             ),
+            "ogs_cache_file_sha256": ogs_cache_file_sha256,
+            "ogs_v1_lambda_protocol": str(
+                getattr(args, "ogs_v1_lambda_protocol", "initial_1e-3")
+            ),
+            "ogs_lambda_calibration": ogs_lambda_calibration,
+            "ogs_v1_formula_sha256": ogs_formula_sha256,
+            "ogs_v1_verified_bindings": ogs_binding_verification,
         }
         protocol_path = os.path.join(scene.model_path, "rgb_continuation_protocol.json")
         temporary_path = protocol_path + f".tmp-{os.getpid()}"
@@ -1746,6 +1986,29 @@ if __name__ == "__main__":
     parser.add_argument("--ogs_v1", action="store_true", default=False)
     parser.add_argument("--ogs_cache", type=str, default="")
     parser.add_argument("--lambda_ogs", type=float, default=1e-3)
+    parser.add_argument(
+        "--ogs_v1_lambda_protocol",
+        choices=[
+            "initial_1e-3",
+            "train_only_gradient_probe_recalibrated_1_1",
+        ],
+        default="initial_1e-3",
+        help=(
+            "Explicit OGS-v1 lambda provenance. The recalibrated mode pins "
+            "lambda=1.1 and requires all expected hash bindings."
+        ),
+    )
+    parser.add_argument("--expected_ogs_cache_sha256", type=str, default="")
+    parser.add_argument("--expected_ogs_anchor_sha256", type=str, default="")
+    parser.add_argument("--expected_ogs_camera_sha256", type=str, default="")
+    parser.add_argument(
+        "--expected_ogs_camera_parameters_sha256", type=str, default=""
+    )
+    parser.add_argument("--expected_ogs_sequence_sha256", type=str, default="")
+    parser.add_argument(
+        "--expected_ogs_sequence_manifest_sha256", type=str, default=""
+    )
+    parser.add_argument("--expected_ogs_formula_sha256", type=str, default="")
     parser.add_argument("--ogs_rho", type=float, default=3.0)
     parser.add_argument("--ogs_gradient_smoke_steps", type=int, default=200)
     parser.add_argument("--ogs_gradient_log", type=str, default="")
@@ -1916,8 +2179,44 @@ if __name__ == "__main__":
         if args.ogs_v1:
             if not args.ogs_cache:
                 parser.error("--ogs_v1 requires --ogs_cache")
-            if args.lambda_ogs != 1e-3:
-                parser.error("OGS-v1 pilot pins --lambda_ogs to 1e-3")
+            if args.ogs_v1_lambda_protocol == "initial_1e-3":
+                if args.lambda_ogs != 1e-3:
+                    parser.error(
+                        "Initial OGS-v1 pilot pins --lambda_ogs to 1e-3"
+                    )
+            elif (
+                args.ogs_v1_lambda_protocol
+                == "train_only_gradient_probe_recalibrated_1_1"
+            ):
+                if args.lambda_ogs != 1.1:
+                    parser.error(
+                        "Recalibrated OGS-v1 pilot pins --lambda_ogs to 1.1"
+                    )
+                required_hashes = {
+                    "--expected_ogs_cache_sha256": args.expected_ogs_cache_sha256,
+                    "--expected_ogs_anchor_sha256": args.expected_ogs_anchor_sha256,
+                    "--expected_ogs_camera_sha256": args.expected_ogs_camera_sha256,
+                    "--expected_ogs_camera_parameters_sha256": (
+                        args.expected_ogs_camera_parameters_sha256
+                    ),
+                    "--expected_ogs_sequence_sha256": (
+                        args.expected_ogs_sequence_sha256
+                    ),
+                    "--expected_ogs_sequence_manifest_sha256": (
+                        args.expected_ogs_sequence_manifest_sha256
+                    ),
+                    "--expected_ogs_formula_sha256": args.expected_ogs_formula_sha256,
+                }
+                missing_hashes = [
+                    option
+                    for option, value in required_hashes.items()
+                    if not str(value).strip()
+                ]
+                if missing_hashes:
+                    parser.error(
+                        "Recalibrated OGS-v1 requires explicit hash bindings: "
+                        + ", ".join(missing_hashes)
+                    )
             if args.ogs_rho != 3.0:
                 parser.error("OGS-v1 pilot pins --ogs_rho to 3")
             if args.ogs_gradient_smoke_steps != 200:
@@ -1925,6 +2224,14 @@ if __name__ == "__main__":
         elif (
             _option_was_set("--ogs_cache")
             or _option_was_set("--lambda_ogs")
+            or _option_was_set("--ogs_v1_lambda_protocol")
+            or _option_was_set("--expected_ogs_cache_sha256")
+            or _option_was_set("--expected_ogs_anchor_sha256")
+            or _option_was_set("--expected_ogs_camera_sha256")
+            or _option_was_set("--expected_ogs_camera_parameters_sha256")
+            or _option_was_set("--expected_ogs_sequence_sha256")
+            or _option_was_set("--expected_ogs_sequence_manifest_sha256")
+            or _option_was_set("--expected_ogs_formula_sha256")
             or _option_was_set("--ogs_rho")
             or _option_was_set("--ogs_gradient_smoke_steps")
             or _option_was_set("--ogs_gradient_log")
@@ -1937,6 +2244,13 @@ if __name__ == "__main__":
             or _option_was_set("--rgb_continuation_anchor_iteration")
             or _option_was_set("--rgb_continuation_scheduler_horizon")
             or _option_was_set("--rgb_continuation_updates")
+            or _option_was_set("--expected_ogs_cache_sha256")
+            or _option_was_set("--expected_ogs_anchor_sha256")
+            or _option_was_set("--expected_ogs_camera_sha256")
+            or _option_was_set("--expected_ogs_camera_parameters_sha256")
+            or _option_was_set("--expected_ogs_sequence_sha256")
+            or _option_was_set("--expected_ogs_sequence_manifest_sha256")
+            or _option_was_set("--expected_ogs_formula_sha256")
         )
         if continuation_only:
             parser.error(
@@ -2112,6 +2426,7 @@ if __name__ == "__main__":
             "fixed_camera_sequence": str(args.fixed_camera_sequence),
             "ogs_v1": bool(args.ogs_v1),
             "lambda_ogs": float(args.lambda_ogs),
+            "ogs_v1_lambda_protocol": str(args.ogs_v1_lambda_protocol),
         },
     )
     efficiency_probe.start()

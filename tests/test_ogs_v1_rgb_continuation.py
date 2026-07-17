@@ -6,11 +6,13 @@ import random
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
 from utils.camera_sequence import (
     build_sequence_manifest,
+    camera_parameters_hash,
     load_sequence_manifest,
     save_sequence_manifest,
 )
@@ -27,6 +29,8 @@ def _load_train_helpers():
         "_validate_rgb_continuation_checkpoint",
         "_should_optimizer_step",
         "_validate_rgb_continuation_schedule",
+        "_normalized_sha256",
+        "_verified_sha256_binding",
     }
     nodes = []
     for node in tree.body:
@@ -45,6 +49,38 @@ def _load_train_helpers():
 
 
 class FixedCameraSequenceTests(unittest.TestCase):
+    @staticmethod
+    def _camera(name="a", translation=(0.0, 0.0, 0.0)):
+        return SimpleNamespace(
+            image_name=name,
+            uid=1,
+            colmap_id=7,
+            R=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+            T=translation,
+            FoVx=0.8,
+            FoVy=0.7,
+            image_width=1280,
+            image_height=1024,
+        )
+
+    def test_camera_parameter_hash_binds_pose_and_order(self):
+        baseline = camera_parameters_hash(
+            [self._camera("a"), self._camera("b", (1.0, 0.0, 0.0))]
+        )
+        self.assertEqual(len(baseline), 64)
+        self.assertNotEqual(
+            baseline,
+            camera_parameters_hash(
+                [self._camera("a"), self._camera("b", (1.001, 0.0, 0.0))]
+            ),
+        )
+        self.assertNotEqual(
+            baseline,
+            camera_parameters_hash(
+                [self._camera("b", (1.0, 0.0, 0.0)), self._camera("a")]
+            ),
+        )
+
     def test_private_rng_random_pop_is_reproducible_and_global_rng_untouched(self):
         names = ["a", "b", "c"]
         random.seed(91)
@@ -133,6 +169,31 @@ class RGBContinuationContractTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "six-group"):
             validate(tuple(malformed), 30000, 30000)
 
+    def test_external_hash_binding_helper_fails_on_every_mismatch(self):
+        verify = self.helpers["_verified_sha256_binding"]
+        expected = "a" * 64
+        self.assertEqual(
+            verify("OGS-v1 camera-parameters", expected, expected),
+            {
+                "expected_sha256": expected,
+                "actual_sha256": expected,
+                "verified": True,
+            },
+        )
+        for label in (
+            "OGS-v1 anchor",
+            "OGS-v1 ordered-camera",
+            "OGS-v1 camera-parameters",
+            "OGS-v1 fixed-sequence",
+            "OGS-v1 fixed-sequence manifest",
+            "OGS-v1 cache file",
+        ):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(RuntimeError, "SHA-256 mismatch"):
+                    verify(label, expected, "b" * 64)
+        with self.assertRaisesRegex(RuntimeError, "64-character SHA-256"):
+            verify("OGS-v1 formula", "not-a-sha", expected)
+
     def test_new_protocol_is_opt_in_and_legacy_defaults_remain(self):
         tree = ast.parse(TRAIN_PATH.read_text(encoding="utf-8"))
         defaults = {}
@@ -150,20 +211,63 @@ class RGBContinuationContractTests(unittest.TestCase):
                 if option in {
                     "--rgb_continuation_recipe",
                     "--optimizer_step_at_final_iteration",
+                    "--lambda_ogs",
+                    "--ogs_v1_lambda_protocol",
                 }:
-                    defaults[option] = {
+                    keywords = {
                         item.arg: ast.literal_eval(item.value)
                         for item in node.keywords
-                        if item.arg == "default"
-                    }["default"]
-        self.assertEqual(defaults["--rgb_continuation_recipe"], "legacy")
-        self.assertFalse(defaults["--optimizer_step_at_final_iteration"])
+                        if item.arg in {"default", "choices"}
+                    }
+                    defaults[option] = keywords
+        self.assertEqual(
+            defaults["--rgb_continuation_recipe"]["default"], "legacy"
+        )
+        self.assertFalse(
+            defaults["--optimizer_step_at_final_iteration"]["default"]
+        )
+        self.assertEqual(defaults["--lambda_ogs"]["default"], 1e-3)
+        self.assertEqual(
+            defaults["--ogs_v1_lambda_protocol"]["default"], "initial_1e-3"
+        )
+        self.assertIn(
+            "train_only_gradient_probe_recalibrated_1_1",
+            defaults["--ogs_v1_lambda_protocol"]["choices"],
+        )
 
         source = TRAIN_PATH.read_text(encoding="utf-8")
         self.assertIn("if fixed_camera_sequence is not None:", source)
         self.assertIn("rand_idx = randint(0, len(viewpoint_indices) - 1)", source)
         self.assertIn('args.artifact_save_semantics = "aligned"', source)
         self.assertIn("and not rgb_continuation", source)
+
+    def test_recalibrated_mode_is_one_shot_and_manifest_binds_all_hash_classes(self):
+        source = TRAIN_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            'args.lambda_ogs != 1.1',
+            source,
+        )
+        for option in (
+            "--expected_ogs_cache_sha256",
+            "--expected_ogs_anchor_sha256",
+            "--expected_ogs_camera_sha256",
+            "--expected_ogs_camera_parameters_sha256",
+            "--expected_ogs_sequence_sha256",
+            "--expected_ogs_sequence_manifest_sha256",
+            "--expected_ogs_formula_sha256",
+        ):
+            self.assertIn(option, source)
+        for manifest_key in (
+            '"anchor_checkpoint"',
+            '"ordered_camera_set"',
+            '"fixed_5000_camera_sequence"',
+            '"cache_file"',
+            '"cache_semantic"',
+            '"formula"',
+            '"ogs_lambda_calibration"',
+            '"ogs_v1_verified_bindings"',
+        ):
+            self.assertIn(manifest_key, source)
 
 
 if __name__ == "__main__":

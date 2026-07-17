@@ -30,6 +30,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from utils.camera_sequence import camera_parameters_hash
+
 
 AUDIT_SCHEMA = "uav-tgs-ogs-v1-anchor-audit-v1"
 CACHE_SCHEMA = "ogs_v1_anchor_cache_v1"
@@ -383,25 +385,6 @@ def evaluate_complete_non_support(
     }
 
 
-def _ordered_camera_payload(cameras: Sequence[Any]) -> list[dict[str, Any]]:
-    rows = []
-    for camera in cameras:
-        rows.append(
-            {
-                "image_name": str(camera.image_name),
-                "uid": int(camera.uid),
-                "colmap_id": int(camera.colmap_id),
-                "R": np.asarray(camera.R, dtype=np.float64).tolist(),
-                "T": np.asarray(camera.T, dtype=np.float64).tolist(),
-                "FoVx": float(camera.FoVx),
-                "FoVy": float(camera.FoVy),
-                "image_width": int(camera.image_width),
-                "image_height": int(camera.image_height),
-            }
-        )
-    return rows
-
-
 def ordered_names_sha256(names: Sequence[str]) -> str:
     # Same canonical JSON definition used by utils.camera_sequence.
     return canonical_json_sha256(list(names))
@@ -527,12 +510,20 @@ def _run_gpu_audit(args: argparse.Namespace) -> dict[str, Any]:
     from scene import Scene
     from scene.gaussian_model import GaussianModel
     from utils.ogs_v1 import (
+        OGS_V1_FORMULA_SHA256,
+        OGS_V1_LOSS_EPS,
+        OGS_V1_MIN_ACTIVATED_OPACITY,
+        OGS_V1_MIN_VISIBLE_VIEWS,
+        OGS_V1_RHO,
+        OGS_V1_VARIANCE_EPS,
         accumulate_camera_bearings,
+        build_ogs_eligibility_mask,
         build_ogs_cache,
         compute_observability_from_moments,
         covariance_thickness,
         initialize_bearing_moment_accumulators,
         save_ogs_cache,
+        verify_ogs_v1_formula_hash,
     )
 
     if not torch.cuda.is_available():
@@ -682,8 +673,7 @@ def _run_gpu_audit(args: argparse.Namespace) -> dict[str, Any]:
         )
         gaussians.active_sh_degree = active_sh_degree
 
-    camera_payload = _ordered_camera_payload(cameras)
-    camera_parameters_sha = canonical_json_sha256(camera_payload)
+    camera_parameters_sha = camera_parameters_hash(cameras)
     ordered_camera_names_sha = ordered_names_sha256(ordered_camera_names)
 
     background = torch.tensor(
@@ -755,8 +745,9 @@ def _run_gpu_audit(args: argparse.Namespace) -> dict[str, Any]:
             f"max_H={float(max_trace_h_residual.item())}"
         )
 
+    formula_sha256 = verify_ogs_v1_formula_hash(OGS_V1_FORMULA_SHA256)
     activated_opacity = torch.sigmoid(checkpoint_raw["opacity"].cuda()).squeeze(1)
-    eligible = (visible_count >= 8) & (activated_opacity > 0.01)
+    eligible = build_ogs_eligibility_mask(visible_count, activated_opacity)
     eligible_count = int(eligible.sum().item())
     if eligible_count == 0:
         raise OgsAuditError("OGS eligible set is empty; refusing to write a cache")
@@ -769,18 +760,18 @@ def _run_gpu_audit(args: argparse.Namespace) -> dict[str, Any]:
         anchor_scales,
         anchor_rotations,
         weakest_direction.to(dtype=torch.float64),
-        variance_eps=VARIANCE_EPS,
+        variance_eps=OGS_V1_VARIANCE_EPS,
     )
     parallel = thickness["parallel"]
     perpendicular = thickness["perpendicular"]
     q_anchor = parallel / (perpendicular + EPS)
     covariance_trace = thickness["trace"]
     log_penalty = torch.relu(
-        torch.log(parallel + EPS)
-        - torch.log(RHO * perpendicular + EPS)
+        torch.log(parallel + OGS_V1_LOSS_EPS)
+        - torch.log(OGS_V1_RHO * perpendicular + OGS_V1_LOSS_EPS)
     ).square()
     risk = (1.0 - observability).square() * log_penalty
-    active = eligible & (parallel > RHO * perpendicular)
+    active = eligible & (parallel > OGS_V1_RHO * perpendicular)
     for label, values in (
         ("observability", observability),
         ("anchor penalty", log_penalty),
@@ -803,13 +794,16 @@ def _run_gpu_audit(args: argparse.Namespace) -> dict[str, Any]:
         "camera_parameters_sha256": camera_parameters_sha,
         "binding_sha256": binding_sha,
         "split_hashes": split_hashes,
-        "rho": RHO,
-        "eps": EPS,
-        "variance_eps": VARIANCE_EPS,
+        "rho": OGS_V1_RHO,
+        "eps": OGS_V1_LOSS_EPS,
+        "variance_eps": OGS_V1_VARIANCE_EPS,
+        "ogs_v1_formula_sha256": formula_sha256,
         "renderer_visibility": "radii>0",
         "eligibility": {
-            "minimum_visible_views": 8,
-            "minimum_activated_opacity_strict_gt": 0.01,
+            "minimum_visible_views": OGS_V1_MIN_VISIBLE_VIEWS,
+            "minimum_activated_opacity_strict_gt": (
+                OGS_V1_MIN_ACTIVATED_OPACITY
+            ),
         },
         "camera_count": len(cameras),
         "separate_process_no_training_rng": True,
@@ -825,9 +819,9 @@ def _run_gpu_audit(args: argparse.Namespace) -> dict[str, Any]:
         anchor_scales,
         anchor_rotations,
         metadata=metadata,
-        min_visible_views=8,
-        min_activated_opacity=0.01,
-        eps=VARIANCE_EPS,
+        min_visible_views=OGS_V1_MIN_VISIBLE_VIEWS,
+        min_activated_opacity=OGS_V1_MIN_ACTIVATED_OPACITY,
+        eps=OGS_V1_VARIANCE_EPS,
     )
     if not torch.equal(cache["eligible_mask"], eligible.detach().cpu()):
         raise OgsAuditError("core cache eligibility differs from audit eligibility")

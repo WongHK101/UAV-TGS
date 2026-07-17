@@ -14,6 +14,8 @@ import random
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
+import numpy as np
+
 
 SCHEMA = "uav-tgs-fixed-camera-sequence-v1"
 
@@ -48,6 +50,37 @@ def ordered_camera_names(cameras: Iterable[object]) -> list[str]:
 
 def ordered_camera_hash(camera_names: Sequence[str]) -> str:
     return sha256_json(list(camera_names))
+
+
+def camera_parameters_payload(cameras: Sequence[object]) -> list[dict]:
+    """Return the canonical ordered camera payload used by the OGS audit.
+
+    The explicit float64 conversion is part of the hash contract.  Keep this
+    representation shared between the no-grad audit and continuation trainer.
+    """
+
+    rows = []
+    for camera in cameras:
+        rows.append(
+            {
+                "image_name": str(camera.image_name),
+                "uid": int(camera.uid),
+                "colmap_id": int(camera.colmap_id),
+                "R": np.asarray(camera.R, dtype=np.float64).tolist(),
+                "T": np.asarray(camera.T, dtype=np.float64).tolist(),
+                "FoVx": float(camera.FoVx),
+                "FoVy": float(camera.FoVy),
+                "image_width": int(camera.image_width),
+                "image_height": int(camera.image_height),
+            }
+        )
+    return rows
+
+
+def camera_parameters_hash(cameras: Sequence[object]) -> str:
+    """Hash ordered camera identities, extrinsics, intrinsics, and dimensions."""
+
+    return sha256_json(camera_parameters_payload(cameras))
 
 
 def sequence_hash(sequence: Sequence[str]) -> str:
