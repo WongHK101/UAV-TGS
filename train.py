@@ -27,6 +27,11 @@ from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
+from utils.camera_sequence import (
+    camera_lookup,
+    load_sequence_manifest,
+    ordered_camera_names,
+)
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -53,11 +58,228 @@ except:
 
 _STRICT_FREEZE_FIELDS = ("_xyz", "_scaling", "_rotation", "_opacity")
 _OPACITY_ADAPTIVE_FREEZE_FIELDS = ("_xyz", "_scaling", "_rotation")
+_RGB_CONTINUATION_GROUPS = (
+    "xyz", "f_dc", "f_rest", "opacity", "scaling", "rotation"
+)
+
+
+def _optimizer_state_step(value):
+    if torch.is_tensor(value):
+        if value.numel() != 1 or not torch.isfinite(value).all():
+            raise RuntimeError("Optimizer step must be one finite scalar")
+        return int(value.detach().cpu().item())
+    return int(value)
+
+
+def _validate_rgb_continuation_checkpoint(
+    model_params, checkpoint_iteration, expected_anchor_iteration
+):
+    """Fail closed unless the anchor contains a restorable six-group RGB Adam."""
+
+    if int(checkpoint_iteration) != int(expected_anchor_iteration):
+        raise RuntimeError(
+            "RGB continuation anchor iteration mismatch: "
+            f"expected={expected_anchor_iteration} actual={checkpoint_iteration}"
+        )
+    if not isinstance(model_params, (tuple, list)) or len(model_params) != 12:
+        raise RuntimeError("RGB continuation requires the standard 12-field checkpoint")
+    optimizer_state = model_params[10]
+    if not isinstance(optimizer_state, dict):
+        raise RuntimeError("RGB continuation checkpoint has no optimizer state_dict")
+    groups = optimizer_state.get("param_groups")
+    states = optimizer_state.get("state")
+    if not isinstance(groups, list) or not isinstance(states, dict):
+        raise RuntimeError("RGB continuation checkpoint optimizer state is malformed")
+    names = tuple(group.get("name") for group in groups)
+    if names != _RGB_CONTINUATION_GROUPS:
+        raise RuntimeError(
+            "RGB continuation requires the standard six-group RGB Adam: "
+            f"expected={_RGB_CONTINUATION_GROUPS} actual={names}"
+        )
+
+    steps = {}
+    for group in groups:
+        parameters = group.get("params")
+        name = group.get("name")
+        if not isinstance(parameters, list) or len(parameters) != 1:
+            raise RuntimeError(f"RGB optimizer group {name!r} must contain one tensor")
+        state = states.get(parameters[0])
+        if not isinstance(state, dict):
+            raise RuntimeError(f"RGB optimizer group {name!r} has no Adam state")
+        if "step" not in state or "exp_avg" not in state or "exp_avg_sq" not in state:
+            raise RuntimeError(f"RGB optimizer group {name!r} has incomplete Adam state")
+        if not torch.is_tensor(state["exp_avg"]) or not torch.is_tensor(state["exp_avg_sq"]):
+            raise RuntimeError(f"RGB optimizer group {name!r} has invalid moments")
+        if state["exp_avg"].shape != state["exp_avg_sq"].shape:
+            raise RuntimeError(f"RGB optimizer group {name!r} moment shapes differ")
+        if not torch.isfinite(state["exp_avg"]).all() or not torch.isfinite(state["exp_avg_sq"]).all():
+            raise RuntimeError(f"RGB optimizer group {name!r} has non-finite moments")
+        steps[name] = _optimizer_state_step(state["step"])
+
+    unique_steps = sorted(set(steps.values()))
+    if (
+        len(unique_steps) != 1
+        or unique_steps[0] <= 0
+        or unique_steps[0] > int(expected_anchor_iteration)
+    ):
+        raise RuntimeError(
+            "RGB continuation Adam steps are not a coherent anchor state: "
+            f"steps={steps} required=uniform_positive_at_most_"
+            f"{int(expected_anchor_iteration)}"
+        )
+    return {
+        "groups": list(names),
+        "adam_steps": steps,
+        "uniform_adam_step": unique_steps[0],
+    }
+
+
+def _validate_restored_rgb_optimizer(gaussians, expected_summary):
+    names = tuple(group.get("name") for group in gaussians.optimizer.param_groups)
+    if names != _RGB_CONTINUATION_GROUPS:
+        raise RuntimeError(
+            "Restored RGB optimizer group mismatch: "
+            f"expected={_RGB_CONTINUATION_GROUPS} actual={names}"
+        )
+    restored_steps = {}
+    for group in gaussians.optimizer.param_groups:
+        name = group.get("name")
+        if len(group.get("params", [])) != 1:
+            raise RuntimeError(f"Restored RGB optimizer group {name!r} is malformed")
+        state = gaussians.optimizer.state.get(group["params"][0])
+        if not isinstance(state, dict) or "step" not in state:
+            raise RuntimeError(f"Restored RGB optimizer group {name!r} lost Adam state")
+        restored_steps[name] = _optimizer_state_step(state["step"])
+    if restored_steps != expected_summary["adam_steps"]:
+        raise RuntimeError(
+            "Restored RGB Adam steps differ from checkpoint: "
+            f"expected={expected_summary['adam_steps']} actual={restored_steps}"
+        )
+    return restored_steps
+
+
+def _should_optimizer_step(iteration, final_iteration, step_at_final_iteration):
+    return int(iteration) < int(final_iteration) or bool(step_at_final_iteration)
+
+
+def _validate_rgb_continuation_schedule(
+    anchor_iteration,
+    scheduler_horizon,
+    updates,
+    final_iteration,
+    step_at_final_iteration,
+):
+    if int(anchor_iteration) != 30000:
+        raise ValueError("OGS-v1 protocol requires the formal RGB 30000 anchor")
+    if int(scheduler_horizon) != int(anchor_iteration):
+        raise ValueError("Scheduler horizon must remain at the anchor iteration")
+    if int(updates) not in (200, 5000):
+        raise ValueError("RGB continuation updates must be 200 or 5000")
+    expected_final = int(anchor_iteration) + int(updates)
+    if int(final_iteration) != expected_final:
+        raise ValueError(f"RGB continuation final iteration must be {expected_final}")
+    if not bool(step_at_final_iteration):
+        raise ValueError("RGB continuation requires the final optimizer step")
+    return expected_final
+
+
+def _vector_norm(gradient):
+    if gradient is None:
+        return 0.0
+    return float(torch.linalg.vector_norm(gradient.detach()).item())
+
+
+def _gradient_cosine(left, right, eps=1e-30):
+    if left is None or right is None:
+        return None
+    left_flat = left.detach().reshape(-1)
+    right_flat = right.detach().reshape(-1)
+    denominator = torch.linalg.vector_norm(left_flat) * torch.linalg.vector_norm(right_flat)
+    if float(denominator.item()) <= eps:
+        return None
+    return float(torch.dot(left_flat, right_flat).div(denominator).item())
+
+
+def _lr_scaled_gradient_probe(rgb_grads, ogs_grads, scaling_lr, rotation_lr, lambda_ogs):
+    rgb_scaling = _vector_norm(rgb_grads[0])
+    rgb_rotation = _vector_norm(rgb_grads[1])
+    ogs_scaling = _vector_norm(ogs_grads[0])
+    ogs_rotation = _vector_norm(ogs_grads[1])
+    weighted_ogs_scaling = float(lambda_ogs) * ogs_scaling
+    weighted_ogs_rotation = float(lambda_ogs) * ogs_rotation
+    rgb_proxy = (
+        (float(scaling_lr) * rgb_scaling) ** 2
+        + (float(rotation_lr) * rgb_rotation) ** 2
+    ) ** 0.5
+    ogs_proxy = (
+        (float(scaling_lr) * weighted_ogs_scaling) ** 2
+        + (float(rotation_lr) * weighted_ogs_rotation) ** 2
+    ) ** 0.5
+    return {
+        "raw": {
+            "rgb_scaling_norm": rgb_scaling,
+            "rgb_rotation_norm": rgb_rotation,
+            "ogs_scaling_norm": ogs_scaling,
+            "ogs_rotation_norm": ogs_rotation,
+            "weighted_ogs_scaling_norm": weighted_ogs_scaling,
+            "weighted_ogs_rotation_norm": weighted_ogs_rotation,
+            "scaling_cosine": _gradient_cosine(rgb_grads[0], ogs_grads[0]),
+            "rotation_cosine": _gradient_cosine(rgb_grads[1], ogs_grads[1]),
+        },
+        "lr_scaled": {
+            "scaling_lr": float(scaling_lr),
+            "rotation_lr": float(rotation_lr),
+            "rgb_scaling_update_proxy": float(scaling_lr) * rgb_scaling,
+            "rgb_rotation_update_proxy": float(rotation_lr) * rgb_rotation,
+            "weighted_ogs_scaling_update_proxy": float(scaling_lr) * weighted_ogs_scaling,
+            "weighted_ogs_rotation_update_proxy": float(rotation_lr) * weighted_ogs_rotation,
+            "rgb_combined_update_proxy": rgb_proxy,
+            "weighted_ogs_combined_update_proxy": ogs_proxy,
+            "combined_ratio": (ogs_proxy / rgb_proxy) if rgb_proxy > 0.0 else None,
+            "scaling_ratio": (
+                weighted_ogs_scaling / rgb_scaling if rgb_scaling > 0.0 else None
+            ),
+            "rotation_ratio": (
+                weighted_ogs_rotation / rgb_rotation if rgb_rotation > 0.0 else None
+            ),
+        },
+    }
+
+
+def _append_jsonl(path, payload):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "a", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(payload, sort_keys=True, allow_nan=False) + "\n")
+        handle.flush()
 
 
 def _tensor_sha256(tensor):
     value = tensor.detach().cpu().contiguous()
     return hashlib.sha256(value.numpy().tobytes()).hexdigest()
+
+
+def _ogs_anchor_tensor_sha256(tensor):
+    """Match tools/audit_ogs_v1.py's dtype+shape+bytes tensor hash."""
+
+    array = tensor.detach().cpu().contiguous().numpy()
+    digest = hashlib.sha256()
+    digest.update(array.dtype.str.encode("ascii"))
+    digest.update(
+        json.dumps(list(array.shape), separators=(",", ":")).encode("ascii")
+    )
+    digest.update(array.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _file_sha256(path, chunk_size=8 * 1024 * 1024):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _snapshot_strict_freeze_fields(gaussians):
@@ -231,28 +453,42 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
     thermal_freeze_mode = str(getattr(args, "thermal_freeze_mode", "legacy"))
+    rgb_continuation = (
+        str(getattr(args, "rgb_continuation_recipe", "legacy"))
+        == "fixed_topology"
+    )
+    ogs_enabled = bool(getattr(args, "ogs_v1", False))
     strict_freeze = thermal_freeze_mode == "strict"
     opacity_adaptive = thermal_freeze_mode == "geometry_frozen_opacity_adaptive"
-    topology_frozen = thermal_freeze_mode in (
+    topology_frozen = rgb_continuation or thermal_freeze_mode in (
         "strict", "continuous_unfrozen", "geometry_frozen_opacity_adaptive"
     )
     artifact_save_semantics = _resolve_artifact_save_semantics(
         getattr(args, "thermal_recipe", "legacy"),
         getattr(args, "artifact_save_semantics", None),
     )
-    aligned_artifact_saves = artifact_save_semantics == "aligned"
+    aligned_artifact_saves = (
+        artifact_save_semantics == "aligned" or rgb_continuation
+    )
     if aligned_artifact_saves:
         print(
             "[INFO] AAAIArtifactSaveSemantics: "
             "semantics=aligned aligned_post_optimizer_step=1"
         )
     if topology_frozen and not checkpoint:
-        raise RuntimeError(f"thermal_freeze_mode={thermal_freeze_mode} requires a start checkpoint")
+        raise RuntimeError(
+            "Fixed-topology training requires a start checkpoint: "
+            f"rgb_continuation={rgb_continuation} "
+            f"thermal_freeze_mode={thermal_freeze_mode}"
+        )
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
-    scene = Scene(dataset, gaussians)
+    # The fixed sequence manifest is keyed to Scene(shuffle=False) camera
+    # ordering emitted by the audit sidecar.  Legacy training retains its
+    # historical shuffled Scene construction.
+    scene = Scene(dataset, gaussians, shuffle=(not rgb_continuation))
 
 
     # Optional: sparse support gating for densification (disabled by default).
@@ -342,6 +578,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         except Exception:
             print("[WARN] SparseSupport enabled but initialization failed; disabling sparse support.")
     gaussians.training_setup(opt)
+    rgb_optimizer_summary = None
     if checkpoint:
         # Checkpoints are generated locally by this training pipeline and
         # contain NumPy/Python objects in addition to tensor weights.  PyTorch
@@ -349,6 +586,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # checkpoint format before thermal fine-tuning can start.
         (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         optimizer_restore_mode = str(getattr(args, "thermal_optimizer_state", "restore"))
+        if rgb_continuation:
+            if optimizer_restore_mode != "restore":
+                raise RuntimeError("RGB continuation forbids a fresh optimizer fallback")
+            rgb_optimizer_summary = _validate_rgb_continuation_checkpoint(
+                model_params,
+                first_iter,
+                getattr(args, "rgb_continuation_anchor_iteration", 30000),
+            )
         if opacity_adaptive and optimizer_restore_mode == "restore":
             checkpoint_groups = tuple(
                 group.get("name") for group in model_params[10].get("param_groups", [])
@@ -360,6 +605,43 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     f"expected={expected_checkpoint_groups} actual={checkpoint_groups}"
                 )
         gaussians.restore(model_params, opt, optimizer_restore_mode=optimizer_restore_mode)
+        if rgb_continuation:
+            restored_steps = _validate_restored_rgb_optimizer(
+                gaussians, rgb_optimizer_summary
+            )
+            if gaussians.active_sh_degree != gaussians.max_sh_degree:
+                raise RuntimeError(
+                    "RGB continuation requires the formal SH3 anchor: "
+                    f"active={gaussians.active_sh_degree} max={gaussians.max_sh_degree}"
+                )
+            if dataset.train_test_exp:
+                raise RuntimeError(
+                    "This RGB anchor checkpoint does not serialize exposure Adam; "
+                    "a train_test_exp continuation cannot be restored exactly"
+                )
+            # Recreate both scheduler functions with the original Stage-1
+            # horizon, not the 35k continuation endpoint.
+            scheduler_horizon = int(
+                getattr(args, "rgb_continuation_scheduler_horizon", 30000)
+            )
+            gaussians.xyz_scheduler_args = get_expon_lr_func(
+                lr_init=opt.position_lr_init * gaussians.spatial_lr_scale,
+                lr_final=opt.position_lr_final * gaussians.spatial_lr_scale,
+                lr_delay_mult=opt.position_lr_delay_mult,
+                max_steps=scheduler_horizon,
+            )
+            gaussians.exposure_scheduler_args = get_expon_lr_func(
+                opt.exposure_lr_init,
+                opt.exposure_lr_final,
+                lr_delay_steps=opt.exposure_lr_delay_steps,
+                lr_delay_mult=opt.exposure_lr_delay_mult,
+                max_steps=scheduler_horizon,
+            )
+            print(
+                "[INFO] RGBContinuationRestore: "
+                f"groups={rgb_optimizer_summary['groups']} "
+                f"adam_steps={restored_steps} scheduler_horizon={scheduler_horizon}"
+            )
         if optimizer_restore_mode == "fresh":
             state_entries = len(gaussians.optimizer.state)
             step_entries = sum(
@@ -580,7 +862,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             elif name == "rotation":
                 group["lr"] = opt.rotation_lr
 
-    if checkpoint and getattr(args, "start_checkpoint", None) and not getattr(args, "sgf_disable", False):
+    if (
+        checkpoint
+        and getattr(args, "start_checkpoint", None)
+        and not getattr(args, "sgf_disable", False)
+        and not rgb_continuation
+    ):
         _reapply_lrs_after_restore()
 
     debug_stats = bool(getattr(args, "debug_gaussian_stats", False)) and bool(checkpoint)
@@ -653,8 +940,195 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     )
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
 
-    viewpoint_stack = scene.getTrainCameras().copy()
+    train_cameras = scene.getTrainCameras().copy()
+    viewpoint_stack = train_cameras.copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
+    fixed_camera_sequence = None
+    fixed_camera_manifest = None
+    fixed_camera_map = None
+    continuation_checkpoint_sha256 = None
+    continuation_train_list_sha256 = None
+    if rgb_continuation:
+        camera_names = ordered_camera_names(train_cameras)
+        fixed_camera_manifest = load_sequence_manifest(
+            getattr(args, "fixed_camera_sequence"),
+            camera_names=camera_names,
+            expected_steps=5000,
+        )
+        fixed_camera_sequence = fixed_camera_manifest["sequence"]
+        fixed_camera_map = camera_lookup(train_cameras)
+        sequence_metadata = fixed_camera_manifest.get("metadata", {})
+        if not isinstance(sequence_metadata, dict):
+            raise RuntimeError("Fixed camera sequence metadata is malformed")
+        expected_checkpoint_sha = str(
+            sequence_metadata.get("anchor_sha256", "")
+        ).strip().lower()
+        expected_train_list_sha = str(
+            sequence_metadata.get("split_sha256", "")
+        ).strip().lower()
+        if not expected_checkpoint_sha or not expected_train_list_sha:
+            raise RuntimeError(
+                "Fixed camera sequence must pin anchor_sha256 and split_sha256"
+            )
+        continuation_checkpoint_sha256 = _file_sha256(checkpoint)
+        if continuation_checkpoint_sha256 != expected_checkpoint_sha:
+            raise RuntimeError(
+                "Fixed camera sequence checkpoint SHA-256 mismatch: "
+                f"expected={expected_checkpoint_sha} "
+                f"actual={continuation_checkpoint_sha256}"
+            )
+        train_list_path = str(getattr(dataset, "train_list", "") or "")
+        if not train_list_path or not os.path.isfile(train_list_path):
+            raise RuntimeError(
+                "Fixed-topology RGB continuation requires the formal train list file"
+            )
+        continuation_train_list_sha256 = _file_sha256(train_list_path)
+        if continuation_train_list_sha256 != expected_train_list_sha:
+            raise RuntimeError(
+                "Fixed camera sequence train-list SHA-256 mismatch: "
+                f"expected={expected_train_list_sha} "
+                f"actual={continuation_train_list_sha256}"
+            )
+        declared_train_list_sha = str(
+            getattr(dataset, "train_list_sha256", "") or ""
+        ).strip().lower()
+        if (
+            declared_train_list_sha
+            and declared_train_list_sha != continuation_train_list_sha256
+        ):
+            raise RuntimeError(
+                "ModelParams train_list_sha256 does not match the actual train list"
+            )
+        print(
+            "[INFO] FixedCameraSequence: "
+            f"steps={len(fixed_camera_sequence)} "
+            f"camera_hash={fixed_camera_manifest['ordered_camera_sha256']} "
+            f"sequence_sha256={fixed_camera_manifest['sequence_sha256']}"
+        )
+
+    ogs_cache = None
+    if ogs_enabled:
+        from utils.ogs_v1 import load_ogs_cache
+
+        expected_cache_metadata = {
+            "scene_name": sequence_metadata.get("scene"),
+            "checkpoint_sha256": sequence_metadata.get("anchor_sha256"),
+            "train_list_sha256": sequence_metadata.get("split_sha256"),
+            "ordered_train_camera_names_sha256": fixed_camera_manifest[
+                "ordered_camera_sha256"
+            ],
+        }
+        missing_expected = [
+            key for key, value in expected_cache_metadata.items() if not value
+        ]
+        if missing_expected:
+            raise RuntimeError(
+                "OGS fixed sequence lacks anchor identity metadata: "
+                + ", ".join(missing_expected)
+            )
+        ogs_cache = load_ogs_cache(
+            getattr(args, "ogs_cache"),
+            device=gaussians.get_xyz.device,
+            expected_gaussian_count=int(gaussians.get_xyz.shape[0]),
+            expected_metadata=expected_cache_metadata,
+        )
+        current_raw_hashes = {
+            "xyz": _ogs_anchor_tensor_sha256(gaussians._xyz),
+            "scaling": _ogs_anchor_tensor_sha256(gaussians._scaling),
+            "rotation": _ogs_anchor_tensor_sha256(gaussians._rotation),
+            "opacity": _ogs_anchor_tensor_sha256(gaussians._opacity),
+        }
+        cached_raw_hashes = ogs_cache.get("metadata", {}).get(
+            "raw_tensor_sha256"
+        )
+        if cached_raw_hashes != current_raw_hashes:
+            raise RuntimeError(
+                "OGS cache Gaussian index/tensor identity does not match the "
+                f"restored anchor: expected={cached_raw_hashes} "
+                f"actual={current_raw_hashes}"
+            )
+        if int(ogs_cache["eligible_mask"].sum().item()) <= 0:
+            raise RuntimeError("OGS-v1 cache has zero eligible Gaussians")
+        print(
+            "[INFO] OGSV1Cache: "
+            f"eligible={int(ogs_cache['eligible_mask'].sum().item())} "
+            f"cache_sha256={ogs_cache.get('cache_sha256')}"
+        )
+
+    if rgb_continuation:
+        protocol = {
+            "schema": "uav-tgs-rgb-continuation-protocol-v1",
+            "recipe": "fixed_topology",
+            "start_checkpoint": str(checkpoint),
+            "start_checkpoint_sha256": continuation_checkpoint_sha256,
+            "anchor_iteration": int(start_iteration),
+            "scheduler_horizon": int(
+                getattr(args, "rgb_continuation_scheduler_horizon", 30000)
+            ),
+            "scheduler_parameters": {
+                "position_lr_init": float(opt.position_lr_init),
+                "position_lr_final": float(opt.position_lr_final),
+                "position_lr_delay_mult": float(opt.position_lr_delay_mult),
+                "position_lr_max_steps": int(opt.position_lr_max_steps),
+                "exposure_lr_init": float(opt.exposure_lr_init),
+                "exposure_lr_final": float(opt.exposure_lr_final),
+                "exposure_lr_delay_steps": int(opt.exposure_lr_delay_steps),
+                "exposure_lr_delay_mult": float(opt.exposure_lr_delay_mult),
+            },
+            "requested_updates": int(
+                getattr(args, "rgb_continuation_updates", 5000)
+            ),
+            "final_iteration": int(opt.iterations),
+            "optimizer_step_at_final_iteration": bool(
+                getattr(args, "optimizer_step_at_final_iteration", False)
+            ),
+            "optimizer_restore": rgb_optimizer_summary,
+            "topology_fixed": True,
+            "densification": False,
+            "pruning": False,
+            "opacity_reset": False,
+            "artifact_save_semantics": "aligned",
+            "camera_sequence_path": str(getattr(args, "fixed_camera_sequence")),
+            "ordered_camera_sha256": fixed_camera_manifest["ordered_camera_sha256"],
+            "camera_sequence_sha256": fixed_camera_manifest["sequence_sha256"],
+            "train_list_sha256": continuation_train_list_sha256,
+            "rng_seeds": {
+                "python": 0,
+                "numpy": 0,
+                "torch": 0,
+                "cuda": 0,
+                "camera_sequence": int(fixed_camera_manifest["seed"]),
+            },
+            "random_background": bool(opt.random_background),
+            "rgb_objective": {
+                "lambda_dssim": float(opt.lambda_dssim),
+                "depth_l1_weight_init": float(opt.depth_l1_weight_init),
+                "depth_l1_weight_final": float(opt.depth_l1_weight_final),
+                "thermal_structure_gradient_weight": float(
+                    getattr(args, "t_struct_grad_w", 0.0)
+                ),
+            },
+            "cuda_determinism_note": (
+                "Fixed seeds and camera inputs do not guarantee bitwise "
+                "determinism for all CUDA rasterizer kernels."
+            ),
+            "ogs_v1": ogs_enabled,
+            "lambda_ogs": float(getattr(args, "lambda_ogs", 1e-3)),
+            "ogs_rho": float(getattr(args, "ogs_rho", 3.0)),
+            "ogs_cache_path": str(getattr(args, "ogs_cache", "")) if ogs_enabled else None,
+            "ogs_cache_sha256": (
+                ogs_cache.get("cache_sha256") if ogs_enabled else None
+            ),
+        }
+        protocol_path = os.path.join(scene.model_path, "rgb_continuation_protocol.json")
+        temporary_path = protocol_path + f".tmp-{os.getpid()}"
+        with open(temporary_path, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(protocol, handle, indent=2, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, protocol_path)
+
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
 
@@ -706,13 +1180,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree(max_degree=thermal_max_sh_degree)
 
-        # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-            viewpoint_indices = list(range(len(viewpoint_stack)))
-        rand_idx = randint(0, len(viewpoint_indices) - 1)
-        viewpoint_cam = viewpoint_stack.pop(rand_idx)
-        vind = viewpoint_indices.pop(rand_idx)
+        # Paired RGB continuations consume a pre-generated sequence and never
+        # call the process-global Python RNG during camera selection.
+        if fixed_camera_sequence is not None:
+            sequence_index = int(iteration) - int(start_iteration) - 1
+            if sequence_index < 0 or sequence_index >= len(fixed_camera_sequence):
+                raise RuntimeError(
+                    "Fixed camera sequence exhausted at continuation update "
+                    f"{sequence_index + 1}"
+                )
+            viewpoint_cam = fixed_camera_map[fixed_camera_sequence[sequence_index]]
+        else:
+            # Legacy random-pop-without-replacement path remains byte-for-byte
+            # equivalent in behavior when RGB continuation is not requested.
+            if not viewpoint_stack:
+                viewpoint_stack = scene.getTrainCameras().copy()
+                viewpoint_indices = list(range(len(viewpoint_stack)))
+            rand_idx = randint(0, len(viewpoint_indices) - 1)
+            viewpoint_cam = viewpoint_stack.pop(rand_idx)
+            vind = viewpoint_indices.pop(rand_idx)
 
         # Render
         if (iteration - 1) == debug_from:
@@ -777,6 +1263,116 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             Ll1depth = 0
 
+        rgb_objective = loss
+        ogs_result = None
+        if ogs_enabled:
+            from utils.ogs_v1 import ogs_v1_loss
+
+            ogs_result = ogs_v1_loss(
+                scales=gaussians.get_scaling,
+                rotations=gaussians._rotation,
+                cache=ogs_cache,
+                rho=float(getattr(args, "ogs_rho", 3.0)),
+                eps=1e-8,
+            )
+            ogs_loss = ogs_result["loss"]
+            lambda_ogs = float(getattr(args, "lambda_ogs", 1e-3))
+
+            if iteration == first_iter:
+                forbidden_parameters = (
+                    gaussians._xyz,
+                    gaussians._features_dc,
+                    gaussians._features_rest,
+                    gaussians._opacity,
+                    gaussians._exposure,
+                )
+                forbidden_gradients = torch.autograd.grad(
+                    ogs_loss,
+                    forbidden_parameters,
+                    retain_graph=True,
+                    allow_unused=True,
+                )
+                leaked = []
+                for name, gradient in zip(
+                    ("xyz", "f_dc", "f_rest", "opacity", "exposure"),
+                    forbidden_gradients,
+                ):
+                    if gradient is not None and torch.count_nonzero(gradient).item() != 0:
+                        leaked.append(name)
+                if leaked:
+                    raise RuntimeError(
+                        "OGS-v1 gradient leaked outside scaling/rotation: "
+                        + ", ".join(leaked)
+                    )
+
+            smoke_step = int(iteration) - int(start_iteration)
+            smoke_limit = int(getattr(args, "ogs_gradient_smoke_steps", 200))
+            if smoke_step <= smoke_limit:
+                rgb_grads = torch.autograd.grad(
+                    rgb_objective,
+                    (gaussians._scaling, gaussians._rotation),
+                    retain_graph=True,
+                    allow_unused=True,
+                )
+                ogs_grads = torch.autograd.grad(
+                    ogs_loss,
+                    (gaussians._scaling, gaussians._rotation),
+                    retain_graph=True,
+                    allow_unused=True,
+                )
+                lr_map = {
+                    group.get("name"): float(group.get("lr", 0.0))
+                    for group in gaussians.optimizer.param_groups
+                }
+                probe = _lr_scaled_gradient_probe(
+                    rgb_grads,
+                    ogs_grads,
+                    lr_map["scaling"],
+                    lr_map["rotation"],
+                    lambda_ogs,
+                )
+                eligible_q = ogs_result["q_current"][
+                    ogs_cache["eligible_mask"]
+                ].detach()
+                finite_values = [
+                    rgb_objective.detach(),
+                    ogs_loss.detach(),
+                    eligible_q,
+                    *(gradient.detach() for gradient in rgb_grads if gradient is not None),
+                    *(gradient.detach() for gradient in ogs_grads if gradient is not None),
+                ]
+                payload = {
+                    "schema": "uav-tgs-ogs-v1-gradient-smoke-v1",
+                    "iteration": int(iteration),
+                    "continuation_update": smoke_step,
+                    "camera_image_name": str(viewpoint_cam.image_name),
+                    "l_rgb": float(rgb_objective.detach().item()),
+                    "l_ogs": float(ogs_loss.detach().item()),
+                    "weighted_l_ogs": float((lambda_ogs * ogs_loss).detach().item()),
+                    "penalty_mean": float(
+                        torch.as_tensor(ogs_result["penalty_mean"]).detach().item()
+                    ),
+                    "eligible_count": int(ogs_result["eligible_count"]),
+                    "active_count": int(ogs_result["active_count"]),
+                    "q_current_eligible_mean": float(eligible_q.mean().item()),
+                    "q_current_eligible_max": float(eligible_q.max().item()),
+                    "gradient_probe": probe,
+                    "finite": bool(
+                        all(torch.isfinite(value).all().item() for value in finite_values)
+                    ),
+                }
+                smoke_path = (
+                    getattr(args, "ogs_gradient_log", "")
+                    or os.path.join(scene.model_path, "ogs_gradient_smoke.jsonl")
+                )
+                _append_jsonl(smoke_path, payload)
+                if not payload["finite"]:
+                    raise RuntimeError(
+                        f"Non-finite OGS-v1 smoke value at iteration {iteration}"
+                    )
+
+            loss = rgb_objective + lambda_ogs * ogs_loss
+
         loss.backward()
 
         iter_end.record()
@@ -836,7 +1432,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.reset_opacity()
 
             # Optimizer step
-            if iteration < opt.iterations:
+            if _should_optimizer_step(
+                iteration,
+                opt.iterations,
+                getattr(args, "optimizer_step_at_final_iteration", False),
+            ):
                 if gaussians.exposure_optimizer is not None:
                     gaussians.exposure_optimizer.step()
                     gaussians.exposure_optimizer.zero_grad(set_to_none = True)
@@ -923,10 +1523,46 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             final_iteration=int(opt.iterations),
         )
 
+    optimizer_updates_executed = max(
+        0,
+        int(opt.iterations)
+        - int(start_iteration)
+        - (0 if getattr(args, "optimizer_step_at_final_iteration", False) else 1),
+    )
+    if rgb_continuation:
+        final_steps = {}
+        for group in gaussians.optimizer.param_groups:
+            state = gaussians.optimizer.state.get(group["params"][0])
+            if not isinstance(state, dict) or "step" not in state:
+                raise RuntimeError(
+                    f"RGB continuation final Adam state missing for {group.get('name')}"
+                )
+            final_steps[group.get("name")] = _optimizer_state_step(state["step"])
+        step_deltas = {
+            name: final_steps[name] - rgb_optimizer_summary["adam_steps"][name]
+            for name in _RGB_CONTINUATION_GROUPS
+        }
+        expected_updates = int(getattr(args, "rgb_continuation_updates", 5000))
+        if set(step_deltas.values()) != {expected_updates}:
+            raise RuntimeError(
+                "RGB continuation did not execute the exact requested optimizer "
+                f"updates: expected={expected_updates} actual={step_deltas}"
+            )
+        if optimizer_updates_executed != expected_updates:
+            raise RuntimeError(
+                "RGB continuation loop/update count mismatch: "
+                f"loop={optimizer_updates_executed} expected={expected_updates}"
+            )
+        print(
+            "[INFO] RGBContinuationUpdates: "
+            f"exact_updates={expected_updates} final_adam_steps={final_steps}"
+        )
+
     return {
         "start_iteration": start_iteration,
         "final_iteration": int(opt.iterations),
         "iterations_executed": max(0, int(opt.iterations) - start_iteration),
+        "optimizer_updates_executed": optimizer_updates_executed,
         "gaussian_count": int(gaussians.get_xyz.shape[0]),
         "model_path": str(scene.model_path),
     }
@@ -1074,6 +1710,46 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--optimizer_step_at_final_iteration",
+        action="store_true",
+        default=False,
+        help=(
+            "Execute the optimizer update at the labeled final iteration. "
+            "Only valid with aligned artifact saves or the fixed-topology RGB recipe."
+        ),
+    )
+    parser.add_argument(
+        "--rgb_continuation_recipe",
+        choices=["legacy", "fixed_topology"],
+        default="legacy",
+        help="Explicit fixed-topology RGB 30k-anchor continuation protocol.",
+    )
+    parser.add_argument(
+        "--rgb_continuation_anchor_iteration", type=int, default=30000
+    )
+    parser.add_argument(
+        "--rgb_continuation_scheduler_horizon", type=int, default=30000
+    )
+    parser.add_argument(
+        "--rgb_continuation_updates",
+        type=int,
+        choices=[200, 5000],
+        default=5000,
+        help="Use 200 for smoke or 5000 for the formal continuation.",
+    )
+    parser.add_argument(
+        "--fixed_camera_sequence",
+        type=str,
+        default="",
+        help="Pre-generated 5000-entry image_name sequence manifest.",
+    )
+    parser.add_argument("--ogs_v1", action="store_true", default=False)
+    parser.add_argument("--ogs_cache", type=str, default="")
+    parser.add_argument("--lambda_ogs", type=float, default=1e-3)
+    parser.add_argument("--ogs_rho", type=float, default=3.0)
+    parser.add_argument("--ogs_gradient_smoke_steps", type=int, default=200)
+    parser.add_argument("--ogs_gradient_log", type=str, default="")
+    parser.add_argument(
         "--thermal_freeze_mode",
         choices=[
             "legacy", "strict", "continuous_unfrozen",
@@ -1156,6 +1832,125 @@ if __name__ == "__main__":
         )
     except ValueError as error:
         parser.error(str(error))
+
+    rgb_continuation_requested = (
+        args.rgb_continuation_recipe == "fixed_topology"
+    )
+    if rgb_continuation_requested:
+        if not args.start_checkpoint:
+            parser.error(
+                "--rgb_continuation_recipe fixed_topology requires --start_checkpoint"
+            )
+        forbidden_prefixes = (
+            "--thermal_",
+            "--baseline_",
+            "--sgf_disable",
+            "--t_struct_grad_",
+            "--clamp_scale_",
+            "--ss_",
+        )
+        forbidden_options = sorted(
+            token.split("=", 1)[0]
+            for token in cli_args
+            if token.startswith(forbidden_prefixes)
+        )
+        if forbidden_options:
+            parser.error(
+                "Fixed-topology RGB continuation rejects thermal/baseline/"
+                "SSP/clamp flags: " + ", ".join(forbidden_options)
+            )
+        if args.thermal_recipe != "legacy":
+            parser.error("RGB continuation cannot use a thermal recipe")
+        if args.thermal_optimizer_state != "restore":
+            parser.error("RGB continuation requires restored optimizer state")
+        if args.thermal_freeze_mode != "legacy":
+            parser.error("RGB continuation cannot use a thermal freeze mode")
+        if args.thermal_reset_features or args.thermal_max_sh_degree is not None:
+            parser.error("RGB continuation cannot reset or cap thermal SH")
+        if args.baseline_modules_off or args.baseline_restore_ssp or args.baseline_restore_stt:
+            parser.error("RGB continuation cannot use baseline recipe flags")
+        if args.sgf_disable or args.ss_enable or args.ss_prune_before_thermal:
+            parser.error("RGB continuation cannot use SGF/SSP stage flags")
+        if (
+            args.clamp_scale_max is not None
+            or args.clamp_scale_after_densify
+            or args.clamp_scale_after_rgb_final
+        ):
+            parser.error("RGB continuation cannot use scale clamps")
+        if args.t_struct_grad_w != 0.0:
+            parser.error("RGB continuation uses the ordinary RGB objective only")
+        if args.optimizer_type != "default":
+            parser.error("RGB continuation requires the standard dense Adam")
+        if not args.fixed_camera_sequence:
+            parser.error("RGB continuation requires --fixed_camera_sequence")
+        try:
+            expected_endpoint = _validate_rgb_continuation_schedule(
+                args.rgb_continuation_anchor_iteration,
+                args.rgb_continuation_scheduler_horizon,
+                args.rgb_continuation_updates,
+                args.iterations,
+                args.optimizer_step_at_final_iteration,
+            )
+        except ValueError as error:
+            parser.error(str(error))
+        if args.position_lr_max_steps != args.rgb_continuation_scheduler_horizon:
+            parser.error(
+                "--position_lr_max_steps must equal the original 30000 scheduler horizon"
+            )
+        if expected_endpoint not in args.checkpoint_iterations:
+            parser.error(
+                "RGB continuation requires a checkpoint at the aligned final endpoint"
+            )
+        if (
+            _option_was_set("--artifact_save_semantics")
+            and args.artifact_save_semantics != "aligned"
+        ):
+            parser.error("RGB continuation requires aligned artifact saves")
+        args.artifact_save_semantics = "aligned"
+        # Fixed topology makes these no-ops, but setting them explicitly keeps
+        # the runtime manifest unambiguous.
+        args.ss_enable = False
+        args.ss_prune_before_thermal = False
+        args.ss_prune_after_rgb = False
+
+        if args.ogs_v1:
+            if not args.ogs_cache:
+                parser.error("--ogs_v1 requires --ogs_cache")
+            if args.lambda_ogs != 1e-3:
+                parser.error("OGS-v1 pilot pins --lambda_ogs to 1e-3")
+            if args.ogs_rho != 3.0:
+                parser.error("OGS-v1 pilot pins --ogs_rho to 3")
+            if args.ogs_gradient_smoke_steps != 200:
+                parser.error("OGS-v1 pilot pins the gradient smoke to 200 updates")
+        elif (
+            _option_was_set("--ogs_cache")
+            or _option_was_set("--lambda_ogs")
+            or _option_was_set("--ogs_rho")
+            or _option_was_set("--ogs_gradient_smoke_steps")
+            or _option_was_set("--ogs_gradient_log")
+        ):
+            parser.error("OGS options require --ogs_v1")
+    else:
+        continuation_only = (
+            args.ogs_v1
+            or bool(args.fixed_camera_sequence)
+            or _option_was_set("--rgb_continuation_anchor_iteration")
+            or _option_was_set("--rgb_continuation_scheduler_horizon")
+            or _option_was_set("--rgb_continuation_updates")
+        )
+        if continuation_only:
+            parser.error(
+                "Fixed camera/OGS continuation options require "
+                "--rgb_continuation_recipe fixed_topology"
+            )
+
+    if (
+        args.optimizer_step_at_final_iteration
+        and args.artifact_save_semantics != "aligned"
+    ):
+        parser.error(
+            "--optimizer_step_at_final_iteration requires aligned artifact saves"
+        )
 
     if args.thermal_recipe == "aaai_strict":
         if not args.start_checkpoint:
@@ -1262,7 +2057,11 @@ if __name__ == "__main__":
     # Thermal-stage default: if user did not explicitly pass --opacity_lr and a
     # checkpoint is provided, use a conservative opacity lr to avoid geometry drift.
     opacity_flag_set = any((a == "--opacity_lr") or a.startswith("--opacity_lr=") for a in cli_args)
-    if args.start_checkpoint and (not opacity_flag_set):
+    if (
+        args.start_checkpoint
+        and (not opacity_flag_set)
+        and args.rgb_continuation_recipe == "legacy"
+    ):
         if args.baseline_restore_stt:
             args.opacity_lr = 2e-4
         else:
@@ -1305,6 +2104,14 @@ if __name__ == "__main__":
             "thermal_optimizer_state": str(args.thermal_optimizer_state),
             "thermal_freeze_mode": str(args.thermal_freeze_mode),
             "thermal_scale_clamp": str(args.thermal_scale_clamp),
+            "optimizer_step_at_final_iteration": bool(
+                args.optimizer_step_at_final_iteration
+            ),
+            "rgb_continuation_recipe": str(args.rgb_continuation_recipe),
+            "rgb_continuation_updates": int(args.rgb_continuation_updates),
+            "fixed_camera_sequence": str(args.fixed_camera_sequence),
+            "ogs_v1": bool(args.ogs_v1),
+            "lambda_ogs": float(args.lambda_ogs),
         },
     )
     efficiency_probe.start()
