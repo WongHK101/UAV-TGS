@@ -48,7 +48,27 @@ from oct_gs.radiance import (
     temperature_to_hot_iron,
 )
 from oct_gs.rendering import FrozenGaussianView, OCTRendererContext, weak_axis_from_anchor
-from tools.thermal_radiometry.palette_lut import hot_iron_lut, lut_sha256
+from tools.thermal_radiometry.palette_lut import (
+    hot_iron_lut,
+    indices_to_temperature,
+    lut_sha256,
+    temperature_to_indices,
+)
+from tools.evaluate_oct_gs_formal_v2 import (
+    EVALUATION_SCHEMA,
+    FROZEN_TRAINING_COMMIT,
+    FORMAL_HOTSPOT_BINS,
+    FORMAL_HOTSPOT_QUANTILE,
+    _checkpoint_compatibility,
+    _exact_display_temperature_c,
+    _histogram_auprc,
+    _load_and_validate_endpoint_receipt,
+    _occupancy_invariant_evidence,
+    _population_variance_from_moments,
+    _training_source_compatibility,
+    _update_visible_temperature_moments,
+    _validate_formal_hotspot_threshold,
+)
 from tools.oct_gs_formal import (
     HOTSPOT_SCHEMA,
     Runtime,
@@ -1123,6 +1143,17 @@ class OCTFormalProtocolTests(unittest.TestCase):
         anchor = DummyAnchor(3)
         snapshot = capture_occupancy_snapshot(anchor)
         verify_occupancy_snapshot(anchor, snapshot)
+        evidence = _occupancy_invariant_evidence(snapshot, snapshot)
+        self.assertEqual(evidence["status"], "passed")
+        self.assertTrue(evidence["exact"])
+        self.assertEqual(evidence["topology_count"], 3)
+        self.assertEqual(
+            evidence["expected_overall_sha256"], snapshot["overall_sha256"]
+        )
+        self.assertEqual(
+            evidence["observed_overall_sha256"], snapshot["overall_sha256"]
+        )
+        self.assertEqual(set(evidence["field_hashes"]), set(snapshot["ordered_fields"]))
         tracker = OCTStageCostTracker({"variant": "oct_scalar"})
         tracker.start()
         time.sleep(0.001)
@@ -1134,6 +1165,319 @@ class OCTFormalProtocolTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             verify_occupancy_snapshot(anchor, snapshot)
 
+    def test_visible_welford_is_scalar_exact_and_residual_stable(self):
+        scalar = torch.tensor([37.123451, 19.876543, 72.34567], dtype=torch.float32)
+        mean = torch.zeros_like(scalar)
+        m2 = torch.zeros_like(scalar)
+        count = torch.zeros(3, dtype=torch.int32)
+        visible = torch.tensor([True, True, False])
+        for _ in range(257):
+            _update_visible_temperature_moments(
+                mean, m2, count, scalar, visible
+            )
+        variance, valid = _population_variance_from_moments(m2, count)
+        self.assertTrue(torch.equal(variance[valid], torch.zeros_like(variance[valid])))
+        self.assertEqual(count.tolist(), [257, 257, 0])
+
+        mean.zero_()
+        m2.zero_()
+        count.zero_()
+        samples = (
+            torch.tensor([10.0, 20.0, 30.0]),
+            torch.tensor([12.0, 20.5, 30.0]),
+            torch.tensor([14.0, 21.0, 30.0]),
+        )
+        masks = (
+            torch.tensor([True, True, False]),
+            torch.tensor([True, True, False]),
+            torch.tensor([True, True, True]),
+        )
+        for sample, mask in zip(samples, masks):
+            _update_visible_temperature_moments(mean, m2, count, sample, mask)
+        variance, valid = _population_variance_from_moments(m2, count)
+        self.assertEqual(valid.tolist(), [True, True, False])
+        self.assertAlmostEqual(float(variance[0]), 8.0 / 3.0, places=6)
+        self.assertAlmostEqual(float(variance[1]), 1.0 / 6.0, places=6)
+
+    def test_exact_display_temperature_matches_palette_roundtrip(self):
+        source = torch.tensor(
+            [[-1.0, 0.0, 12.345, 49.999, 50.001, 100.0, 101.0]],
+            dtype=torch.float32,
+        )
+        recovered = _exact_display_temperature_c(source, 0.0, 100.0)
+        indices, _ = temperature_to_indices(source.numpy(), 0.0, 100.0)
+        expected = indices_to_temperature(indices, 0.0, 100.0)
+        self.assertTrue(
+            np.allclose(recovered.numpy(), expected, rtol=0.0, atol=1e-6)
+        )
+        direct = source.clamp(0.0, 100.0)
+        self.assertFalse(torch.equal(recovered, direct))
+
+    def test_hotspot_policy_is_pinned_and_histogram_auprc_is_deterministic(self):
+        binding = SimpleNamespace(tmin_c=0.0, tmax_c=100.0)
+        payload = {
+            "source_split": "train",
+            "test_statistics_used": False,
+            "quantile": FORMAL_HOTSPOT_QUANTILE,
+            "histogram_bins": FORMAL_HOTSPOT_BINS,
+            "threshold_c": 50.0,
+            "range_c": [0.0, 100.0],
+            "valid_train_pixels": 1000,
+        }
+        _validate_formal_hotspot_threshold(payload, binding)
+        with self.assertRaises(ValueError):
+            _validate_formal_hotspot_threshold(
+                {**payload, "quantile": 0.90}, binding
+            )
+        with self.assertRaises(ValueError):
+            _validate_formal_hotspot_threshold(
+                {**payload, "histogram_bins": 4096}, binding
+            )
+        for invalid in (
+            {**payload, "threshold_c": float("nan")},
+            {**payload, "threshold_c": 101.0},
+            {**payload, "range_c": [0.0, 99.0]},
+            {**payload, "valid_train_pixels": 0},
+        ):
+            with self.assertRaises(ValueError):
+                _validate_formal_hotspot_threshold(invalid, binding)
+        positive = np.asarray([0, 1, 1], dtype=np.int64)
+        negative = np.asarray([1, 1, 0], dtype=np.int64)
+        self.assertAlmostEqual(_histogram_auprc(positive, negative), 5.0 / 6.0)
+        self.assertIsNone(_histogram_auprc(np.zeros(3, dtype=np.int64), negative))
+
+    def test_eval_v2_training_source_compatibility_is_exact_not_a_waiver(self):
+        provenance = fake_training_source_provenance()
+        provenance["git_commit"] = FROZEN_TRAINING_COMMIT
+        protocol = {"source_provenance": provenance}
+        changed = ["tools/evaluate_oct_gs_formal_v2.py", "tests/test_oct_gs.py"]
+        with patch(
+            "tools.evaluate_oct_gs_formal_v2._source_records",
+            return_value=provenance["files"],
+        ), patch(
+            "tools.evaluate_oct_gs_formal_v2._changed_paths_since_frozen_training",
+            return_value=changed,
+        ):
+            result = _training_source_compatibility(protocol)
+        self.assertEqual(result["status"], "passed")
+        self.assertFalse(result["generic_commit_mismatch_waiver"])
+        self.assertTrue(result["training_source_files_byte_exact"])
+        self.assertEqual(result["post_training_changed_paths"], changed)
+
+        wrong_commit = dict(provenance)
+        wrong_commit["git_commit"] = "9" * 40
+        with self.assertRaises(RuntimeError):
+            _training_source_compatibility({"source_provenance": wrong_commit})
+        with patch(
+            "tools.evaluate_oct_gs_formal_v2._source_records",
+            return_value=[{**provenance["files"][0], "bytes": 999}],
+        ):
+            with self.assertRaises(RuntimeError):
+                _training_source_compatibility(protocol)
+
+    def test_eval_v2_checkpoint_gate_pins_final_exact_artifacts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            checkpoint_path = Path(temp) / "step_30000.pt"
+            checkpoint_path.write_bytes(b"formal-checkpoint-fixture")
+            snapshot = capture_occupancy_snapshot(DummyAnchor(3))
+            field_config = {"variant": "oct_scalar", "num_gaussians": 3}
+            formal_sha = "a" * 64
+            protocol = {
+                "scene_name": "Building",
+                "variant": "oct_scalar",
+                "manifest_file_sha256": "b" * 64,
+                "manifest_sha256": "c" * 64,
+                "field": {"config": field_config},
+            }
+            checkpoint = {
+                "step": 30_000,
+                "sequence_offset": 30_000,
+                "checkpoint_sha256": sha256_file(checkpoint_path),
+                "field_config": field_config,
+                "anchor_snapshot": snapshot,
+                "protocol_receipt": {
+                    "manifest_file_sha256": protocol["manifest_file_sha256"],
+                    "manifest_sha256": protocol["manifest_sha256"],
+                    "formal_protocol_sha256": formal_sha,
+                },
+            }
+            result = _checkpoint_compatibility(
+                checkpoint=checkpoint,
+                protocol=protocol,
+                binding=SimpleNamespace(
+                    scene_name="Building", formal_protocol_sha256=formal_sha
+                ),
+                runtime=SimpleNamespace(anchor_snapshot=snapshot),
+                variant="oct_scalar",
+            )
+            self.assertTrue(all(result.values()))
+            self.assertEqual(EVALUATION_SCHEMA, "uav-tgs-oct-formal-evaluation-v2")
+            checkpoint["step"] = 20_000
+            with self.assertRaises(ValueError):
+                _checkpoint_compatibility(
+                    checkpoint=checkpoint,
+                    protocol=protocol,
+                    binding=SimpleNamespace(
+                        scene_name="Building", formal_protocol_sha256=formal_sha
+                    ),
+                    runtime=SimpleNamespace(anchor_snapshot=snapshot),
+                    variant="oct_scalar",
+                )
+
+    def test_eval_v2_endpoint_receipt_is_independent_checkpoint_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run_root = Path(temp) / "Building" / "oct_scalar"
+            endpoint_path = run_root / "endpoints" / "step_30000.json"
+            checkpoint_path = run_root / "checkpoints" / "step_30000.pt"
+            protocol_path = run_root / "protocol.json"
+            endpoint_path.parent.mkdir(parents=True)
+            checkpoint_path.parent.mkdir(parents=True)
+            checkpoint_bytes = b"independent-formal-checkpoint"
+            checkpoint_path.write_bytes(checkpoint_bytes)
+            protocol_path.write_text("{}\n", encoding="utf-8")
+
+            snapshot = capture_occupancy_snapshot(DummyAnchor(3))
+            source = fake_training_source_provenance()
+            source["git_commit"] = FROZEN_TRAINING_COMMIT
+            formal_sha = "a" * 64
+            logical_protocol_sha = "b" * 64
+            protocol = {
+                "scene_name": "Building",
+                "variant": "oct_scalar",
+                "manifest_file_sha256": sha256_file(protocol_path),
+                "manifest_sha256": logical_protocol_sha,
+                "anchor_snapshot": snapshot,
+                "source_provenance": source,
+            }
+            cost = {
+                "schema": "uav-tgs-oct-cost-v1",
+                "status": "endpoint_30000",
+                "cumulative_optimizer_steps": 30_000,
+                "segment_start_step": 0,
+                "segment_optimizer_steps": 30_000,
+                "optimizer_steps": 30_000,
+                "rendered_views": 30_000,
+                "raster_passes": 30_000,
+                "raster_passes_per_view": 1.0,
+                "wall_time_s": 123.0,
+                "end_to_end_wall_time_s": 125.0,
+                "pre_training_setup_wall_time_s": 2.0,
+                "ms_per_step": 4.1,
+                "peak_memory_reset_succeeded": True,
+                "device": {
+                    "cuda_available": True,
+                    "device_name": "fixture GPU",
+                    "peak_torch_allocated_bytes": 100,
+                    "peak_torch_reserved_bytes": 200,
+                },
+                "metadata": {
+                    "formal_protocol_sha256": formal_sha,
+                    "scene": "Building",
+                    "variant": "oct_scalar",
+                    "segment_start_step": 0,
+                },
+            }
+            checkpoint = {
+                "checkpoint_sha256": sha256_file(checkpoint_path),
+                "protocol_receipt": {
+                    "manifest_file_sha256": protocol["manifest_file_sha256"],
+                    "manifest_sha256": logical_protocol_sha,
+                    "formal_protocol_sha256": formal_sha,
+                    "anchor_occupancy_sha256": snapshot["overall_sha256"],
+                },
+                "cost_summary": cost,
+            }
+            endpoint = {
+                "schema": "uav-tgs-oct-endpoint-v2",
+                "step": 30_000,
+                "sequence_offset": 30_000,
+                "checkpoint_sha256": sha256_file(checkpoint_path),
+                "protocol_manifest_sha256": logical_protocol_sha,
+                "formal_protocol_sha256": formal_sha,
+                "anchor_occupancy_sha256": snapshot["overall_sha256"],
+                "source_files_sha256": source["files_sha256"],
+                "recent_loss_mean": 0.25,
+                "resumed_from_step": None,
+                "cost": cost,
+            }
+            endpoint["endpoint_sha256"] = sha256_json(endpoint)
+            endpoint_path.write_text(json.dumps(endpoint), encoding="utf-8")
+            payload, identity, flags = _load_and_validate_endpoint_receipt(
+                endpoint_receipt_path=endpoint_path,
+                checkpoint_path=checkpoint_path,
+                protocol_path=protocol_path,
+                checkpoint=checkpoint,
+                protocol=protocol,
+                binding=SimpleNamespace(formal_protocol_sha256=formal_sha),
+                runtime=SimpleNamespace(anchor_snapshot=snapshot),
+            )
+            self.assertEqual(payload["cost"], cost)
+            self.assertEqual(identity["checkpoint_sha256"], sha256_file(checkpoint_path))
+            self.assertTrue(all(flags.values()))
+
+            checkpoint_path.write_bytes(checkpoint_bytes + b"tamper")
+            with self.assertRaises(RuntimeError):
+                _load_and_validate_endpoint_receipt(
+                    endpoint_receipt_path=endpoint_path,
+                    checkpoint_path=checkpoint_path,
+                    protocol_path=protocol_path,
+                    checkpoint=checkpoint,
+                    protocol=protocol,
+                    binding=SimpleNamespace(formal_protocol_sha256=formal_sha),
+                    runtime=SimpleNamespace(anchor_snapshot=snapshot),
+                )
+            checkpoint_path.write_bytes(checkpoint_bytes)
+
+            wrong_sha = dict(endpoint)
+            wrong_sha["checkpoint_sha256"] = "0" * 64
+            wrong_sha.pop("endpoint_sha256")
+            wrong_sha["endpoint_sha256"] = sha256_json(wrong_sha)
+            endpoint_path.write_text(json.dumps(wrong_sha), encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                _load_and_validate_endpoint_receipt(
+                    endpoint_receipt_path=endpoint_path,
+                    checkpoint_path=checkpoint_path,
+                    protocol_path=protocol_path,
+                    checkpoint=checkpoint,
+                    protocol=protocol,
+                    binding=SimpleNamespace(formal_protocol_sha256=formal_sha),
+                    runtime=SimpleNamespace(anchor_snapshot=snapshot),
+                )
+
+            bad_self_hash = dict(endpoint)
+            bad_self_hash["endpoint_sha256"] = "f" * 64
+            endpoint_path.write_text(json.dumps(bad_self_hash), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                _load_and_validate_endpoint_receipt(
+                    endpoint_receipt_path=endpoint_path,
+                    checkpoint_path=checkpoint_path,
+                    protocol_path=protocol_path,
+                    checkpoint=checkpoint,
+                    protocol=protocol,
+                    binding=SimpleNamespace(formal_protocol_sha256=formal_sha),
+                    runtime=SimpleNamespace(anchor_snapshot=snapshot),
+                )
+
+            bad_cost = dict(cost)
+            bad_cost["wall_time_s"] = -1.0
+            bad_cost_endpoint = dict(endpoint)
+            bad_cost_endpoint["cost"] = bad_cost
+            bad_cost_endpoint.pop("endpoint_sha256")
+            bad_cost_endpoint["endpoint_sha256"] = sha256_json(bad_cost_endpoint)
+            bad_cost_checkpoint = dict(checkpoint)
+            bad_cost_checkpoint["cost_summary"] = bad_cost
+            endpoint_path.write_text(json.dumps(bad_cost_endpoint), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                _load_and_validate_endpoint_receipt(
+                    endpoint_receipt_path=endpoint_path,
+                    checkpoint_path=checkpoint_path,
+                    protocol_path=protocol_path,
+                    checkpoint=bad_cost_checkpoint,
+                    protocol=protocol,
+                    binding=SimpleNamespace(formal_protocol_sha256=formal_sha),
+                    runtime=SimpleNamespace(anchor_snapshot=snapshot),
+                )
+
     def test_hotspot_receipt_is_train_only_and_eval_rejects_non_r1_before_cuda(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -1144,7 +1488,11 @@ class OCTFormalProtocolTests(unittest.TestCase):
                 "source_receipt": binding.hotspot_receipt(),
                 "source_split": "train",
                 "test_statistics_used": False,
+                "quantile": FORMAL_HOTSPOT_QUANTILE,
+                "histogram_bins": FORMAL_HOTSPOT_BINS,
                 "threshold_c": 25.0,
+                "range_c": [binding.tmin_c, binding.tmax_c],
+                "valid_train_pixels": 1000,
                 "train_view_ids_sha256": sha256_json(binding.names("train")),
             }
             payload["threshold_sha256"] = sha256_json(payload)
@@ -1158,6 +1506,15 @@ class OCTFormalProtocolTests(unittest.TestCase):
             path.write_text(json.dumps(payload), encoding="utf-8")
             with self.assertRaises(ValueError):
                 _load_hotspot_threshold(path, binding)
+            payload["source_split"] = "train"
+            payload["quantile"] = 0.90
+            basis = dict(payload)
+            basis.pop("threshold_sha256")
+            payload["threshold_sha256"] = sha256_json(basis)
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            loaded = _load_hotspot_threshold(path, binding)
+            with self.assertRaises(ValueError):
+                _validate_formal_hotspot_threshold(loaded, binding)
         with self.assertRaises(ValueError):
             command_eval(SimpleNamespace(resolution=2))
 
