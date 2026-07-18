@@ -30,7 +30,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.camera_sequence import camera_parameters_hash
+from utils.camera_sequence import camera_parameters_hash, camera_parameters_payload
 
 
 AUDIT_SCHEMA = "uav-tgs-ogs-v1-anchor-audit-v1"
@@ -390,6 +390,39 @@ def ordered_names_sha256(names: Sequence[str]) -> str:
     return canonical_json_sha256(list(names))
 
 
+def build_camera_audit_payload(
+    cameras: Sequence[object],
+) -> tuple[list[dict[str, Any]], str]:
+    """Serialize camera rows and bind the digest written by the audit."""
+
+    payload = camera_parameters_payload(cameras)
+    digest = camera_parameters_hash(cameras)
+    if canonical_json_sha256(payload) != digest:
+        raise OgsAuditError("camera payload and camera-parameter hash disagree")
+    return payload, digest
+
+
+def build_ordered_camera_manifest(
+    scene_name: str,
+    ordered_camera_names: Sequence[str],
+    cameras: Sequence[object],
+) -> dict[str, Any]:
+    """Build the complete ordered-camera sidecar without GPU dependencies."""
+
+    names = list(ordered_camera_names)
+    if len(names) != len(cameras):
+        raise OgsAuditError("ordered camera names and camera payload lengths differ")
+    camera_payload, camera_parameters_sha = build_camera_audit_payload(cameras)
+    return {
+        "schema": "uav-tgs-ogs-v1-ordered-train-cameras-v1",
+        "scene_name": scene_name,
+        "ordered_camera_names": names,
+        "ordered_camera_sha256": ordered_names_sha256(names),
+        "camera_parameters_sha256": camera_parameters_sha,
+        "cameras": camera_payload,
+    }
+
+
 def _read_ply_raw_geometry(path: Path) -> dict[str, np.ndarray]:
     from plyfile import PlyData
 
@@ -673,8 +706,13 @@ def _run_gpu_audit(args: argparse.Namespace) -> dict[str, Any]:
         )
         gaussians.active_sh_degree = active_sh_degree
 
-    camera_parameters_sha = camera_parameters_hash(cameras)
-    ordered_camera_names_sha = ordered_names_sha256(ordered_camera_names)
+    ordered_camera_manifest = build_ordered_camera_manifest(
+        args.scene_name, ordered_camera_names, cameras
+    )
+    camera_parameters_sha = ordered_camera_manifest["camera_parameters_sha256"]
+    ordered_camera_names_sha = ordered_camera_manifest[
+        "ordered_camera_sha256"
+    ]
 
     background = torch.tensor(
         [1.0, 1.0, 1.0] if dataset.white_background else [0.0, 0.0, 0.0],
@@ -837,14 +875,7 @@ def _run_gpu_audit(args: argparse.Namespace) -> dict[str, Any]:
     _prepare_output_directory(output, overwrite=args.overwrite)
     _write_json(
         output / "ordered_camera_names.json",
-        {
-            "schema": "uav-tgs-ogs-v1-ordered-train-cameras-v1",
-            "scene_name": args.scene_name,
-            "ordered_camera_names": ordered_camera_names,
-            "ordered_camera_sha256": ordered_camera_names_sha,
-            "camera_parameters_sha256": camera_parameters_sha,
-            "cameras": camera_payload,
-        },
+        ordered_camera_manifest,
     )
     cache_path = output / "ogs_v1_anchor_cache.pt"
     semantic_cache_sha = save_ogs_cache(cache_path, cache)

@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -11,6 +12,33 @@ from tools import audit_ogs_v1
 
 
 class OgsV1AuditSidecarTests(unittest.TestCase):
+    def test_camera_audit_payload_is_defined_and_hash_bound(self) -> None:
+        camera = SimpleNamespace(
+            image_name="0001.jpg",
+            uid=7,
+            colmap_id=11,
+            R=np.eye(3, dtype=np.float64),
+            T=np.asarray([1.0, 2.0, 3.0], dtype=np.float64),
+            FoVx=0.8,
+            FoVy=0.6,
+            image_width=1259,
+            image_height=1007,
+        )
+        manifest = audit_ogs_v1.build_ordered_camera_manifest(
+            "InternalRoad", [camera.image_name], [camera]
+        )
+        payload = manifest["cameras"]
+        self.assertEqual(payload[0]["image_name"], "0001.jpg")
+        self.assertEqual(payload[0]["image_width"], 1259)
+        self.assertEqual(
+            manifest["camera_parameters_sha256"],
+            audit_ogs_v1.canonical_json_sha256(payload),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "ordered_camera_names.json"
+            audit_ogs_v1._write_json(path, manifest)
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), manifest)
+
     def test_parse_established_clamp_sidecar_and_fail_closed_checks(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "clamp.json"
