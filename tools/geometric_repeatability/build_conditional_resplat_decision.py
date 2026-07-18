@@ -6,8 +6,9 @@ front-error concentration and per-Gaussian diagnostics from train/guard views,
 binds the decision to the already frozen SCSP support-anomaly set, and writes a
 receipt before test-only final reporting is allowed.
 
-The decision thresholds are protocol constants, not CLI parameters.  The
-sidecar never modifies a model, split, reference, or dataset.
+The v2 decision is the exact intersection of the locked SCSP anomaly set and
+the train/guard top-0.1% front-responsibility sets.  The sidecar never modifies
+a model, split, reference, or dataset.
 """
 
 from __future__ import annotations
@@ -53,24 +54,14 @@ from tools.geometric_repeatability.evaluate_depth_definitions import (
 )
 
 
-PROTOCOL = "uav-tgs-conditional-resplat-decision-v1"
+PROTOCOL = "uav-tgs-conditional-resplat-decision-v2"
 SELECTION_SPLITS = ("train", "guard")
 FRONT_SIGNAL = "front_max_contribution"
+LOCKED_SCSP_MANIFEST_SHA256 = "a6f95331ceb5f9bc36ad0f3b52fd802ff9bce8cc2a4eb73c00680bef330a84a1"
 
-# Pre-registered fixed AND contract.  There are intentionally no CLI knobs.
+# Frozen v2 candidate contract.  There are intentionally no CLI knobs.
 TOP_001_FRACTION = 0.001
 TOP_01_FRACTION = 0.01
-MIN_ASSIGNED_MASS_FRACTION = 0.95
-MIN_TOP_001_MASS_SHARE = 0.20
-MIN_TOP_01_MASS_SHARE = 0.50
-MAX_SINGLE_VIEW_MASS_SHARE = 0.25
-MAX_SINGLE_BLOCK_MASS_SHARE = 0.50
-MIN_STABLE_INTERSECTION = 3
-MIN_ENRICHMENT = 10.0
-MIN_SCSP_RECALL = 0.25
-MIN_CANDIDATE_FRONT_VIEWS = 3
-MIN_CANDIDATE_FRONT_BLOCKS = 2
-ROBUST_IQR_MULTIPLIER = 3.0
 DEPTH_MIN_M = 1.0e-6
 OPACITY_THRESHOLD = 0.5
 # Existing smallest formal front-curve threshold.  Selection mass is only the
@@ -102,17 +93,62 @@ def _identity(path: Path) -> dict[str, Any]:
     return {"path": str(path), "size_bytes": int(path.stat().st_size), "sha256": _sha256(path)}
 
 
-def _stable_positive_order(mass: np.ndarray) -> np.ndarray:
-    mass = np.asarray(mass, dtype=np.float64).reshape(-1)
-    positive = np.flatnonzero(np.isfinite(mass) & (mass > 0.0))
-    if positive.size == 0:
-        return positive.astype(np.int64)
-    return positive[np.lexsort((positive, -mass[positive]))].astype(np.int64, copy=False)
+def _canonical_json_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
-def _top_indices(mass: np.ndarray, fraction: float) -> np.ndarray:
-    count = int(math.ceil(float(np.asarray(mass).size) * float(fraction)))
-    return _stable_positive_order(mass)[:count]
+def _top_responsibility_indices(
+    mass: np.ndarray,
+    fraction: float,
+    *,
+    gaussian_count: int,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Return the frozen top-fraction set over valid responsibility entries.
+
+    Gaussian indices are implicit array positions, so exact length is the
+    index-validity contract.  Negative responsibility is a protocol error.
+    Non-finite entries are excluded from ``N_valid`` and reported.
+    """
+
+    values = np.asarray(mass, dtype=np.float64).reshape(-1)
+    if values.size != int(gaussian_count):
+        raise ValueError(
+            "responsibility length does not match Gaussian index space: "
+            f"expected={gaussian_count} actual={values.size}"
+        )
+    negative = np.flatnonzero(values < 0.0)
+    if negative.size:
+        raise ValueError(
+            "front responsibility contains negative entries; first indices="
+            + ",".join(str(int(index)) for index in negative[:20])
+        )
+    valid = np.isfinite(values) & (values >= 0.0)
+    valid_indices = np.flatnonzero(valid).astype(np.int64, copy=False)
+    n_valid = int(valid_indices.size)
+    if n_valid == 0:
+        raise ValueError("front responsibility has no finite nonnegative entries")
+    k = max(1, int(math.ceil(float(fraction) * float(n_valid))))
+    ordered = valid_indices[
+        np.lexsort((valid_indices, -values[valid_indices]))
+    ].astype(np.int64, copy=False)
+    selected = ordered[:k]
+    return selected, {
+        "n_valid": n_valid,
+        "nonfinite_count": int(values.size - n_valid),
+        "k": k,
+        "fraction": float(fraction),
+        "ordering": "responsibility_descending_then_gaussian_index_ascending",
+    }
+
+
+def _top_indices(mass: np.ndarray, fraction: float, *, gaussian_count: int) -> np.ndarray:
+    selected, _ = _top_responsibility_indices(
+        mass, fraction, gaussian_count=gaussian_count
+    )
+    return selected
 
 
 def _mass_share(mass: np.ndarray, indices: np.ndarray) -> float:
@@ -165,37 +201,6 @@ def _support_overlap(candidate: np.ndarray, support_indices: frozenset[int], pop
         "candidate_count": evidence["first_count"],
         "support_count": evidence["second_count"],
         "support_recall": evidence["second_recall"],
-    }
-
-
-def _robust_tail(score: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
-    score = np.asarray(score, dtype=np.float64).reshape(-1)
-    positive = score[np.isfinite(score) & (score > 0.0)]
-    if positive.size == 0:
-        return np.zeros((0,), dtype=np.int64), {
-            "positive_count": 0,
-            "q1": None,
-            "q3": None,
-            "iqr": None,
-            "multiplier": ROBUST_IQR_MULTIPLIER,
-            "log_cutoff": None,
-            "score_cutoff": None,
-        }
-    log_value = np.log(positive)
-    q1 = float(np.quantile(log_value, 0.25))
-    q3 = float(np.quantile(log_value, 0.75))
-    iqr = q3 - q1
-    log_cutoff = q3 + ROBUST_IQR_MULTIPLIER * iqr
-    cutoff = float(math.exp(log_cutoff))
-    indices = np.flatnonzero(np.isfinite(score) & (score > cutoff)).astype(np.int64)
-    return indices, {
-        "positive_count": int(positive.size),
-        "q1": q1,
-        "q3": q3,
-        "iqr": iqr,
-        "multiplier": ROBUST_IQR_MULTIPLIER,
-        "log_cutoff": log_cutoff,
-        "score_cutoff": cutoff,
     }
 
 
@@ -431,17 +436,31 @@ def compute_fixed_decision(
     scsp_indices: frozenset[int],
     finite_support_indices: frozenset[int],
     candidate_block_counts: Mapping[int, int],
+    support_distances: Mapping[int, float] | None = None,
 ) -> dict[str, Any]:
-    """Apply the fixed AND gate without consulting test data."""
+    """Apply the frozen v2 train/guard candidate rule without test data."""
+
+    if gaussian_count <= 0:
+        raise ValueError("gaussian_count must be positive")
+    invalid_scsp = sorted(
+        int(index)
+        for index in scsp_indices
+        if int(index) < 0 or int(index) >= int(gaussian_count)
+    )
+    if invalid_scsp:
+        raise ValueError(f"SCSP anomaly indices are outside Gaussian index space: {invalid_scsp[:20]}")
 
     split_evidence: dict[str, Any] = {}
     top_sets: dict[str, dict[str, np.ndarray]] = {}
-    conditions: dict[str, bool] = {}
     for split in SELECTION_SPLITS:
         state = states[split]
         mass = np.asarray(state["front_mass"], dtype=np.float64)
-        top001 = _top_indices(mass, TOP_001_FRACTION)
-        top01 = _top_indices(mass, TOP_01_FRACTION)
+        top001, top001_contract = _top_responsibility_indices(
+            mass, TOP_001_FRACTION, gaussian_count=gaussian_count
+        )
+        top01, top01_contract = _top_responsibility_indices(
+            mass, TOP_01_FRACTION, gaussian_count=gaussian_count
+        )
         top_sets[split] = {"top_0.1pct": top001, "top_1pct": top01}
         raw_mass = float(state["raw_front_mass"])
         assigned_mass = float(state["assigned_front_mass"])
@@ -454,69 +473,101 @@ def compute_fixed_decision(
             "assigned_front_mass": assigned_mass,
             "assigned_mass_fraction": assigned_fraction,
             "top_0.1pct": {
+                **top001_contract,
                 "count": int(top001.size),
                 "mass_share": _mass_share(mass, top001),
                 "indices": top001.tolist(),
+                "indices_sha256": _canonical_json_sha256(top001.tolist()),
             },
             "top_1pct": {
+                **top01_contract,
                 "count": int(top01.size),
                 "mass_share": _mass_share(mass, top01),
-                "indices_sha256": hashlib.sha256(top01.astype("<i8", copy=False).tobytes()).hexdigest(),
+                "indices_sha256": _canonical_json_sha256(top01.tolist()),
             },
             "view_concentration": view_concentration,
             "block_concentration": block_concentration,
             "scsp_overlap_top_0.1pct": support,
         }
-        conditions[f"{split}_positive_front_mass"] = raw_mass > 0.0
-        conditions[f"{split}_assigned_mass_fraction"] = assigned_fraction >= MIN_ASSIGNED_MASS_FRACTION
-        conditions[f"{split}_top_0.1pct_mass_share"] = (
-            split_evidence[split]["top_0.1pct"]["mass_share"] >= MIN_TOP_001_MASS_SHARE
-        )
-        conditions[f"{split}_top_1pct_mass_share"] = (
-            split_evidence[split]["top_1pct"]["mass_share"] >= MIN_TOP_01_MASS_SHARE
-        )
-        conditions[f"{split}_not_single_view_dominated"] = (
-            view_concentration["top1_share"] <= MAX_SINGLE_VIEW_MASS_SHARE
-        )
-        conditions[f"{split}_not_single_block_dominated"] = (
-            block_concentration["top1_share"] <= MAX_SINGLE_BLOCK_MASS_SHARE
-        )
-        conditions[f"{split}_scsp_intersection_count"] = support["intersection_count"] >= MIN_STABLE_INTERSECTION
-        conditions[f"{split}_scsp_recall"] = support["support_recall"] >= MIN_SCSP_RECALL
-        conditions[f"{split}_scsp_enrichment"] = support["enrichment"] >= MIN_ENRICHMENT
 
     stability = _overlap_evidence(
         top_sets["train"]["top_0.1pct"],
         top_sets["guard"]["top_0.1pct"],
         gaussian_count,
     )
-    conditions["train_guard_top_0.1pct_intersection"] = stability["intersection_count"] >= MIN_STABLE_INTERSECTION
-    conditions["train_guard_top_0.1pct_enrichment"] = stability["enrichment"] >= MIN_ENRICHMENT
-    conditions["nonempty_scsp_support_anomaly_set"] = bool(scsp_indices)
 
-    train_mass = np.asarray(states["train"]["front_mass"], dtype=np.float64)
-    guard_mass = np.asarray(states["guard"]["front_mass"], dtype=np.float64)
-    train_total = float(np.sum(train_mass, dtype=np.float64))
-    guard_total = float(np.sum(guard_mass, dtype=np.float64))
-    balanced_score = np.zeros((gaussian_count,), dtype=np.float64)
-    if train_total > 0.0:
-        balanced_score += 0.5 * train_mass / train_total
-    if guard_total > 0.0:
-        balanced_score += 0.5 * guard_mass / guard_total
-    robust_indices, robust_fence = _robust_tail(balanced_score)
-    eligible = []
+    train_top = {int(index) for index in top_sets["train"]["top_0.1pct"].tolist()}
+    guard_top = {int(index) for index in top_sets["guard"]["top_0.1pct"].tolist()}
+    candidates = sorted(scsp_indices.intersection(train_top).intersection(guard_top))
+
+    support_distances = support_distances or {}
     train_views = np.asarray(states["train"]["front_assigned_view_count"], dtype=np.int64)
     guard_views = np.asarray(states["guard"]["front_assigned_view_count"], dtype=np.int64)
-    for index in robust_indices.tolist():
-        if (
-            index in scsp_indices
-            and index in finite_support_indices
-            and int(train_views[index] + guard_views[index]) >= MIN_CANDIDATE_FRONT_VIEWS
-            and int(candidate_block_counts.get(index, 0)) >= MIN_CANDIDATE_FRONT_BLOCKS
-        ):
-            eligible.append(int(index))
-    conditions["nonempty_robust_support_bound_candidate_set"] = bool(eligible)
-    triggered = all(conditions.values())
+    for label, values in (("train", train_views), ("guard", guard_views)):
+        if values.size != gaussian_count or bool((values < 0).any()):
+            raise ValueError(f"{label} front-view counts do not match the Gaussian index space")
+
+    candidate_rows = []
+    finite_distances = []
+    for index in candidates:
+        distance = float(support_distances.get(index, float("nan")))
+        finite_positive_support = (
+            index in finite_support_indices and math.isfinite(distance) and distance > 0.0
+        )
+        if finite_positive_support:
+            finite_distances.append(distance)
+        candidate_rows.append(
+            {
+                "gaussian_index": int(index),
+                "train_front_mass": float(states["train"]["front_mass"][index]),
+                "guard_front_mass": float(states["guard"]["front_mass"][index]),
+                "train_front_views": int(train_views[index]),
+                "guard_front_views": int(guard_views[index]),
+                "combined_front_views": int(train_views[index] + guard_views[index]),
+                "train_guard_front_blocks": int(candidate_block_counts.get(index, 0)),
+                "local_support_distance_m": distance if finite_positive_support else None,
+                "finite_positive_support": bool(finite_positive_support),
+            }
+        )
+
+    candidate_mass: dict[str, Any] = {}
+    for split in SELECTION_SPLITS:
+        mass = np.asarray(states[split]["front_mass"], dtype=np.float64)
+        valid = np.isfinite(mass) & (mass >= 0.0)
+        total = float(np.sum(mass[valid], dtype=np.float64))
+        selected_mass = float(
+            np.sum(mass[np.asarray(candidates, dtype=np.int64)], dtype=np.float64)
+        ) if candidates else 0.0
+        candidate_mass[split] = {
+            "total_valid_responsibility_mass": total,
+            "candidate_responsibility_mass": selected_mass,
+            "candidate_mass_share": selected_mass / total if total > 0.0 else 0.0,
+        }
+
+    combined_views = [row["combined_front_views"] for row in candidate_rows]
+    block_counts = [row["train_guard_front_blocks"] for row in candidate_rows]
+    support_summary = {
+        "finite_positive_count": len(finite_distances),
+        "missing_or_nonpositive_count": len(candidates) - len(finite_distances),
+        "minimum_distance_m": min(finite_distances) if finite_distances else None,
+        "maximum_distance_m": max(finite_distances) if finite_distances else None,
+        "mean_distance_m": (
+            float(sum(finite_distances)) / float(len(finite_distances))
+            if finite_distances
+            else None
+        ),
+        "used_for_candidate_selection": False,
+    }
+    view_block_summary = {
+        "minimum_combined_front_views": min(combined_views) if combined_views else None,
+        "maximum_combined_front_views": max(combined_views) if combined_views else None,
+        "minimum_train_guard_front_blocks": min(block_counts) if block_counts else None,
+        "maximum_train_guard_front_blocks": max(block_counts) if block_counts else None,
+        "used_for_candidate_selection": False,
+    }
+
+    conditions = {"nonempty_exact_candidate_set": bool(candidates)}
+    triggered = bool(candidates)
     failed = sorted(key for key, value in conditions.items() if not value)
     return {
         "decision": "execute_one_deterministic_resplat" if triggered else "skip_resplat",
@@ -525,15 +576,23 @@ def compute_fixed_decision(
         "conditions": conditions,
         "split_evidence": split_evidence,
         "train_guard_top_0.1pct_stability": stability,
-        "balanced_front_score": {
-            "formula": "0.5*train_mass/sum(train_mass)+0.5*guard_mass/sum(guard_mass)",
-            "robust_tail": robust_fence,
-            "robust_tail_count": int(robust_indices.size),
-            "robust_tail_indices_sha256": hashlib.sha256(
-                robust_indices.astype("<i8", copy=False).tobytes()
-            ).hexdigest(),
+        "candidate_rule": {
+            "formula": "SCSP_support_anomaly AND train_top_0.1pct AND guard_top_0.1pct",
+            "scsp_support_anomaly_count": len(scsp_indices),
+            "scsp_support_anomaly_indices_sha256": _canonical_json_sha256(sorted(scsp_indices)),
+            "train_top_0.1pct_count": int(top_sets["train"]["top_0.1pct"].size),
+            "guard_top_0.1pct_count": int(top_sets["guard"]["top_0.1pct"].size),
+            "candidate_count": len(candidates),
+            "candidate_indices": candidates,
+            "candidate_indices_sha256": _canonical_json_sha256(candidates),
+            "responsibility_mass": candidate_mass,
+            "support_summary": support_summary,
+            "view_block_summary": view_block_summary,
+            "candidate_diagnostics": candidate_rows,
         },
-        "eligible_candidate_indices": eligible,
+        # Retain this alias so old consumers can read a v2 receipt while the
+        # candidate_rule object remains the authoritative schema.
+        "eligible_candidate_indices": candidates,
     }
 
 
@@ -748,6 +807,13 @@ def run(
     for path in inputs:
         if not path.resolve().is_file():
             raise FileNotFoundError(path)
+    scsp_manifest_identity = _identity(scsp_manifest_path.resolve())
+    if scsp_manifest_identity["sha256"] != LOCKED_SCSP_MANIFEST_SHA256:
+        raise ValueError(
+            "SCSP manifest is not the locked formal support-anomaly receipt: "
+            f"expected={LOCKED_SCSP_MANIFEST_SHA256} "
+            f"actual={scsp_manifest_identity['sha256']}"
+        )
     out_dir = out_dir.resolve()
     if out_dir.exists() and any(out_dir.iterdir()):
         raise FileExistsError(f"Refusing non-empty output directory: {out_dir}")
@@ -821,16 +887,16 @@ def run(
 
         top_union: set[int] = set()
         for split in SELECTION_SPLITS:
-            top_union.update(_top_indices(states[split]["front_mass"], TOP_01_FRACTION).tolist())
-        train_mass = np.asarray(states["train"]["front_mass"], dtype=np.float64)
-        guard_mass = np.asarray(states["guard"]["front_mass"], dtype=np.float64)
-        balanced = np.zeros((gaussian_count,), dtype=np.float64)
-        if float(train_mass.sum()) > 0.0:
-            balanced += 0.5 * train_mass / float(train_mass.sum())
-        if float(guard_mass.sum()) > 0.0:
-            balanced += 0.5 * guard_mass / float(guard_mass.sum())
-        robust_indices, _ = _robust_tail(balanced)
-        diagnostics_indices = np.asarray(sorted(top_union | set(robust_indices.tolist()) | set(scsp.indices)), dtype=np.int64)
+            top_union.update(
+                _top_indices(
+                    states[split]["front_mass"],
+                    TOP_01_FRACTION,
+                    gaussian_count=gaussian_count,
+                ).tolist()
+            )
+        diagnostics_indices = np.asarray(
+            sorted(top_union | set(scsp.indices)), dtype=np.int64
+        )
         properties = _load_model_properties(model_manifest, gaussian_count)
         support_distance, support_receipt = support_query(
             properties["xyz"],
@@ -848,6 +914,19 @@ def run(
             scsp_indices=scsp.indices,
             finite_support_indices=finite_support,
             candidate_block_counts=block_counts,
+            support_distances=support_distance,
+        )
+
+        train_top_v2 = set(
+            int(index)
+            for index in decision["split_evidence"]["train"]["top_0.1pct"]["indices"]
+        )
+        guard_top_v2 = set(
+            int(index)
+            for index in decision["split_evidence"]["guard"]["top_0.1pct"]["indices"]
+        )
+        candidate_v2 = set(
+            int(index) for index in decision["candidate_rule"]["candidate_indices"]
         )
 
         arrays: dict[str, np.ndarray] = {}
@@ -875,6 +954,9 @@ def run(
             fields = [
                 "gaussian_index",
                 "scsp_support_anomaly",
+                "train_top_0.1pct_v2",
+                "guard_top_0.1pct_v2",
+                "exact_candidate_v2",
                 "local_support_distance_m",
                 "activated_opacity",
                 "scale_0_m",
@@ -915,6 +997,9 @@ def run(
                     {
                         "gaussian_index": index,
                         "scsp_support_anomaly": index in scsp.indices,
+                        "train_top_0.1pct_v2": index in train_top_v2,
+                        "guard_top_0.1pct_v2": index in guard_top_v2,
+                        "exact_candidate_v2": index in candidate_v2,
                         "local_support_distance_m": distance if math.isfinite(distance) else "",
                         "activated_opacity": float(properties["activated_opacity"][index]),
                         "scale_0_m": float(scale[0]),
@@ -984,23 +1069,27 @@ def run(
                 "tool_identity": _identity(Path(__file__).resolve()),
             },
             "decision_contract": {
-                "logic": "all fixed conditions must pass; no threshold is tunable",
+                "version": 2,
+                "logic": (
+                    "exact set intersection: locked SCSP support anomaly AND "
+                    "train top-0.1% front responsibility AND guard top-0.1% "
+                    "front responsibility"
+                ),
                 "constants": {
                     "top_0.1_fraction": TOP_001_FRACTION,
-                    "top_1_fraction": TOP_01_FRACTION,
-                    "minimum_assigned_mass_fraction": MIN_ASSIGNED_MASS_FRACTION,
-                    "minimum_top_0.1_mass_share": MIN_TOP_001_MASS_SHARE,
-                    "minimum_top_1_mass_share": MIN_TOP_01_MASS_SHARE,
-                    "maximum_single_view_mass_share": MAX_SINGLE_VIEW_MASS_SHARE,
-                    "maximum_single_block_mass_share": MAX_SINGLE_BLOCK_MASS_SHARE,
-                    "minimum_intersection_count": MIN_STABLE_INTERSECTION,
-                    "minimum_enrichment": MIN_ENRICHMENT,
-                    "minimum_scsp_recall": MIN_SCSP_RECALL,
-                    "minimum_candidate_front_views": MIN_CANDIDATE_FRONT_VIEWS,
-                    "minimum_candidate_front_blocks": MIN_CANDIDATE_FRONT_BLOCKS,
+                    "n_valid": (
+                        "finite nonnegative responsibility entries whose implicit "
+                        "array position is a valid Gaussian index"
+                    ),
+                    "k_rule": "max(1,ceil(0.001*N_valid))",
+                    "ordering": "responsibility descending, Gaussian index ascending",
+                    "negative_responsibility": "fail_closed",
+                    "nonfinite_responsibility": "excluded_from_N_valid",
+                    "locked_scsp_manifest_sha256": LOCKED_SCSP_MANIFEST_SHA256,
                     "material_front_threshold_m": MATERIAL_FRONT_THRESHOLD_M,
-                    "robust_tail": "Q3+3*IQR on log positive balanced front score",
                 },
+                "support_view_block_role": "reported_only_not_candidate_filters",
+                "balanced_or_log_iqr_eligibility_used": False,
                 "clamp20_used": False,
                 "rgb_or_temperature_used_to_trigger": False,
                 "front_mass_semantics": (
@@ -1019,7 +1108,7 @@ def run(
                 "reference_manifest": _identity(reference_manifest_path.resolve()),
                 "model_manifest": _identity(model_manifest_path.resolve()),
                 "formal_split_manifest": _identity(formal_split_manifest_path.resolve()),
-                "scsp_manifest": _identity(scsp_manifest_path.resolve()),
+                "scsp_manifest": scsp_manifest_identity,
                 "temperature_responsibility_manifest": _identity(
                     temperature_responsibility_manifest_path.resolve()
                 )

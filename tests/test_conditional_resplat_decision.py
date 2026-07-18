@@ -5,13 +5,16 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
+import tools.geometric_repeatability.build_conditional_resplat_decision as conditional_resplat
 from tools.geometric_repeatability.build_conditional_resplat_decision import (
     SelectionView,
     _candidate_block_counts,
     _selection_views,
+    _top_responsibility_indices,
     collect_selection_signals,
     compute_fixed_decision,
     run,
@@ -44,7 +47,7 @@ def _passing_state(count: int) -> dict[str, object]:
 
 
 class ConditionalResplatDecisionTests(unittest.TestCase):
-    def test_fixed_and_contract_can_trigger_on_stable_concentrated_support_anomalies(self) -> None:
+    def test_v2_exact_intersection_triggers_without_support_view_block_filtering(self) -> None:
         count = 10_000
         states = {"train": _passing_state(count), "guard": _passing_state(count)}
         decision = compute_fixed_decision(
@@ -57,32 +60,86 @@ class ConditionalResplatDecisionTests(unittest.TestCase):
         self.assertTrue(decision["triggered"])
         self.assertEqual(decision["decision"], "execute_one_deterministic_resplat")
         self.assertEqual(decision["failed_conditions"], [])
-        self.assertGreaterEqual(
-            decision["split_evidence"]["train"]["top_0.1pct"]["mass_share"],
-            0.20,
-        )
-        self.assertGreaterEqual(
-            decision["split_evidence"]["train"]["top_1pct"]["mass_share"],
-            0.50,
-        )
+        rule = decision["candidate_rule"]
+        self.assertEqual(rule["candidate_indices"], list(range(10)))
+        self.assertEqual(rule["candidate_count"], 10)
+        self.assertEqual(decision["split_evidence"]["train"]["top_0.1pct"]["k"], 10)
+        self.assertEqual(rule["support_summary"]["finite_positive_count"], 0)
+        self.assertFalse(rule["support_summary"]["used_for_candidate_selection"])
+        self.assertFalse(rule["view_block_summary"]["used_for_candidate_selection"])
 
-    def test_diffuse_mass_fails_without_relaxing_contract(self) -> None:
-        count = 10_000
-        state = _passing_state(count)
-        state["front_mass"] = np.ones((count,), dtype=np.float64)
-        state["raw_front_mass"] = float(count)
-        state["assigned_front_mass"] = float(count)
+    def test_v2_empty_exact_intersection_skips(self) -> None:
+        count = 2_000
+        train = _passing_state(count)
+        guard = _passing_state(count)
+        train_mass = np.zeros((count,), dtype=np.float64)
+        guard_mass = np.zeros((count,), dtype=np.float64)
+        train_mass[[5, 8]] = [10.0, 9.0]
+        guard_mass[[5, 9]] = [10.0, 9.0]
+        train["front_mass"] = train_mass
+        guard["front_mass"] = guard_mass
         decision = compute_fixed_decision(
-            {"train": state, "guard": dict(state)},
+            {"train": train, "guard": guard},
             gaussian_count=count,
-            scsp_indices=frozenset(range(12)),
+            scsp_indices=frozenset({8, 9}),
             finite_support_indices=frozenset(range(count)),
-            candidate_block_counts={index: 2 for index in range(count)},
+            candidate_block_counts={8: 10, 9: 10},
         )
         self.assertFalse(decision["triggered"])
         self.assertEqual(decision["decision"], "skip_resplat")
-        self.assertIn("train_top_1pct_mass_share", decision["failed_conditions"])
-        self.assertIn("guard_top_0.1pct_mass_share", decision["failed_conditions"])
+        self.assertEqual(decision["candidate_rule"]["candidate_indices"], [])
+        self.assertEqual(decision["failed_conditions"], ["nonempty_exact_candidate_set"])
+
+    def test_v2_n_valid_k_and_stable_tie_order(self) -> None:
+        mass = np.zeros((1_501,), dtype=np.float64)
+        mass[100] = np.nan
+        mass[9] = 10.0
+        mass[2] = 10.0
+        selected, evidence = _top_responsibility_indices(
+            mass, 0.001, gaussian_count=1_501
+        )
+        self.assertEqual(evidence["n_valid"], 1_500)
+        self.assertEqual(evidence["nonfinite_count"], 1)
+        self.assertEqual(evidence["k"], 2)
+        self.assertEqual(selected.tolist(), [2, 9])
+
+    def test_v2_negative_responsibility_fails_closed(self) -> None:
+        mass = np.zeros((10,), dtype=np.float64)
+        mass[3] = -0.01
+        with self.assertRaisesRegex(ValueError, "negative entries"):
+            _top_responsibility_indices(mass, 0.001, gaussian_count=10)
+
+    def test_v2_candidate_reports_mass_support_views_blocks_and_hash(self) -> None:
+        count = 2_000
+        train = _passing_state(count)
+        guard = _passing_state(count)
+        train_mass = np.zeros((count,), dtype=np.float64)
+        guard_mass = np.zeros((count,), dtype=np.float64)
+        train_mass[[5, 8]] = [10.0, 9.0]
+        guard_mass[[5, 9]] = [11.0, 9.0]
+        train["front_mass"] = train_mass
+        guard["front_mass"] = guard_mass
+        train["front_assigned_view_count"][5] = 7
+        guard["front_assigned_view_count"][5] = 4
+        decision = compute_fixed_decision(
+            {"train": train, "guard": guard},
+            gaussian_count=count,
+            scsp_indices=frozenset({5, 8, 9}),
+            finite_support_indices=frozenset({5}),
+            candidate_block_counts={5: 3},
+            support_distances={5: 1.25},
+        )
+        rule = decision["candidate_rule"]
+        self.assertEqual(rule["candidate_indices"], [5])
+        self.assertEqual(
+            rule["candidate_indices_sha256"],
+            hashlib.sha256(b"[5]").hexdigest(),
+        )
+        self.assertEqual(rule["responsibility_mass"]["train"]["candidate_responsibility_mass"], 10.0)
+        self.assertEqual(rule["responsibility_mass"]["guard"]["candidate_responsibility_mass"], 11.0)
+        self.assertEqual(rule["support_summary"]["minimum_distance_m"], 1.25)
+        self.assertEqual(rule["view_block_summary"]["minimum_combined_front_views"], 11)
+        self.assertEqual(rule["view_block_summary"]["minimum_train_guard_front_blocks"], 3)
 
     def test_collect_signals_skips_test_npz_and_accumulates_top_weight(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -242,6 +299,24 @@ class ConditionalResplatDecisionTests(unittest.TestCase):
             self.assertEqual(str(by_split["test"].model_path), "__formal_test_not_opened__")
             self.assertFalse((root / "test.npz").exists())
 
+    def test_v2_run_rejects_unlocked_scsp_manifest_before_data_io(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = {}
+            for name in ("reference", "model", "formal", "scsp"):
+                path = root / f"{name}.json"
+                _write_json(path, {})
+                paths[name] = path
+            with self.assertRaisesRegex(ValueError, "locked formal support-anomaly"):
+                run(
+                    reference_manifest_path=paths["reference"],
+                    model_manifest_path=paths["model"],
+                    formal_split_manifest_path=paths["formal"],
+                    scsp_manifest_path=paths["scsp"],
+                    sparse_root=root,
+                    out_dir=root / "decision",
+                )
+
     def test_full_sidecar_publishes_receipt_without_test_npz(self) -> None:
         from plyfile import PlyData, PlyElement
 
@@ -382,19 +457,25 @@ class ConditionalResplatDecisionTests(unittest.TestCase):
                 return {int(index): 1.0 for index in indices.tolist()}, {"points3d_sha256": "a" * 64}
 
             output = root / "decision"
-            receipt = run(
-                reference_manifest_path=reference_manifest,
-                model_manifest_path=model_manifest,
-                formal_split_manifest_path=formal,
-                scsp_manifest_path=scsp,
-                sparse_root=root,
-                out_dir=output,
-                support_query=fake_support,
-            )
+            with mock.patch.object(
+                conditional_resplat, "LOCKED_SCSP_MANIFEST_SHA256", _sha(scsp)
+            ):
+                receipt = run(
+                    reference_manifest_path=reference_manifest,
+                    model_manifest_path=model_manifest,
+                    formal_split_manifest_path=formal,
+                    scsp_manifest_path=scsp,
+                    sparse_root=root,
+                    out_dir=output,
+                    support_query=fake_support,
+                )
             self.assertEqual(receipt["selection_policy"]["formal_test_npz_open_count_before_receipt"], 0)
+            self.assertEqual(receipt["protocol"], "uav-tgs-conditional-resplat-decision-v2")
+            self.assertEqual(receipt["decision_contract"]["version"], 2)
             self.assertEqual(receipt["decision_contract"]["constants"]["material_front_threshold_m"], 0.25)
             self.assertIn("D_ref-D_max_contribution-0.25m", receipt["decision_contract"]["front_mass_semantics"])
-            self.assertFalse(receipt["decision"]["triggered"])
+            self.assertTrue(receipt["decision"]["triggered"])
+            self.assertEqual(receipt["decision"]["candidate_rule"]["candidate_indices"], [0])
             self.assertTrue((output / "conditional_resplat_decision_receipt.json").is_file())
             self.assertTrue((output / "selection_signals_train_guard_only.npz").is_file())
             csv_header = (output / "candidate_diagnostics_train_guard_only.csv").read_text(
@@ -402,6 +483,7 @@ class ConditionalResplatDecisionTests(unittest.TestCase):
             ).splitlines()[0]
             self.assertIn("train_temperature_view_mean_count", csv_header)
             self.assertIn("guard_temperature_view_mean_count", csv_header)
+            self.assertIn("exact_candidate_v2", csv_header)
             self.assertFalse((model_dir / "test.npz").exists())
             self.assertFalse((reference_dir / "test.npz").exists())
 
