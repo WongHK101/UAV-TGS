@@ -90,10 +90,24 @@ def render(args: argparse.Namespace) -> dict[str, Any]:
     manifest = _load_json(manifest_path)
     if manifest.get("status") != "passed":
         raise MechanismRenderError("shared-anchor manifest is not passed")
+    adaptive = manifest.get("schema") == "uav-tgs-adaptive-scale-anchor-v1"
     input_checkpoint = Path(manifest["input"]["checkpoint"]).resolve()
-    output_checkpoint = Path(manifest["output"]["checkpoint"]).resolve()
+    if adaptive:
+        output_checkpoint = Path(manifest["output"]["checkpoint"]).resolve()
+        input_checkpoint_sha = manifest["input"]["checkpoint_sha256"]
+        indices = np.asarray(manifest["modified_indices"], dtype=np.int64)
+        expected_count = manifest["counts"]["modified_gaussians"]
+        indices_sha = manifest["modified_indices_sha256"]
+        method_label = str(manifest["method"])
+    else:
+        output_checkpoint = Path(manifest["output"]["checkpoint"]).resolve()
+        input_checkpoint_sha = manifest["input"]["checkpoint_sha256_before"]
+        indices = np.asarray(manifest["clamped_indices"], dtype=np.int64)
+        expected_count = manifest["counts"]["actual_clamped_gaussians"]
+        indices_sha = manifest["clamped_indices_sha256"]
+        method_label = "absolute_clamp"
     if (
-        _sha256(input_checkpoint) != manifest["input"]["checkpoint_sha256_before"]
+        _sha256(input_checkpoint) != input_checkpoint_sha
         or _sha256(output_checkpoint) != manifest["output"]["checkpoint_sha256"]
     ):
         raise MechanismRenderError("checkpoint identity differs from the manifest")
@@ -105,8 +119,7 @@ def render(args: argparse.Namespace) -> dict[str, Any]:
     raw_scale = np.exp(raw_params[4].detach().numpy())
     shared_scale = np.exp(shared_params[4].detach().numpy())
     rotation = raw_params[5].detach().numpy()
-    indices = np.asarray(manifest["clamped_indices"], dtype=np.int64)
-    if len(indices) != manifest["counts"]["actual_clamped_gaussians"]:
+    if len(indices) != expected_count:
         raise MechanismRenderError("manifest clamp count/index list mismatch")
     if (
         not np.array_equal(raw_params[1].detach().numpy(), shared_params[1].detach().numpy())
@@ -200,8 +213,8 @@ def render(args: argparse.Namespace) -> dict[str, Any]:
         axis.set_ylabel("y")
         axis.set_zlabel("z")
     figure.suptitle(
-        f"{manifest['scene']} shared-anchor clamp: "
-        "raw (orange) vs S-anchor (green)"
+        f"{manifest['scene']} {method_label}: "
+        "raw (orange) vs projected anchor (green)"
     )
     figure.tight_layout()
     output_dir.mkdir(parents=True)
@@ -210,12 +223,13 @@ def render(args: argparse.Namespace) -> dict[str, Any]:
     plt.close(figure)
 
     report = {
-        "schema": "uav-tgs-shared-anchor-clamp-mechanism-render-v1",
+        "schema": "uav-tgs-scale-projection-mechanism-render-v1",
         "status": "complete",
         "scene": manifest["scene"],
         "anchor_iteration": raw_iteration,
         "clamped_gaussian_count": len(indices),
-        "clamped_indices_sha256": manifest["clamped_indices_sha256"],
+        "method": method_label,
+        "modified_indices_sha256": indices_sha,
         "input_manifest": str(manifest_path),
         "input_manifest_sha256": _sha256(manifest_path),
         "raw_checkpoint_sha256": _sha256(input_checkpoint),

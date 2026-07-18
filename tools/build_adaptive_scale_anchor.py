@@ -379,7 +379,16 @@ def build_adaptive_anchor(args: argparse.Namespace) -> dict[str, Any]:
             },
             "output": {
                 "model_dir": str(output_model),
+                "checkpoint": str(
+                    output_model / f"chkpnt{iteration}.pth"
+                ),
                 "checkpoint_sha256": _sha256(output_checkpoint),
+                "ply": str(
+                    output_model
+                    / "point_cloud"
+                    / f"iteration_{iteration}"
+                    / "point_cloud.ply"
+                ),
                 "ply_sha256": _sha256(output_ply),
                 "copied_model_files": copied_files,
             },
