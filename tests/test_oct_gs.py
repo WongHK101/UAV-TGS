@@ -55,12 +55,15 @@ from tools.oct_gs_formal import (
     _copy_immutable_reference,
     _formal_source_provenance,
     _load_hotspot_threshold,
+    _formal_metadata_cameras,
+    _metadata_camera,
     _remaining_sequence,
     _require_matching_source_provenance,
     _require_isolated_output,
     command_eval,
 )
 from utils.camera_sequence import build_sequence_manifest, save_sequence_manifest
+from utils.graphics_utils import focal2fov
 
 
 class DummyAnchor:
@@ -96,6 +99,23 @@ class DummyAnchor:
 class DummyCamera:
     def __init__(self):
         self.camera_center = torch.tensor([0.0, 0.0, 3.0], dtype=torch.float32)
+
+
+def fake_colmap_camera(name: str, *, camera_id: int = 7):
+    extrinsic = SimpleNamespace(
+        name=name,
+        camera_id=camera_id,
+        qvec=np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float64),
+        tvec=np.asarray([1.0, -2.0, 3.0], dtype=np.float64),
+    )
+    intrinsic = SimpleNamespace(
+        id=camera_id,
+        model="PINHOLE",
+        width=1280,
+        height=1024,
+        params=np.asarray([900.0, 880.0, 640.0, 512.0], dtype=np.float64),
+    )
+    return extrinsic, intrinsic
 
 
 def weighted_fake_renderer(weights):
@@ -583,6 +603,76 @@ class OCTRenderingAndLossTests(unittest.TestCase):
 
 
 class OCTFormalProtocolTests(unittest.TestCase):
+    def test_formal_metadata_cameras_do_not_decode_source_images(self):
+        train_b, intrinsic = fake_colmap_camera("b.png")
+        train_a, _ = fake_colmap_camera("a.png")
+        test_c, _ = fake_colmap_camera("c.png")
+        guard_d, _ = fake_colmap_camera("guard.png")
+        bound = {
+            "records": [
+                {"split": "train", "thermal_camera_name": "b.png"},
+                {"split": "guard", "thermal_camera_name": "guard.png"},
+                {"split": "test", "thermal_camera_name": "c.png"},
+                {"split": "train", "thermal_camera_name": "a.png"},
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            image_root = source / "images"
+            image_root.mkdir()
+            for name in ("a.png", "b.png", "c.png"):
+                Image.new("RGB", (1280, 1024), (0, 0, 0)).save(image_root / name)
+            train, test = _formal_metadata_cameras(
+                source,
+                bound,
+                images="images",
+                device="cpu",
+                colmap_model=(
+                    {1: train_b, 2: train_a, 3: test_c, 4: guard_d},
+                    {int(intrinsic.id): intrinsic},
+                ),
+            )
+            Image.new("RGB", (1279, 1024), (0, 0, 0)).save(image_root / "c.png")
+            with self.assertRaisesRegex(ValueError, "dimensions differ"):
+                _formal_metadata_cameras(
+                    source,
+                    bound,
+                    images="images",
+                    device="cpu",
+                    colmap_model=(
+                        {1: train_b, 2: train_a, 3: test_c, 4: guard_d},
+                        {int(intrinsic.id): intrinsic},
+                    ),
+                )
+        self.assertEqual([camera.image_name for camera in train], ["a.png", "b.png"])
+        self.assertEqual([camera.uid for camera in train], [0, 1])
+        self.assertEqual([camera.image_name for camera in test], ["c.png"])
+        self.assertEqual(test[0].uid, 0)
+        for camera in train + test:
+            self.assertTrue(camera.metadata_only)
+            self.assertFalse(hasattr(camera, "original_image"))
+            self.assertFalse(hasattr(camera, "alpha_mask"))
+            self.assertEqual((camera.image_height, camera.image_width), (1024, 1280))
+            self.assertEqual(camera.world_view_transform.device.type, "cpu")
+            self.assertTrue(torch.isfinite(camera.full_proj_transform).all())
+            expected_center = torch.inverse(camera.world_view_transform)[3, :3]
+            self.assertTrue(torch.equal(camera.camera_center, expected_center))
+
+        simple_extrinsic, simple_intrinsic = fake_colmap_camera("simple.png")
+        simple_intrinsic.model = "SIMPLE_PINHOLE"
+        simple_intrinsic.params = np.asarray([900.0, 640.0, 512.0])
+        simple = _metadata_camera(
+            simple_extrinsic, simple_intrinsic, uid=9, device="cpu"
+        )
+        self.assertEqual(simple.uid, 9)
+        self.assertAlmostEqual(simple.FoVx, focal2fov(900.0, 1280))
+        self.assertAlmostEqual(simple.FoVy, focal2fov(900.0, 1024))
+
+        invalid_extrinsic, invalid_intrinsic = fake_colmap_camera("bad.png")
+        invalid_intrinsic.model = "SIMPLE_RADIAL"
+        with self.assertRaisesRegex(ValueError, "PINHOLE/SIMPLE_PINHOLE"):
+            _metadata_camera(invalid_extrinsic, invalid_intrinsic, uid=0, device="cpu")
+
     def test_formal_outputs_are_isolated_and_gt_is_copied(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

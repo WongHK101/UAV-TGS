@@ -64,6 +64,7 @@ from utils.camera_sequence import (
     load_sequence_manifest,
     save_sequence_manifest,
 )
+from utils.graphics_utils import focal2fov, getProjectionMatrix, getWorld2View2
 
 
 FORMAL_STEPS = int(FORMAL_EXPERIMENT_RECIPE["steps"])
@@ -199,8 +200,10 @@ def _formal_source_paths() -> list[Path]:
         Path("tools/thermal_radiometry/palette_lut.py"),
         Path("scene/__init__.py"),
         Path("scene/cameras.py"),
+        Path("scene/colmap_loader.py"),
         Path("scene/dataset_readers.py"),
         Path("scene/gaussian_model.py"),
+        Path("utils/graphics_utils.py"),
     }
     relative_paths.update(
         path.relative_to(REPO_ROOT)
@@ -308,6 +311,226 @@ def _write_camera_lists(bound: Mapping[str, Any], root: Path) -> tuple[Path, Pat
     return paths[0], paths[1]
 
 
+def _read_colmap_camera_metadata(
+    source_path: str | Path,
+) -> tuple[Mapping[int, Any], Mapping[int, Any]]:
+    """Read only COLMAP extrinsics/intrinsics; never decode dataset images.
+
+    OCT consumes camera geometry plus its own float32/canonical thermal targets.
+    Decoding every source PNG through :class:`scene.cameras.Camera` therefore
+    adds hours of repeated I/O without supplying a tensor used by the method.
+    """
+
+    # Lazy import preserves CPU-only protocol/unit-test usability when the
+    # repository's CUDA extensions are intentionally not installed.
+    from scene.colmap_loader import (
+        read_extrinsics_binary,
+        read_extrinsics_text,
+        read_intrinsics_binary,
+        read_intrinsics_text,
+    )
+
+    sparse = Path(source_path).resolve() / "sparse" / "0"
+    image_bin = sparse / "images.bin"
+    camera_bin = sparse / "cameras.bin"
+    image_text = sparse / "images.txt"
+    camera_text = sparse / "cameras.txt"
+    if image_bin.is_file() and camera_bin.is_file():
+        return read_extrinsics_binary(str(image_bin)), read_intrinsics_binary(
+            str(camera_bin)
+        )
+    if image_text.is_file() and camera_text.is_file():
+        return read_extrinsics_text(str(image_text)), read_intrinsics_text(
+            str(camera_text)
+        )
+    raise FileNotFoundError(
+        "formal OCT requires a complete COLMAP sparse/0 images+cameras pair"
+    )
+
+
+def _qvec_to_rotation(qvec: Any) -> np.ndarray:
+    quaternion = np.asarray(qvec, dtype=np.float64)
+    if quaternion.shape != (4,) or not np.isfinite(quaternion).all():
+        raise ValueError("COLMAP quaternion must contain four finite values")
+    norm = float(np.linalg.norm(quaternion))
+    if not math.isfinite(norm) or norm <= 0.0:
+        raise ValueError("COLMAP quaternion norm must be positive")
+    # Match scene.colmap_loader.qvec2rotmat byte-for-byte.  COLMAP stores unit
+    # quaternions; renormalizing here would introduce tiny camera-hash drift.
+    w, x, y, z = quaternion
+    return np.asarray(
+        [
+            [1.0 - 2.0 * y * y - 2.0 * z * z, 2.0 * x * y - 2.0 * w * z, 2.0 * x * z + 2.0 * w * y],
+            [2.0 * x * y + 2.0 * w * z, 1.0 - 2.0 * x * x - 2.0 * z * z, 2.0 * y * z - 2.0 * w * x],
+            [2.0 * x * z - 2.0 * w * y, 2.0 * y * z + 2.0 * w * x, 1.0 - 2.0 * x * x - 2.0 * y * y],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _metadata_camera(
+    extrinsic: Any,
+    intrinsic: Any,
+    *,
+    uid: int,
+    device: str | torch.device = "cuda",
+) -> SimpleNamespace:
+    """Construct the renderer camera used by ``Camera`` without image tensors."""
+
+    width = int(intrinsic.width)
+    height = int(intrinsic.height)
+    if width <= 0 or height <= 0:
+        raise ValueError("COLMAP camera dimensions must be positive")
+    model = str(intrinsic.model)
+    parameters = np.asarray(intrinsic.params, dtype=np.float64)
+    if model == "SIMPLE_PINHOLE":
+        if parameters.size < 1:
+            raise ValueError("SIMPLE_PINHOLE camera has no focal parameter")
+        focal_x = focal_y = float(parameters[0])
+    elif model == "PINHOLE":
+        if parameters.size < 2:
+            raise ValueError("PINHOLE camera has incomplete focal parameters")
+        focal_x, focal_y = float(parameters[0]), float(parameters[1])
+    else:
+        raise ValueError(
+            "formal OCT requires the same undistorted PINHOLE/SIMPLE_PINHOLE "
+            f"camera model as the legacy loader; got {model!r}"
+        )
+    if not all(math.isfinite(value) and value > 0.0 for value in (focal_x, focal_y)):
+        raise ValueError("COLMAP focal parameters must be finite and positive")
+
+    rotation = np.transpose(_qvec_to_rotation(extrinsic.qvec))
+    translation = np.asarray(extrinsic.tvec, dtype=np.float64)
+    if rotation.shape != (3, 3) or translation.shape != (3,):
+        raise ValueError("COLMAP camera extrinsics have invalid shape")
+    fov_x = focal2fov(focal_x, width)
+    fov_y = focal2fov(focal_y, height)
+    target_device = torch.device(device)
+    world_view = torch.tensor(
+        getWorld2View2(rotation, translation),
+        dtype=torch.float32,
+        device=target_device,
+    ).transpose(0, 1)
+    projection = getProjectionMatrix(
+        znear=0.01,
+        zfar=100.0,
+        fovX=fov_x,
+        fovY=fov_y,
+    ).transpose(0, 1).to(device=target_device, dtype=torch.float32)
+    full_projection = world_view.unsqueeze(0).bmm(projection.unsqueeze(0)).squeeze(0)
+    camera = SimpleNamespace(
+        uid=int(uid),
+        colmap_id=int(intrinsic.id),
+        R=rotation,
+        T=translation,
+        FoVx=float(fov_x),
+        FoVy=float(fov_y),
+        image_name=str(extrinsic.name),
+        image_width=width,
+        image_height=height,
+        znear=0.01,
+        zfar=100.0,
+        world_view_transform=world_view,
+        projection_matrix=projection,
+        full_proj_transform=full_projection,
+        camera_center=torch.inverse(world_view)[3, :3],
+        metadata_only=True,
+    )
+    if hasattr(camera, "original_image") or hasattr(camera, "alpha_mask"):
+        raise RuntimeError("metadata-only OCT camera unexpectedly owns image tensors")
+    return camera
+
+
+def _formal_metadata_cameras(
+    source_path: str | Path,
+    bound: Mapping[str, Any],
+    *,
+    images: str | Path = "images",
+    device: str | torch.device = "cuda",
+    colmap_model: tuple[Mapping[int, Any], Mapping[int, Any]] | None = None,
+    verify_image_headers: bool = True,
+) -> tuple[list[SimpleNamespace], list[SimpleNamespace]]:
+    """Build exact formal train/test cameras from COLMAP metadata and split rows."""
+
+    extrinsics, intrinsics = (
+        _read_colmap_camera_metadata(source_path)
+        if colmap_model is None
+        else colmap_model
+    )
+    by_name: dict[str, Any] = {}
+    for extrinsic in extrinsics.values():
+        name = str(extrinsic.name)
+        if not name or name in by_name:
+            raise ValueError(f"COLMAP image names must be nonempty and unique: {name!r}")
+        by_name[name] = extrinsic
+
+    split_names: dict[str, list[str]] = {}
+    records = bound.get("records")
+    if not isinstance(records, list):
+        raise ValueError("formal bound split has no records")
+    for split in ("train", "test"):
+        names = sorted(
+            str(record["thermal_camera_name"])
+            for record in records
+            if record.get("split") == split
+        )
+        if not names or len(names) != len(set(names)):
+            raise ValueError(f"formal {split} camera names must be nonempty and unique")
+        split_names[split] = names
+    overlap = sorted(set(split_names["train"]) & set(split_names["test"]))
+    if overlap:
+        raise ValueError(f"formal train/test camera membership overlaps: {overlap[:8]}")
+    requested = set(split_names["train"]) | set(split_names["test"])
+    missing = sorted(requested - set(by_name))
+    if missing:
+        raise ValueError(f"formal cameras are missing from COLMAP metadata: {missing[:8]}")
+
+    image_root = Path(images)
+    if not image_root.is_absolute():
+        image_root = Path(source_path).resolve() / image_root
+    image_root = image_root.resolve()
+    if not verify_image_headers and colmap_model is None:
+        raise ValueError(
+            "production COLMAP metadata loading cannot disable source image header checks"
+        )
+
+    result: dict[str, list[SimpleNamespace]] = {}
+    for split in ("train", "test"):
+        cameras: list[SimpleNamespace] = []
+        for uid, name in enumerate(split_names[split]):
+            extrinsic = by_name[name]
+            camera_id = int(extrinsic.camera_id)
+            if camera_id not in intrinsics:
+                raise ValueError(
+                    f"COLMAP intrinsic {camera_id} is missing for formal camera {name}"
+                )
+            camera = _metadata_camera(
+                extrinsic,
+                intrinsics[camera_id],
+                uid=uid,
+                device=device,
+            )
+            if verify_image_headers:
+                image_path = image_root / name
+                if not image_path.is_file():
+                    raise FileNotFoundError(
+                        f"formal source image declared by COLMAP is missing: {image_path}"
+                    )
+                # Image.open reads the header lazily; no RGB pixels are decoded
+                # and no per-camera original_image/alpha tensor is allocated.
+                with Image.open(image_path) as source_image:
+                    source_size = tuple(int(value) for value in source_image.size)
+                expected_size = (camera.image_width, camera.image_height)
+                if source_size != expected_size:
+                    raise ValueError(
+                        "formal source image/COLMAP dimensions differ for "
+                        f"{name}: image={source_size}, COLMAP={expected_size}"
+                    )
+            cameras.append(camera)
+        result[split] = cameras
+    return result["train"], result["test"]
+
+
 class Runtime:
     def __init__(self, args: argparse.Namespace) -> None:
         if int(args.anchor_iteration) <= 0:
@@ -318,7 +541,6 @@ class Runtime:
             raise ValueError("formal OCT v1 is fixed to native r1/full-resolution")
         # Lazy imports keep protocol inspection/CLI help usable on machines
         # where the CUDA extensions are intentionally not built.
-        from scene import Scene
         from scene.gaussian_model import GaussianModel
 
         self.args = args
@@ -343,37 +565,13 @@ class Runtime:
             )
         if not supplied_anchor_artifact.is_file():
             raise FileNotFoundError(supplied_anchor_artifact)
-        dataset = SimpleNamespace(
-            sh_degree=3,
-            source_path=str(Path(args.source_path).resolve()),
-            model_path=str(model_path),
-            images=str(args.images),
-            depths="",
-            resolution=int(args.resolution),
-            white_background=False,
-            train_test_exp=False,
-            # OCT never consumes Scene's RGB/T image tensors.  Keeping them on
-            # CPU avoids retaining every formal image on the GPU; the native
-            # float32 target for the selected camera is transferred on demand.
-            data_device="cpu",
-            eval=True,
-            train_list=str(train_list),
-            test_list=str(test_list),
-            train_list_sha256=sha256_file(train_list),
-            test_list_sha256=sha256_file(test_list),
-        )
         self.anchor = GaussianModel(3)
-        self.scene = Scene(
-            dataset,
-            self.anchor,
-            load_iteration=int(args.anchor_iteration),
-            shuffle=False,
-        )
-        self.train_cameras = sorted(
-            self.scene.getTrainCameras(), key=lambda camera: str(camera.image_name)
-        )
-        self.test_cameras = sorted(
-            self.scene.getTestCameras(), key=lambda camera: str(camera.image_name)
+        self.anchor.load_ply(str(supplied_anchor_artifact), use_train_test_exp=False)
+        self.train_cameras, self.test_cameras = _formal_metadata_cameras(
+            args.source_path,
+            self.bound_payload,
+            images=args.images,
+            device="cuda",
         )
         declared_train = sorted(
             str(record["thermal_camera_name"])
@@ -728,6 +926,7 @@ def _validate_resume_layout(
 
 
 def command_train(args: argparse.Namespace) -> int:
+    process_start_perf = time.perf_counter()
     # Provenance is checked before Runtime writes protocol camera lists or
     # allocates/loads any formal training state.
     source_provenance = _formal_source_provenance()
@@ -828,6 +1027,9 @@ def command_train(args: argparse.Namespace) -> int:
     targets.preload(binding.names("train"))
     cameras = camera_lookup(runtime.train_cameras)
     context = OCTRendererContext(runtime.anchor, runtime.proxy)
+    pre_training_setup_wall_time_s = max(
+        0.0, time.perf_counter() - process_start_perf
+    )
     tracker = OCTStageCostTracker(
         {
             "scene": binding.scene_name,
@@ -835,6 +1037,7 @@ def command_train(args: argparse.Namespace) -> int:
             "formal_protocol_sha256": binding.formal_protocol_sha256,
             "segment_start_step": start_step,
             "resumed_from_checkpoint_sha256": resume_checkpoint_sha256,
+            "pre_training_setup_wall_time_s": pre_training_setup_wall_time_s,
         }
     )
     tracker.start()
@@ -865,6 +1068,10 @@ def command_train(args: argparse.Namespace) -> int:
             cost["segment_optimizer_steps"] = int(step - start_step)
             cost["cumulative_optimizer_steps"] = step
             cost["resumed_from_checkpoint_sha256"] = resume_checkpoint_sha256
+            cost["pre_training_setup_wall_time_s"] = pre_training_setup_wall_time_s
+            cost["end_to_end_wall_time_s"] = max(
+                0.0, time.perf_counter() - process_start_perf
+            )
             checkpoint = run_root / "checkpoints" / f"step_{step}.pt"
             endpoint_path = run_root / "endpoints" / f"step_{step}.json"
             _require_absent(checkpoint, f"formal OCT checkpoint step {step}")
@@ -898,6 +1105,10 @@ def command_train(args: argparse.Namespace) -> int:
     final_cost["segment_optimizer_steps"] = FORMAL_STEPS - start_step
     final_cost["cumulative_optimizer_steps"] = FORMAL_STEPS
     final_cost["resumed_from_checkpoint_sha256"] = resume_checkpoint_sha256
+    final_cost["pre_training_setup_wall_time_s"] = pre_training_setup_wall_time_s
+    final_cost["end_to_end_wall_time_s"] = max(
+        0.0, time.perf_counter() - process_start_perf
+    )
     _atomic_json(
         status_path,
         {
