@@ -72,6 +72,7 @@ _OPACITY_ADAPTIVE_FREEZE_FIELDS = ("_xyz", "_scaling", "_rotation")
 _RGB_CONTINUATION_GROUPS = (
     "xyz", "f_dc", "f_rest", "opacity", "scaling", "rotation"
 )
+_RGB_APPEARANCE_GROUPS = ("f_dc", "f_rest")
 
 
 def _optimizer_state_step(value):
@@ -181,7 +182,7 @@ def _validate_rgb_continuation_schedule(
     step_at_final_iteration,
 ):
     if int(anchor_iteration) != 30000:
-        raise ValueError("OGS-v1 protocol requires the formal RGB 30000 anchor")
+        raise ValueError("RGB continuation requires the formal RGB 30000 anchor")
     if int(scheduler_horizon) != int(anchor_iteration):
         raise ValueError("Scheduler horizon must remain at the anchor iteration")
     if int(updates) not in (200, 5000):
@@ -466,7 +467,17 @@ def _snapshot_strict_freeze_fields(gaussians):
     }
 
 
-def _write_strict_freeze_audit(model_path, gaussians, before, start_iteration, final_iteration):
+def _write_strict_freeze_audit(
+    model_path,
+    gaussians,
+    before,
+    start_iteration,
+    final_iteration,
+    *,
+    schema="uav-tgs-strict-freeze-audit-v1",
+    filename="strict_freeze_audit.json",
+    label="StrictFreezeAudit",
+):
     fields = {}
     all_unchanged = True
     for name, expected in before.items():
@@ -490,13 +501,13 @@ def _write_strict_freeze_audit(model_path, gaussians, before, start_iteration, f
         }
 
     payload = {
-        "schema": "uav-tgs-strict-freeze-audit-v1",
+        "schema": schema,
         "status": "passed" if all_unchanged else "failed",
         "start_iteration": int(start_iteration),
         "final_iteration": int(final_iteration),
         "fields": fields,
     }
-    output_path = os.path.join(model_path, "strict_freeze_audit.json")
+    output_path = os.path.join(model_path, filename)
     temporary_path = output_path + f".tmp-{os.getpid()}"
     os.makedirs(model_path, exist_ok=True)
     with open(temporary_path, "w", encoding="utf-8", newline="\n") as handle:
@@ -510,7 +521,7 @@ def _write_strict_freeze_audit(model_path, gaussians, before, start_iteration, f
         raise RuntimeError(
             "Strict thermal freeze invariant failed for: " + ", ".join(changed)
         )
-    print(f"[INFO] StrictFreezeAudit: passed path={output_path}")
+    print(f"[INFO] {label}: passed path={output_path}")
     return payload
 
 
@@ -630,10 +641,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
     thermal_freeze_mode = str(getattr(args, "thermal_freeze_mode", "legacy"))
-    rgb_continuation = (
-        str(getattr(args, "rgb_continuation_recipe", "legacy"))
-        == "fixed_topology"
+    rgb_continuation_recipe = str(
+        getattr(args, "rgb_continuation_recipe", "legacy")
     )
+    rgb_continuation = rgb_continuation_recipe in (
+        "fixed_topology", "appearance_only"
+    )
+    rgb_appearance_refit = rgb_continuation_recipe == "appearance_only"
     ogs_enabled = bool(getattr(args, "ogs_v1", False))
     strict_freeze = thermal_freeze_mode == "strict"
     opacity_adaptive = thermal_freeze_mode == "geometry_frozen_opacity_adaptive"
@@ -762,15 +776,43 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # 2.6+ defaults to weights_only=True, which rejects that established
         # checkpoint format before thermal fine-tuning can start.
         (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
-        optimizer_restore_mode = str(getattr(args, "thermal_optimizer_state", "restore"))
+        optimizer_restore_mode = (
+            str(getattr(args, "rgb_optimizer_state", "restore"))
+            if rgb_continuation
+            else str(getattr(args, "thermal_optimizer_state", "restore"))
+        )
         if rgb_continuation:
-            if optimizer_restore_mode != "restore":
-                raise RuntimeError("RGB continuation forbids a fresh optimizer fallback")
-            rgb_optimizer_summary = _validate_rgb_continuation_checkpoint(
-                model_params,
-                first_iter,
-                getattr(args, "rgb_continuation_anchor_iteration", 30000),
-            )
+            if rgb_appearance_refit:
+                if optimizer_restore_mode != "fresh":
+                    raise RuntimeError("RGB appearance refit requires a fresh optimizer")
+                if int(first_iter) != int(
+                    getattr(args, "rgb_continuation_anchor_iteration", 30000)
+                ):
+                    raise RuntimeError(
+                        "RGB appearance-refit anchor iteration mismatch: "
+                        f"expected={getattr(args, 'rgb_continuation_anchor_iteration', 30000)} "
+                        f"actual={first_iter}"
+                    )
+                if not isinstance(model_params, (tuple, list)) or len(model_params) != 12:
+                    raise RuntimeError(
+                        "RGB appearance refit requires the standard 12-field checkpoint"
+                    )
+                rgb_optimizer_summary = {
+                    "groups": list(_RGB_APPEARANCE_GROUPS),
+                    "adam_steps": {name: 0 for name in _RGB_APPEARANCE_GROUPS},
+                    "uniform_adam_step": 0,
+                    "initialization": "fresh",
+                }
+            else:
+                if optimizer_restore_mode != "restore":
+                    raise RuntimeError(
+                        "Fixed-topology RGB continuation requires restored optimizer state"
+                    )
+                rgb_optimizer_summary = _validate_rgb_continuation_checkpoint(
+                    model_params,
+                    first_iter,
+                    getattr(args, "rgb_continuation_anchor_iteration", 30000),
+                )
         if opacity_adaptive and optimizer_restore_mode == "restore":
             checkpoint_groups = tuple(
                 group.get("name") for group in model_params[10].get("param_groups", [])
@@ -782,7 +824,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     f"expected={expected_checkpoint_groups} actual={checkpoint_groups}"
                 )
         gaussians.restore(model_params, opt, optimizer_restore_mode=optimizer_restore_mode)
-        if rgb_continuation:
+        if rgb_continuation and not rgb_appearance_refit:
             restored_steps = _validate_restored_rgb_optimizer(
                 gaussians, rgb_optimizer_summary
             )
@@ -818,6 +860,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 "[INFO] RGBContinuationRestore: "
                 f"groups={rgb_optimizer_summary['groups']} "
                 f"adam_steps={restored_steps} scheduler_horizon={scheduler_horizon}"
+            )
+        elif rgb_appearance_refit:
+            if gaussians.active_sh_degree != gaussians.max_sh_degree:
+                raise RuntimeError(
+                    "RGB appearance refit requires the formal SH3 anchor: "
+                    f"active={gaussians.active_sh_degree} max={gaussians.max_sh_degree}"
+                )
+            gaussians.training_setup_appearance_only(
+                opt,
+                sh_degree_cap=gaussians.max_sh_degree,
+                preserve_feature_state=False,
+            )
+            optimizer_groups = tuple(
+                group.get("name") for group in gaussians.optimizer.param_groups
+            )
+            if optimizer_groups != _RGB_APPEARANCE_GROUPS:
+                raise RuntimeError(
+                    "RGB appearance-refit optimizer groups mismatch: "
+                    f"expected={_RGB_APPEARANCE_GROUPS} actual={optimizer_groups}"
+                )
+            if gaussians.optimizer.state:
+                raise RuntimeError("RGB appearance refit inherited Adam state")
+            print(
+                "[INFO] RGBAppearanceRefit: appearance_only=1 optimizer=fresh "
+                f"groups={list(optimizer_groups)}"
             )
         if optimizer_restore_mode == "fresh":
             state_entries = len(gaussians.optimizer.state)
@@ -920,6 +987,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         )
 
     strict_freeze_snapshot = None
+    rgb_appearance_freeze_snapshot = None
     opacity_adaptive_freeze_snapshot = None
     if strict_freeze:
         strict_freeze_snapshot = _snapshot_strict_freeze_fields(gaussians)
@@ -944,6 +1012,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             "[INFO] StrictThermalFreeze: appearance_only=1 "
             f"optimizer_groups={optimizer_groups} preserve_feature_state={int(preserve_feature_state)}"
         )
+    elif rgb_appearance_refit:
+        rgb_appearance_freeze_snapshot = _snapshot_strict_freeze_fields(gaussians)
     elif opacity_adaptive:
         opacity_adaptive_freeze_snapshot = _snapshot_opacity_adaptive_freeze_fields(gaussians)
         preserve_optimizer_state = str(
@@ -1541,7 +1611,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if rgb_continuation:
         protocol = {
             "schema": "uav-tgs-rgb-continuation-protocol-v1",
-            "recipe": "fixed_topology",
+            "recipe": rgb_continuation_recipe,
             "start_checkpoint": str(checkpoint),
             "start_checkpoint_sha256": continuation_checkpoint_sha256,
             "anchor_iteration": int(start_iteration),
@@ -1566,6 +1636,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 getattr(args, "optimizer_step_at_final_iteration", False)
             ),
             "optimizer_restore": rgb_optimizer_summary,
+            "optimizer_initialization": (
+                "fresh" if rgb_appearance_refit else "restored_anchor_state"
+            ),
+            "trainable_fields": (
+                ["f_dc", "f_rest"]
+                if rgb_appearance_refit
+                else list(_RGB_CONTINUATION_GROUPS)
+            ),
             "topology_fixed": True,
             "densification": False,
             "pruning": False,
@@ -2079,6 +2157,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             start_iteration=start_iteration,
             final_iteration=int(opt.iterations),
         )
+    elif rgb_appearance_refit:
+        _write_strict_freeze_audit(
+            scene.model_path,
+            gaussians,
+            rgb_appearance_freeze_snapshot,
+            start_iteration=start_iteration,
+            final_iteration=int(opt.iterations),
+            schema="uav-tgs-rgb-appearance-refit-freeze-audit-v1",
+            filename="rgb_appearance_refit_freeze_audit.json",
+            label="RGBAppearanceRefitFreezeAudit",
+        )
     elif opacity_adaptive:
         _write_opacity_adaptive_freeze_audit(
             scene.model_path,
@@ -2103,9 +2192,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     f"RGB continuation final Adam state missing for {group.get('name')}"
                 )
             final_steps[group.get("name")] = _optimizer_state_step(state["step"])
+        expected_groups = (
+            _RGB_APPEARANCE_GROUPS
+            if rgb_appearance_refit
+            else _RGB_CONTINUATION_GROUPS
+        )
+        if tuple(final_steps) != expected_groups:
+            raise RuntimeError(
+                "RGB continuation final optimizer groups mismatch: "
+                f"expected={expected_groups} actual={tuple(final_steps)}"
+            )
         step_deltas = {
             name: final_steps[name] - rgb_optimizer_summary["adam_steps"][name]
-            for name in _RGB_CONTINUATION_GROUPS
+            for name in expected_groups
         }
         expected_updates = int(getattr(args, "rgb_continuation_updates", 5000))
         if set(step_deltas.values()) != {expected_updates}:
@@ -2285,9 +2384,18 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--rgb_continuation_recipe",
-        choices=["legacy", "fixed_topology"],
+        choices=["legacy", "fixed_topology", "appearance_only"],
         default="legacy",
-        help="Explicit fixed-topology RGB 30k-anchor continuation protocol.",
+        help=(
+            "RGB 30k-anchor continuation: fixed_topology restores the full "
+            "RGB Adam; appearance_only creates a fresh SH-only optimizer."
+        ),
+    )
+    parser.add_argument(
+        "--rgb_optimizer_state",
+        choices=["restore", "fresh"],
+        default="restore",
+        help="Optimizer initialization for an explicit RGB continuation recipe.",
     )
     parser.add_argument(
         "--rgb_continuation_anchor_iteration", type=int, default=30000
@@ -2459,13 +2567,13 @@ if __name__ == "__main__":
     except ValueError as error:
         parser.error(str(error))
 
-    rgb_continuation_requested = (
-        args.rgb_continuation_recipe == "fixed_topology"
+    rgb_continuation_requested = args.rgb_continuation_recipe in (
+        "fixed_topology", "appearance_only"
     )
     if rgb_continuation_requested:
         if not args.start_checkpoint:
             parser.error(
-                "--rgb_continuation_recipe fixed_topology requires --start_checkpoint"
+                "--rgb_continuation_recipe requires --start_checkpoint"
             )
         forbidden_prefixes = (
             "--thermal_",
@@ -2488,8 +2596,16 @@ if __name__ == "__main__":
             )
         if args.thermal_recipe != "legacy":
             parser.error("RGB continuation cannot use a thermal recipe")
-        if args.thermal_optimizer_state != "restore":
-            parser.error("RGB continuation requires restored optimizer state")
+        expected_rgb_optimizer_state = (
+            "fresh"
+            if args.rgb_continuation_recipe == "appearance_only"
+            else "restore"
+        )
+        if args.rgb_optimizer_state != expected_rgb_optimizer_state:
+            parser.error(
+                f"--rgb_continuation_recipe {args.rgb_continuation_recipe} "
+                f"requires --rgb_optimizer_state {expected_rgb_optimizer_state}"
+            )
         if args.thermal_freeze_mode != "legacy":
             parser.error("RGB continuation cannot use a thermal freeze mode")
         if args.thermal_reset_features or args.thermal_max_sh_degree is not None:
@@ -2540,6 +2656,8 @@ if __name__ == "__main__":
         args.ss_prune_before_thermal = False
         args.ss_prune_after_rgb = False
 
+        if args.ogs_v1 and args.rgb_continuation_recipe != "fixed_topology":
+            parser.error("OGS-v1 requires --rgb_continuation_recipe fixed_topology")
         if args.ogs_v1:
             if not args.ogs_cache:
                 parser.error("--ogs_v1 requires --ogs_cache")
@@ -2605,6 +2723,7 @@ if __name__ == "__main__":
         continuation_only = (
             args.ogs_v1
             or bool(args.fixed_camera_sequence)
+            or _option_was_set("--rgb_optimizer_state")
             or _option_was_set("--rgb_continuation_anchor_iteration")
             or _option_was_set("--rgb_continuation_scheduler_horizon")
             or _option_was_set("--rgb_continuation_updates")
@@ -2619,7 +2738,7 @@ if __name__ == "__main__":
         if continuation_only:
             parser.error(
                 "Fixed camera/OGS continuation options require "
-                "--rgb_continuation_recipe fixed_topology"
+                "an explicit --rgb_continuation_recipe"
             )
 
     if (
