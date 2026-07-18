@@ -57,6 +57,7 @@ from tools.oct_gs_formal import (
     _load_hotspot_threshold,
     _formal_metadata_cameras,
     _metadata_camera,
+    _qvec_to_rotation,
     _remaining_sequence,
     _require_matching_source_provenance,
     _require_isolated_output,
@@ -657,6 +658,22 @@ class OCTFormalProtocolTests(unittest.TestCase):
             self.assertTrue(torch.isfinite(camera.full_proj_transform).all())
             expected_center = torch.inverse(camera.world_view_transform)[3, :3]
             self.assertTrue(torch.equal(camera.camera_center, expected_center))
+
+        # Current InternalRoad camera 0139 exposes a one-ULP difference if the
+        # legacy qvec expression is algebraically simplified (q**2 -> q*q).
+        regression_qvec = np.asarray(
+            [
+                -0.0025306362255026475,
+                -0.9996852564913212,
+                -0.02495593521926798,
+                -0.0004302691102580914,
+            ],
+            dtype=np.float64,
+        )
+        self.assertEqual(
+            hashlib.sha256(_qvec_to_rotation(regression_qvec).tobytes()).hexdigest(),
+            "832b2e0836f21c01acd3acbba8c3e62adc38dfe8ab02eaca553a2ac91e400605",
+        )
 
         simple_extrinsic, simple_intrinsic = fake_colmap_camera("simple.png")
         simple_intrinsic.model = "SIMPLE_PINHOLE"

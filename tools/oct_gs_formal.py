@@ -355,16 +355,29 @@ def _qvec_to_rotation(qvec: Any) -> np.ndarray:
     norm = float(np.linalg.norm(quaternion))
     if not math.isfinite(norm) or norm <= 0.0:
         raise ValueError("COLMAP quaternion norm must be positive")
-    # Match scene.colmap_loader.qvec2rotmat byte-for-byte.  COLMAP stores unit
-    # quaternions; renormalizing here would introduce tiny camera-hash drift.
-    w, x, y, z = quaternion
-    return np.asarray(
+    # Keep the expression order literally identical to
+    # scene.colmap_loader.qvec2rotmat.  Even replacing ``q[i] ** 2`` with
+    # ``q[i] * q[i]`` changes one current InternalRoad matrix by one ULP and
+    # therefore violates the immutable camera-parameter hash.
+    q = quaternion
+    return np.array(
         [
-            [1.0 - 2.0 * y * y - 2.0 * z * z, 2.0 * x * y - 2.0 * w * z, 2.0 * x * z + 2.0 * w * y],
-            [2.0 * x * y + 2.0 * w * z, 1.0 - 2.0 * x * x - 2.0 * z * z, 2.0 * y * z - 2.0 * w * x],
-            [2.0 * x * z - 2.0 * w * y, 2.0 * y * z + 2.0 * w * x, 1.0 - 2.0 * x * x - 2.0 * y * y],
-        ],
-        dtype=np.float64,
+            [
+                1 - 2 * q[2] ** 2 - 2 * q[3] ** 2,
+                2 * q[1] * q[2] - 2 * q[0] * q[3],
+                2 * q[3] * q[1] + 2 * q[0] * q[2],
+            ],
+            [
+                2 * q[1] * q[2] + 2 * q[0] * q[3],
+                1 - 2 * q[1] ** 2 - 2 * q[3] ** 2,
+                2 * q[2] * q[3] - 2 * q[0] * q[1],
+            ],
+            [
+                2 * q[3] * q[1] - 2 * q[0] * q[2],
+                2 * q[2] * q[3] + 2 * q[0] * q[1],
+                1 - 2 * q[1] ** 2 - 2 * q[2] ** 2,
+            ],
+        ]
     )
 
 
