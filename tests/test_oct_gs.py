@@ -1281,6 +1281,8 @@ class OCTFormalProtocolTests(unittest.TestCase):
             "tests/test_depth_definitions.py",
             ALLOWED_POST_TRAINING_PATHS,
         )
+        self.assertIn("tools/audit_ogs_v1.py", ALLOWED_POST_TRAINING_PATHS)
+        self.assertIn("tests/test_audit_ogs_v1.py", ALLOWED_POST_TRAINING_PATHS)
         self.assertFalse(
             any(
                 path.startswith("oct_gs/") or path == "tools/oct_gs_formal.py"

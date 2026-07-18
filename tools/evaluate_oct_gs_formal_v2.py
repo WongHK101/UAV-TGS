@@ -48,6 +48,7 @@ FORMAL_HOTSPOT_QUANTILE = 0.95
 FORMAL_HOTSPOT_BINS = 65_536
 HOTSPOT_EVALUATION_BINS = 4_096
 ALLOWED_POST_TRAINING_PATHS = {
+    "tests/test_audit_ogs_v1.py",
     "tests/test_conditional_resplat_decision.py",
     "tests/test_depth_definitions.py",
     "tests/test_evaluate_formal_baseline_hotspots.py",
@@ -55,6 +56,7 @@ ALLOWED_POST_TRAINING_PATHS = {
     "tests/test_temperature_responsibility_bundle.py",
     "tools/evaluate_oct_gs_formal_v2.py",
     "tools/evaluate_formal_baseline_hotspots.py",
+    "tools/audit_ogs_v1.py",
     "tools/geometric_repeatability/build_conditional_resplat_decision.py",
     "tools/geometric_repeatability/build_temperature_responsibility_bundle.py",
     "tools/geometric_repeatability/evaluate_depth_definitions.py",
