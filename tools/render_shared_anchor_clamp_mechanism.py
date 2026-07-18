@@ -127,6 +127,44 @@ def render(args: argparse.Namespace) -> dict[str, Any]:
     ):
         raise MechanismRenderError("xyz or rotation changed between anchors")
 
+    if len(indices) == 0:
+        output_dir.mkdir(parents=True)
+        figure = plt.figure(figsize=(8, 3), dpi=160)
+        axis = figure.add_subplot(1, 1, 1)
+        axis.axis("off")
+        axis.text(
+            0.5,
+            0.5,
+            f"{manifest['scene']} {method_label}\nNo Gaussian exceeds the robust fence",
+            ha="center",
+            va="center",
+            fontsize=15,
+        )
+        image_path = output_dir / "ellipsoid_free_views.png"
+        figure.savefig(image_path, bbox_inches="tight")
+        plt.close(figure)
+        report = {
+            "schema": "uav-tgs-scale-projection-mechanism-render-v1",
+            "status": "complete",
+            "scene": manifest["scene"],
+            "anchor_iteration": raw_iteration,
+            "method": method_label,
+            "clamped_gaussian_count": 0,
+            "modified_indices_sha256": indices_sha,
+            "input_manifest": str(manifest_path),
+            "input_manifest_sha256": _sha256(manifest_path),
+            "raw_checkpoint_sha256": _sha256(input_checkpoint),
+            "shared_checkpoint_sha256": _sha256(output_checkpoint),
+            "views": [],
+            "render": str(image_path),
+            "render_sha256": _sha256(image_path),
+            "interpretation": "the robust fence selected no Gaussian; output is exactly the raw anchor",
+        }
+        (output_dir / "mechanism_render_manifest.json").write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        return report
+
     centers = xyz[indices]
     context_count = min(int(args.context_points), xyz.shape[0])
     stride = max(xyz.shape[0] // max(context_count, 1), 1)
