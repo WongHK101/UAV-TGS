@@ -55,6 +55,7 @@ from tools.thermal_radiometry.palette_lut import (
     temperature_to_indices,
 )
 from tools.evaluate_oct_gs_formal_v2 import (
+    ALLOWED_POST_TRAINING_PATHS,
     EVALUATION_SCHEMA,
     FROZEN_TRAINING_COMMIT,
     FORMAL_HOTSPOT_BINS,
@@ -1263,6 +1264,29 @@ class OCTFormalProtocolTests(unittest.TestCase):
         self.assertFalse(result["generic_commit_mismatch_waiver"])
         self.assertTrue(result["training_source_files_byte_exact"])
         self.assertEqual(result["post_training_changed_paths"], changed)
+
+        self.assertIn(
+            "tools/geometric_repeatability/build_temperature_responsibility_bundle.py",
+            ALLOWED_POST_TRAINING_PATHS,
+        )
+        self.assertIn(
+            "tests/test_temperature_responsibility_bundle.py",
+            ALLOWED_POST_TRAINING_PATHS,
+        )
+        self.assertIn(
+            "tools/geometric_repeatability/evaluate_depth_definitions.py",
+            ALLOWED_POST_TRAINING_PATHS,
+        )
+        self.assertIn(
+            "tests/test_depth_definitions.py",
+            ALLOWED_POST_TRAINING_PATHS,
+        )
+        self.assertFalse(
+            any(
+                path.startswith("oct_gs/") or path == "tools/oct_gs_formal.py"
+                for path in ALLOWED_POST_TRAINING_PATHS
+            )
+        )
 
         wrong_commit = dict(provenance)
         wrong_commit["git_commit"] = "9" * 40

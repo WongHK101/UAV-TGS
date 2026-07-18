@@ -39,6 +39,10 @@ FORMAL_SPLIT_LABELS = frozenset({"train", "guard", "test"})
 REFERENCE_DEPTH_SEMANTICS = "metric_camera_z_reference_mesh"
 TEMPERATURE_RESPONSIBILITY_PROTOCOL = "uav-tgs-temperature-responsibility-v1"
 TEMPERATURE_SEMANTICS = "TSDK-referenced apparent-temperature consistency"
+TEMPERATURE_RESOLUTION_NATIVE_EXACT = "native_exact"
+TEMPERATURE_RESOLUTION_BILINEAR_NEAREST = (
+    "bilinear_temperature_nearest_support"
+)
 DIAGNOSTIC_DEPTH_SEMANTICS = {
     "depth_expected_alpha_normalized": "metric camera-z; sum(alpha*T*z)/sum(alpha*T)",
     "depth_transmittance_median": "metric camera-z at first accepted contributor where transmittance <= 0.5; zero if absent",
@@ -958,6 +962,218 @@ def _validate_joint_diagnostic_arrays(
     return indices, weights
 
 
+def _contract_shape_hw(value: Any, *, label: str) -> tuple[int, int]:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"{label} must be a two-element H,W array")
+    try:
+        shape = (int(value[0]), int(value[1]))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} contains invalid dimensions") from exc
+    if any(dimension <= 0 for dimension in shape):
+        raise ValueError(f"{label} dimensions must be positive")
+    return shape
+
+
+def _validate_temperature_resolution_contract(
+    *,
+    payload: Mapping[str, Any],
+    derivation: Mapping[str, Any],
+    target_provenance: Mapping[str, Any],
+    model_views: Mapping[str, Mapping[str, Any]],
+    contract_views: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Validate native-exact or the sole explicit direct-Celsius resize recipe."""
+
+    exact = target_provenance.get(
+        "source_training_target_forward_colorization_exact_on_valid_support"
+    )
+    resolution = payload.get("resolution_policy")
+    if resolution is None:
+        # Backward-compatible native receipts predate the explicit resolution
+        # block.  Their old evidence boundary remains strict and unchanged.
+        if exact is not True:
+            raise ValueError(
+                "Legacy/native temperature provenance must prove exact training colorization"
+            )
+        if target_provenance.get("direct_float_temperature_resized", False) is not False:
+            raise ValueError("Legacy/native temperature provenance cannot claim resizing")
+        return
+    if not isinstance(resolution, Mapping):
+        raise ValueError("Temperature resolution policy must be an object")
+    policy = str(resolution.get("requested_policy", "")).strip()
+    if policy not in {
+        TEMPERATURE_RESOLUTION_NATIVE_EXACT,
+        TEMPERATURE_RESOLUTION_BILINEAR_NEAREST,
+    }:
+        raise ValueError(f"Unsupported temperature resolution policy {policy!r}")
+    if resolution.get("native_exact_is_default") is not True:
+        raise ValueError("Temperature resolution contract must preserve native_exact default")
+    if str(resolution.get("temperature_interpolation_when_resized", "")) != (
+        "bilinear; align_corners=false"
+    ):
+        raise ValueError("Temperature resolution contract does not pin bilinear interpolation")
+    if str(resolution.get("support_interpolation_when_resized", "")) != "nearest":
+        raise ValueError("Temperature resolution contract does not pin nearest support")
+    try:
+        declared_view_count = int(resolution.get("view_count", -1))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Temperature resolution view count is invalid") from exc
+    if declared_view_count != len(model_views):
+        raise ValueError("Temperature resolution contract view count mismatch")
+    try:
+        declared_resized_count = int(resolution.get("resized_view_count", -1))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Temperature resolution resized-view count is invalid") from exc
+    if not 0 <= declared_resized_count <= len(model_views):
+        raise ValueError("Temperature resolution resized-view count is out of range")
+    derivation_resolution = derivation.get("resolution_policy")
+    if not isinstance(derivation_resolution, Mapping) or dict(
+        derivation_resolution
+    ) != dict(resolution):
+        raise ValueError("Temperature derivation/contract resolution policy mismatch")
+    if str(target_provenance.get("domain", "")) != "float32 Celsius":
+        raise ValueError("Temperature resolution target domain is not direct float32 Celsius")
+
+    forward_receipt = derivation.get("source_target_forward_validation_receipt")
+    if not isinstance(forward_receipt, Mapping):
+        raise ValueError("Temperature resolution derivation lacks forward-validation receipt")
+
+    if policy == TEMPERATURE_RESOLUTION_NATIVE_EXACT:
+        if exact is not True or declared_resized_count != 0:
+            raise ValueError(
+                "native_exact temperature provenance must retain exact forward colorization"
+            )
+        if target_provenance.get("direct_float_temperature_resized") is not False:
+            raise ValueError("native_exact temperature provenance cannot claim resizing")
+        if str(
+            target_provenance.get(
+                "source_training_target_forward_colorization_status", ""
+            )
+        ) != "exact_on_valid_support":
+            raise ValueError("native_exact temperature forward-validation status mismatch")
+        if str(target_provenance.get("source", "")) != (
+            "TSDK-referenced undistorted NPY"
+        ):
+            raise ValueError("native_exact temperature target is not direct TSDK float32")
+        if (
+            forward_receipt.get("exact") is not True
+            or str(forward_receipt.get("status", "")) != "exact_on_valid_support"
+        ):
+            raise ValueError("native_exact derivation forward-validation receipt mismatch")
+    else:
+        if exact is not False or declared_resized_count <= 0:
+            raise ValueError(
+                "Explicit temperature resize must record forward exact=false and resized views"
+            )
+        if target_provenance.get("direct_float_temperature_resized") is not True:
+            raise ValueError("Explicit temperature resize lacks direct-float resize provenance")
+        if str(
+            target_provenance.get(
+                "source_training_target_forward_colorization_status", ""
+            )
+        ) != "not_applicable_after_direct_float_temperature_resize":
+            raise ValueError("Explicit temperature resize forward-validation status mismatch")
+        if str(target_provenance.get("source", "")) != (
+            "image-domain bilinear resampling of direct float32 TSDK-referenced "
+            "undistorted NPY"
+        ):
+            raise ValueError("Explicit temperature resize target is not direct float32 Celsius")
+        if (
+            forward_receipt.get("exact") is not False
+            or str(forward_receipt.get("status", ""))
+            != "not_applicable_after_direct_float_temperature_resize"
+        ):
+            raise ValueError("Explicit temperature resize derivation claim is incomplete")
+
+    observed_resized_count = 0
+    for name, model_view in model_views.items():
+        contract_view = contract_views[name]
+        model_receipt = model_view.get("temperature_resolution")
+        contract_receipt = contract_view.get("temperature_resolution")
+        if (
+            not isinstance(model_receipt, Mapping)
+            or not isinstance(contract_receipt, Mapping)
+            or dict(model_receipt) != dict(contract_receipt)
+        ):
+            raise ValueError(
+                f"Temperature resolution model/contract receipt mismatch for {name!r}"
+            )
+        receipt_policy = str(contract_receipt.get("policy", "")).strip()
+        requested_policy = str(
+            contract_receipt.get("requested_policy", "")
+        ).strip()
+        if receipt_policy != policy or requested_policy != policy:
+            raise ValueError(f"Temperature resolution per-view policy mismatch for {name!r}")
+        original_shape = _contract_shape_hw(
+            contract_receipt.get("original_shape_hw"),
+            label=f"{name} original temperature shape",
+        )
+        output_shape = _contract_shape_hw(
+            contract_receipt.get("output_shape_hw"),
+            label=f"{name} output temperature shape",
+        )
+        camera_shape = (int(model_view.get("height", -1)), int(model_view.get("width", -1)))
+        if output_shape != camera_shape:
+            raise ValueError(f"Temperature resolution/camera shape mismatch for {name!r}")
+        resized = contract_receipt.get("resized")
+        if not isinstance(resized, bool):
+            raise ValueError(f"Temperature resolution resized flag is invalid for {name!r}")
+        observed_resized_count += int(resized)
+        if contract_receipt.get("png_or_palette_inverse_used_for_target") is not False:
+            raise ValueError(f"Temperature target provenance is not direct Celsius for {name!r}")
+        if str(contract_receipt.get("target_domain", "")) != "direct float32 Celsius":
+            raise ValueError(f"Temperature target domain mismatch for {name!r}")
+        expected_forward = not resized
+        if (
+            contract_receipt.get("direct_float_temperature_resized") is not resized
+            or contract_receipt.get(
+                "source_training_target_forward_colorization_exact_on_valid_support"
+            )
+            is not expected_forward
+        ):
+            raise ValueError(f"Temperature per-view forward provenance mismatch for {name!r}")
+        expected_status = (
+            "not_applicable_after_direct_float_temperature_resize"
+            if resized
+            else "exact_on_valid_support"
+        )
+        if str(
+            contract_receipt.get(
+                "source_training_target_forward_colorization_status", ""
+            )
+        ) != expected_status:
+            raise ValueError(f"Temperature per-view forward status mismatch for {name!r}")
+        if resized:
+            if policy != TEMPERATURE_RESOLUTION_BILINEAR_NEAREST:
+                raise ValueError("Only the explicit bilinear/nearest policy may resize")
+            if original_shape == output_shape:
+                raise ValueError(f"Resized temperature shape did not change for {name!r}")
+            if (
+                str(contract_receipt.get("temperature_interpolation", ""))
+                != "bilinear"
+                or str(contract_receipt.get("support_interpolation", ""))
+                != "nearest"
+                or contract_receipt.get("align_corners") is not False
+                or str(contract_receipt.get("target_semantics", ""))
+                != "image-domain bilinear resampling of the direct float32 "
+                "TSDK-referenced undistorted temperature NPY"
+            ):
+                raise ValueError(f"Temperature resize recipe mismatch for {name!r}")
+        else:
+            if original_shape != output_shape:
+                raise ValueError(f"Unresized temperature shape changed for {name!r}")
+            if (
+                str(contract_receipt.get("temperature_interpolation", "")) != "none"
+                or str(contract_receipt.get("support_interpolation", "")) != "none"
+                or contract_receipt.get("align_corners") is not None
+                or str(contract_receipt.get("target_semantics", ""))
+                != "direct float32 TSDK-referenced undistorted temperature NPY"
+            ):
+                raise ValueError(f"Native temperature recipe mismatch for {name!r}")
+    if observed_resized_count != declared_resized_count:
+        raise ValueError("Temperature resolution resized-view count does not match views")
+
+
 def _temperature_contract(
     manifest_path: Path | None,
     *,
@@ -1026,12 +1242,10 @@ def _temperature_contract(
     } != {split: int(formal_split_counts.get(split, -1)) for split in FORMAL_SPLIT_LABELS}:
         raise ValueError("Temperature-responsibility/current formal split counts mismatch")
     target_provenance = payload.get("target_provenance")
-    if (
-        not isinstance(target_provenance, Mapping)
-        or target_provenance.get("png_or_palette_inverse_used_for_target") is not False
-        or target_provenance.get("source_training_target_forward_colorization_exact_on_valid_support") is not True
-    ):
-        raise ValueError("Temperature target provenance does not prove direct Celsius and exact training colorization")
+    if not isinstance(target_provenance, Mapping):
+        raise ValueError("Temperature target provenance must be an object")
+    if target_provenance.get("png_or_palette_inverse_used_for_target") is not False:
+        raise ValueError("Temperature target provenance does not prove direct Celsius")
     keys = payload.get("keys")
     if not isinstance(keys, dict):
         raise ValueError("Temperature-responsibility manifest is missing keys")
@@ -1054,6 +1268,13 @@ def _temperature_contract(
         bound[name] = item
     if set(bound) != set(model_views):
         raise ValueError("Temperature-responsibility manifest must cover every model view exactly")
+    _validate_temperature_resolution_contract(
+        payload=payload,
+        derivation=derivation,
+        target_provenance=target_provenance,
+        model_views=model_views,
+        contract_views=bound,
+    )
     for name, model_view in model_views.items():
         if str(bound[name]["npz_sha256"]).lower() != str(model_view.get("npz_sha256", "")).lower():
             raise ValueError(f"Temperature-responsibility NPZ binding mismatch for {name}")
@@ -1062,8 +1283,14 @@ def _temperature_contract(
         ).strip().lower():
             raise ValueError(f"Temperature-responsibility split binding mismatch for {name}")
         for key in ("temperature_target_sha256", "valid_support_sha256", "source_npz_sha256"):
-            if not _is_sha256(bound[name].get(key, "")):
+            contract_sha = str(bound[name].get(key, "")).strip().lower()
+            model_sha = str(model_view.get(key, "")).strip().lower()
+            if not _is_sha256(contract_sha) or not _is_sha256(model_sha):
                 raise ValueError(f"Temperature-responsibility view {name!r} is missing {key}")
+            if contract_sha != model_sha:
+                raise ValueError(
+                    f"Temperature-responsibility view {name!r} {key} exact binding mismatch"
+                )
     if not temperature_fields_present:
         raise ValueError("Temperature-responsibility manifest supplied but model arrays contain no temperature fields")
     return {
@@ -1076,6 +1303,14 @@ def _temperature_contract(
         "canonical_manifest_sha256": str(payload["canonical_manifest_sha256"]).lower(),
         "valid_support_manifest_sha256": str(payload["valid_support_manifest_sha256"]).lower(),
         "lut_sha256_uint8_rgb": str(payload["lut_sha256_uint8_rgb"]).lower(),
+        "resolution_policy": (
+            dict(payload["resolution_policy"])
+            if isinstance(payload.get("resolution_policy"), Mapping)
+            else {
+                "requested_policy": TEMPERATURE_RESOLUTION_NATIVE_EXACT,
+                "legacy_receipt_without_explicit_resolution_block": True,
+            }
+        ),
         "payload": payload,
     }
 

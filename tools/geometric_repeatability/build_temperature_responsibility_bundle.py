@@ -9,8 +9,9 @@ explicit temperature arrays:
 
 * ``render_temperature_c`` is the nearest fixed repository Hot-Iron inverse of
   the rendered (possibly off-LUT) canonical RGB;
-* ``target_temperature_c`` is copied directly from the bound float32 TSDK-
-  referenced undistorted NPY (never reconstructed from a PNG); and
+* ``target_temperature_c`` comes directly from the bound float32 TSDK-
+  referenced undistorted NPY (never reconstructed from a PNG), with an optional
+  explicit image-domain resolution policy; and
 * ``temperature_valid_mask`` is the bound boolean undistortion support.
 
 Every association is fail-closed and stem-based only after uniqueness has
@@ -96,6 +97,15 @@ SOURCE_TEMPERATURE_KEYS = frozenset(
     }
 )
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+RESOLUTION_POLICY_NATIVE_EXACT = "native_exact"
+RESOLUTION_POLICY_BILINEAR_TEMPERATURE_NEAREST_SUPPORT = (
+    "bilinear_temperature_nearest_support"
+)
+RESOLUTION_POLICIES = (
+    RESOLUTION_POLICY_NATIVE_EXACT,
+    RESOLUTION_POLICY_BILINEAR_TEMPERATURE_NEAREST_SUPPORT,
+)
+_NUMPY_BLAS_PRIMED_BEFORE_TORCH = False
 
 
 def _sha256(path: Path) -> str:
@@ -188,6 +198,153 @@ def _as_hw(value: np.ndarray, *, label: str) -> np.ndarray:
     if array.ndim != 2:
         raise ValueError(f"{label} must have shape HxW or 1xHxW, got {array.shape}")
     return array
+
+
+def _prime_numpy_blas_before_optional_torch() -> None:
+    """Initialize NumPy's BLAS runtime before the first local Torch import.
+
+    On the supported Windows workstation, importing Torch before NumPy's first
+    BLAS-backed matmul can abort the process inside the OpenMP runtime.  The
+    explicit resize path is the only path that imports Torch in this module.
+    A deterministic one-time matmul preserves the mandated ``F.interpolate``
+    numerics while making the initialization order explicit and reliable over
+    every subsequent view.
+    """
+
+    global _NUMPY_BLAS_PRIMED_BEFORE_TORCH
+    if _NUMPY_BLAS_PRIMED_BEFORE_TORCH:
+        return
+    left = np.arange(12, dtype=np.float32).reshape(4, 3)
+    right = np.arange(768, dtype=np.float32).reshape(3, 256)
+    product = left @ right
+    if product.shape != (4, 256) or not np.all(np.isfinite(product)):
+        raise RuntimeError("NumPy BLAS preflight failed before optional Torch import")
+    _NUMPY_BLAS_PRIMED_BEFORE_TORCH = True
+
+
+def _align_temperature_and_support(
+    target: np.ndarray,
+    support: np.ndarray,
+    *,
+    output_shape: tuple[int, int],
+    policy: str = RESOLUTION_POLICY_NATIVE_EXACT,
+    label: str,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Align direct-Celsius/support arrays to a diagnostic image domain.
+
+    ``native_exact`` deliberately preserves the historical fail-closed
+    contract.  The only permitted resampling recipe is explicit: bilinear
+    interpolation of the direct float32 Celsius map and nearest-neighbour
+    interpolation of the boolean support.  No display PNG or palette inverse
+    participates in this operation.
+    """
+
+    target_array = np.asarray(target)
+    support_array = np.asarray(support)
+    if target_array.ndim != 2 or support_array.ndim != 2:
+        raise ValueError(f"{label} temperature/support must both be HxW")
+    if target_array.shape != support_array.shape:
+        raise ValueError(f"Temperature/support shape mismatch for {label}")
+    if target_array.dtype != np.float32:
+        raise TypeError(
+            f"{label} TSDK target must be float32 Celsius, got {target_array.dtype}"
+        )
+    if support_array.dtype != np.bool_:
+        raise TypeError(
+            f"{label} valid-support must be boolean, got {support_array.dtype}"
+        )
+    try:
+        destination_shape = tuple(int(value) for value in output_shape)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} output shape is invalid") from exc
+    if len(destination_shape) != 2 or any(value <= 0 for value in destination_shape):
+        raise ValueError(f"{label} output shape must contain two positive dimensions")
+    if policy not in RESOLUTION_POLICIES:
+        raise ValueError(
+            f"Unknown temperature resolution policy {policy!r}; expected one of "
+            f"{RESOLUTION_POLICIES}"
+        )
+
+    original_shape = tuple(int(value) for value in target_array.shape)
+    resized = original_shape != destination_shape
+    if resized and policy == RESOLUTION_POLICY_NATIVE_EXACT:
+        raise ValueError(
+            f"TSDK target/camera shape mismatch for {label}: "
+            f"{original_shape} vs {destination_shape}; native_exact forbids resampling"
+        )
+
+    if resized:
+        # Bilinear interpolation would spread even unsupported NaN/Inf values.
+        # Therefore the explicit resize recipe requires the complete direct
+        # Celsius source map, not only its valid-support subset, to be finite.
+        if not np.all(np.isfinite(target_array)):
+            raise ValueError(
+                f"{label} TSDK target must be fully finite before bilinear resize"
+            )
+        # Keep the default native-exact path free of a PyTorch dependency.  The
+        # explicit resize path intentionally uses the same torch interpolation
+        # primitive as the diagnostic image pipeline.  Prime NumPy BLAS first;
+        # see the helper for the Windows OpenMP initialization-order contract.
+        _prime_numpy_blas_before_optional_torch()
+        import torch
+        import torch.nn.functional as torch_functional
+
+        target_tensor = torch.from_numpy(
+            np.ascontiguousarray(target_array)
+        ).reshape(1, 1, *original_shape)
+        support_tensor = torch.from_numpy(
+            np.ascontiguousarray(support_array.astype(np.float32, copy=False))
+        ).reshape(1, 1, *original_shape)
+        with torch.no_grad():
+            aligned_target = torch_functional.interpolate(
+                target_tensor,
+                size=destination_shape,
+                mode="bilinear",
+                align_corners=False,
+            )[0, 0]
+            aligned_support_float = torch_functional.interpolate(
+                support_tensor,
+                size=destination_shape,
+                mode="nearest",
+            )[0, 0]
+        target_output = aligned_target.cpu().numpy().astype(np.float32, copy=False)
+        support_output = (
+            aligned_support_float.cpu().numpy() >= np.float32(0.5)
+        ).astype(np.bool_, copy=False)
+        if not np.all(np.isfinite(target_output)):
+            raise RuntimeError(f"{label} resized TSDK target contains NaN/Inf")
+    else:
+        target_output = np.asarray(target_array, dtype=np.float32)
+        support_output = np.asarray(support_array, dtype=np.bool_)
+
+    receipt = {
+        "policy": policy,
+        "requested_policy": policy,
+        "original_shape_hw": list(original_shape),
+        "output_shape_hw": list(destination_shape),
+        "resized": bool(resized),
+        "temperature_interpolation": "bilinear" if resized else "none",
+        "support_interpolation": "nearest" if resized else "none",
+        "align_corners": False if resized else None,
+        "target_domain": "direct float32 Celsius",
+        "target_semantics": (
+            "image-domain bilinear resampling of the direct float32 "
+            "TSDK-referenced undistorted temperature NPY"
+            if resized
+            else "direct float32 TSDK-referenced undistorted temperature NPY"
+        ),
+        "png_or_palette_inverse_used_for_target": False,
+        "direct_float_temperature_resized": bool(resized),
+        "source_training_target_forward_colorization_exact_on_valid_support": (
+            not resized
+        ),
+        "source_training_target_forward_colorization_status": (
+            "exact_on_valid_support"
+            if not resized
+            else "not_applicable_after_direct_float_temperature_resize"
+        ),
+    }
+    return target_output, support_output, receipt
 
 
 def _as_hwc_rgb(
@@ -438,6 +595,23 @@ def _validate_array_metadata(
             raise ValueError(f"{label} manifest/array shape mismatch")
 
 
+def _declared_hw(
+    metadata: Mapping[str, Any], *, label: str
+) -> tuple[int, int] | None:
+    value = metadata.get("shape")
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"{label} manifest shape must be H,W")
+    try:
+        shape = (int(value[0]), int(value[1]))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} manifest shape is invalid") from exc
+    if any(dimension <= 0 for dimension in shape):
+        raise ValueError(f"{label} manifest shape must be positive")
+    return shape
+
+
 def _save_npz_deterministic(path: Path, arrays: Mapping[str, np.ndarray]) -> None:
     """Write a deterministic, pickle-free compressed NPZ."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -497,11 +671,17 @@ def build_temperature_responsibility_bundle(
     output_root: Path,
     expected_view_count: int = 559,
     chunk_pixels: int = 32768,
+    resolution_policy: str = RESOLUTION_POLICY_NATIVE_EXACT,
 ) -> dict[str, Any]:
     if int(expected_view_count) <= 0:
         raise ValueError("expected_view_count must be positive")
     if int(chunk_pixels) <= 0:
         raise ValueError("chunk_pixels must be positive")
+    if resolution_policy not in RESOLUTION_POLICIES:
+        raise ValueError(
+            f"Unknown temperature resolution policy {resolution_policy!r}; expected "
+            f"one of {RESOLUTION_POLICIES}"
+        )
 
     source_manifest_path = Path(source_model_manifest_path).resolve()
     render_binding_path = Path(source_render_binding_manifest_path).resolve()
@@ -753,6 +933,49 @@ def build_temperature_responsibility_bundle(
             "Temperature/support roots must cover every source model view exactly"
         )
 
+    if resolution_policy == RESOLUTION_POLICY_BILINEAR_TEMPERATURE_NEAREST_SUPPORT:
+        # Fail before creating a temporary output tree when the manifests prove
+        # that the explicit resize would be a no-op for every view.  Missing
+        # shape metadata is handled by the authoritative array check below.
+        all_shapes_declared = True
+        declared_resize_count = 0
+        for stem, source_view in source_views.items():
+            target_record = target_aliases.get(stem)
+            support_record = support_aliases.get(stem)
+            if target_record is None or support_record is None:
+                all_shapes_declared = False
+                break
+            target_shape = _declared_hw(
+                _mapping(
+                    target_record,
+                    "output_temperature",
+                    label="temperature target manifest",
+                ),
+                label=f"temperature target {stem!r}",
+            )
+            support_shape = _declared_hw(
+                _mapping(
+                    support_record,
+                    "valid_support",
+                    label="valid-support manifest",
+                ),
+                label=f"valid-support {stem!r}",
+            )
+            if target_shape is None or support_shape is None:
+                all_shapes_declared = False
+                break
+            if target_shape != support_shape:
+                raise ValueError(
+                    f"Temperature/support manifest shape mismatch for {stem!r}"
+                )
+            camera_shape = (int(source_view["height"]), int(source_view["width"]))
+            declared_resize_count += int(target_shape != camera_shape)
+        if all_shapes_declared and declared_resize_count == 0:
+            raise ValueError(
+                "bilinear_temperature_nearest_support requires at least one actual "
+                "temperature/camera resolution mismatch; refusing no-op policy"
+            )
+
     low_c, high_c, range_provenance = resolve_temperature_range(
         range_manifest=range_path
     )
@@ -775,6 +998,7 @@ def build_temperature_responsibility_bundle(
     )
     output_views: list[dict[str, Any]] = []
     contract_views: list[dict[str, Any]] = []
+    resolution_receipts: list[dict[str, Any]] = []
     seen_records: dict[str, set[int]] = {
         "formal": set(),
         "binding": set(),
@@ -946,10 +1170,13 @@ def build_temperature_responsibility_bundle(
                         f"Source {stem!r} is missing diagnostic arrays {missing}"
                     )
                 expected_shape = (int(source_view["height"]), int(source_view["width"]))
-                if target.shape != expected_shape:
-                    raise ValueError(
-                        f"TSDK target/camera shape mismatch for {stem!r}: {target.shape} vs {expected_shape}"
-                    )
+                target, support, resolution_receipt = _align_temperature_and_support(
+                    target,
+                    support,
+                    output_shape=expected_shape,
+                    policy=resolution_policy,
+                    label=stem,
+                )
                 compact: dict[str, np.ndarray] = {}
                 for key in DIAGNOSTIC_KEYS:
                     value = np.asarray(source_npz[key])
@@ -984,16 +1211,6 @@ def build_temperature_responsibility_bundle(
                     label=f"{stem} target_thermal_canonical",
                 )
 
-            safe_target = np.where(np.isfinite(target), target, np.float32(low_c)).astype(
-                np.float32,
-                copy=False,
-            )
-            expected_target_rgb, _target_clipping = temperature_to_rgb(
-                safe_target,
-                low_c,
-                high_c,
-                lut=palette,
-            )
             if np.any(target_rgb_bytes < -1.0e-5) or np.any(target_rgb_bytes > 255.0 + 1.0e-5) or np.any(
                 np.abs(target_rgb_bytes - np.rint(target_rgb_bytes)) > 1.0e-4
             ):
@@ -1001,17 +1218,28 @@ def build_temperature_responsibility_bundle(
                     f"Source target_thermal_canonical is not byte-exact canonical PNG data for {stem!r}"
                 )
             observed_target_rgb = np.rint(target_rgb_bytes).astype(np.int16)
-            expected_target_rgb_i16 = expected_target_rgb.astype(np.int16)
-            if np.any(support):
-                canonical_abs_diff = np.abs(
-                    observed_target_rgb[support] - expected_target_rgb_i16[support]
+            if not resolution_receipt["resized"]:
+                safe_target = np.where(
+                    np.isfinite(target), target, np.float32(low_c)
+                ).astype(np.float32, copy=False)
+                expected_target_rgb, _target_clipping = temperature_to_rgb(
+                    safe_target,
+                    low_c,
+                    high_c,
+                    lut=palette,
                 )
-                if np.any(canonical_abs_diff != 0):
-                    raise ValueError(
-                        f"Source target_thermal_canonical is not the exact fixed-LUT/formal-range "
-                        f"forward colorization on valid support for {stem!r}; "
-                        f"max_byte_error={int(np.max(canonical_abs_diff))}"
+                expected_target_rgb_i16 = expected_target_rgb.astype(np.int16)
+                if np.any(support):
+                    canonical_abs_diff = np.abs(
+                        observed_target_rgb[support]
+                        - expected_target_rgb_i16[support]
                     )
+                    if np.any(canonical_abs_diff != 0):
+                        raise ValueError(
+                            f"Source target_thermal_canonical is not the exact fixed-LUT/formal-range "
+                            f"forward colorization on valid support for {stem!r}; "
+                            f"max_byte_error={int(np.max(canonical_abs_diff))}"
+                        )
 
             render_temperature, off_lut_distance, _ = rgb_to_temperature(
                 render_rgb_bytes,
@@ -1043,9 +1271,11 @@ def build_temperature_responsibility_bundle(
                     "source_npz_sha256": str(source_view["npz_sha256"]).lower(),
                     "temperature_target_sha256": target_sha,
                     "valid_support_sha256": support_sha,
+                    "temperature_resolution": dict(resolution_receipt),
                 }
             )
             output_views.append(view_entry)
+            resolution_receipts.append(dict(resolution_receipt))
             contract_views.append(
                 {
                     "image_name": str(source_view["image_name"]),
@@ -1057,6 +1287,7 @@ def build_temperature_responsibility_bundle(
                     "source_npz_sha256": str(source_view["npz_sha256"]).lower(),
                     "temperature_target_sha256": target_sha,
                     "valid_support_sha256": support_sha,
+                    "temperature_resolution": dict(resolution_receipt),
                     "off_lut": _off_lut_summary(off_lut_distance, support),
                 }
             )
@@ -1069,6 +1300,24 @@ def build_temperature_responsibility_bundle(
                 )
 
         producer_identity = _producer_identity()
+        resized_view_count = sum(
+            int(receipt["resized"]) for receipt in resolution_receipts
+        )
+        if (
+            resolution_policy
+            == RESOLUTION_POLICY_BILINEAR_TEMPERATURE_NEAREST_SUPPORT
+            and resized_view_count == 0
+        ):
+            raise ValueError(
+                "bilinear_temperature_nearest_support requires at least one actual "
+                "temperature/camera resolution mismatch; refusing no-op policy"
+            )
+        source_target_forward_exact = resized_view_count == 0
+        source_target_forward_status = (
+            "exact_on_valid_support"
+            if source_target_forward_exact
+            else "not_applicable_after_direct_float_temperature_resize"
+        )
         derived_manifest = dict(source)
         derived_manifest["views"] = output_views
         derived_manifest["temperature_responsibility_derivation"] = {
@@ -1088,12 +1337,38 @@ def build_temperature_responsibility_bundle(
             "canonical_manifest_sha256": input_hashes["canonical_manifest"],
             "lut_sha256_uint8_rgb": palette_sha,
             "keys": dict(TEMPERATURE_KEYS),
-            "target_source": "direct float32 TSDK-referenced undistorted NPY; never PNG inversion",
+            "target_source": (
+                "direct float32 TSDK-referenced undistorted NPY; never PNG inversion; "
+                "optionally image-domain resized only under the explicit recorded resolution policy"
+            ),
             "render_inverse": "nearest repository-owned fixed Hot-Iron LUT",
+            "resolution_policy": {
+                "requested_policy": resolution_policy,
+                "native_exact_is_default": True,
+                "resized_view_count": resized_view_count,
+                "view_count": int(expected_view_count),
+                "temperature_interpolation_when_resized": "bilinear; align_corners=false",
+                "support_interpolation_when_resized": "nearest",
+            },
             "source_target_forward_validation": (
                 "target_thermal_canonical equals direct TSDK float32 target forward-colorized with the "
                 "same formal range and fixed Hot-Iron LUT on every valid-support pixel"
+                if source_target_forward_exact
+                else "not applicable after direct-float temperature resize; source "
+                "target_thermal_canonical is only validated as bound finite byte-domain data"
             ),
+            "source_target_forward_validation_receipt": {
+                "exact": source_target_forward_exact,
+                "status": source_target_forward_status,
+                "reason": (
+                    "target_thermal_canonical equals the direct TSDK float32 target forward-colorized "
+                    "with the same formal range and fixed Hot-Iron LUT on every valid-support pixel"
+                    if source_target_forward_exact
+                    else "source target_thermal_canonical is an independently image-domain-resized "
+                    "canonical target; it is not claimed to equal forward colorization of the "
+                    "bilinearly resized direct-Celsius target"
+                ),
+            },
         }
         model_manifest_path = temporary / OUTPUT_MODEL_MANIFEST
         _write_json(model_manifest_path, derived_manifest)
@@ -1139,11 +1414,30 @@ def build_temperature_responsibility_bundle(
                 "split_labels": sorted(FORMAL_SPLITS),
                 "all_formal_views_exactly_once": True,
             },
+            "resolution_policy": {
+                "requested_policy": resolution_policy,
+                "native_exact_is_default": True,
+                "resized_view_count": resized_view_count,
+                "view_count": int(expected_view_count),
+                "temperature_interpolation_when_resized": "bilinear; align_corners=false",
+                "support_interpolation_when_resized": "nearest",
+            },
             "target_provenance": {
                 "domain": "float32 Celsius",
-                "source": "TSDK-referenced undistorted NPY",
+                "source": (
+                    "image-domain bilinear resampling of direct float32 TSDK-referenced "
+                    "undistorted NPY"
+                    if resized_view_count
+                    else "TSDK-referenced undistorted NPY"
+                ),
                 "png_or_palette_inverse_used_for_target": False,
-                "source_training_target_forward_colorization_exact_on_valid_support": True,
+                "direct_float_temperature_resized": bool(resized_view_count),
+                "source_training_target_forward_colorization_exact_on_valid_support": (
+                    source_target_forward_exact
+                ),
+                "source_training_target_forward_colorization_status": (
+                    source_target_forward_status
+                ),
             },
             "render_provenance": {
                 "source_key": "render_thermal_canonical",
@@ -1200,6 +1494,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--expected-view-count", type=int, default=559)
     parser.add_argument("--chunk-pixels", type=int, default=32768)
+    parser.add_argument(
+        "--resolution-policy",
+        choices=RESOLUTION_POLICIES,
+        default=RESOLUTION_POLICY_NATIVE_EXACT,
+        help=(
+            "native_exact (default) rejects any TSDK/diagnostic size mismatch; "
+            "bilinear_temperature_nearest_support explicitly resizes direct float32 "
+            "Celsius with bilinear align_corners=False and boolean support with nearest"
+        ),
+    )
     return parser
 
 
@@ -1219,6 +1523,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_root=args.output_root,
         expected_view_count=args.expected_view_count,
         chunk_pixels=args.chunk_pixels,
+        resolution_policy=args.resolution_policy,
     )
     print(json.dumps(result, sort_keys=True))
     return 0

@@ -14,6 +14,7 @@ from tools.thermal_radiometry.palette_lut import lut_sha256
 from tools.geometric_repeatability.evaluate_depth_definitions import (
     DEFAULT_THRESHOLDS_M,
     DIAGNOSTIC_DEPTH_SEMANTICS,
+    TEMPERATURE_RESOLUTION_BILINEAR_NEAREST,
     TEMPERATURE_RESPONSIBILITY_PROTOCOL,
     TEMPERATURE_SEMANTICS,
     _camera_set_sha256,
@@ -251,6 +252,74 @@ class DepthMetricTests(unittest.TestCase):
 
 
 class FormalEvaluatorTests(unittest.TestCase):
+    def _set_explicit_temperature_resize_contract(
+        self,
+        bundle: dict,
+        *,
+        original_shape: tuple[int, int] = (4, 4),
+        output_shape: tuple[int, int] = (2, 2),
+    ) -> None:
+        model = json.loads(bundle["model"].read_text(encoding="utf-8"))
+        resolution = {
+            "requested_policy": TEMPERATURE_RESOLUTION_BILINEAR_NEAREST,
+            "native_exact_is_default": True,
+            "resized_view_count": len(model["views"]),
+            "view_count": len(model["views"]),
+            "temperature_interpolation_when_resized": "bilinear; align_corners=false",
+            "support_interpolation_when_resized": "nearest",
+        }
+        receipt = {
+            "policy": TEMPERATURE_RESOLUTION_BILINEAR_NEAREST,
+            "requested_policy": TEMPERATURE_RESOLUTION_BILINEAR_NEAREST,
+            "original_shape_hw": list(original_shape),
+            "output_shape_hw": list(output_shape),
+            "resized": True,
+            "temperature_interpolation": "bilinear",
+            "support_interpolation": "nearest",
+            "align_corners": False,
+            "target_domain": "direct float32 Celsius",
+            "target_semantics": (
+                "image-domain bilinear resampling of the direct float32 "
+                "TSDK-referenced undistorted temperature NPY"
+            ),
+            "png_or_palette_inverse_used_for_target": False,
+            "direct_float_temperature_resized": True,
+            "source_training_target_forward_colorization_exact_on_valid_support": False,
+            "source_training_target_forward_colorization_status": (
+                "not_applicable_after_direct_float_temperature_resize"
+            ),
+        }
+        derivation = model["temperature_responsibility_derivation"]
+        derivation["resolution_policy"] = dict(resolution)
+        derivation["source_target_forward_validation_receipt"] = {
+            "exact": False,
+            "status": "not_applicable_after_direct_float_temperature_resize",
+            "reason": "fixture direct-float image-domain resize",
+        }
+        for view in model["views"]:
+            view["temperature_resolution"] = dict(receipt)
+        _write_json(bundle["model"], model)
+
+        contract = json.loads(bundle["temperature"].read_text(encoding="utf-8"))
+        contract["model_manifest_sha256"] = _sha256(bundle["model"])
+        contract["resolution_policy"] = dict(resolution)
+        contract["target_provenance"] = {
+            "domain": "float32 Celsius",
+            "source": (
+                "image-domain bilinear resampling of direct float32 TSDK-referenced "
+                "undistorted NPY"
+            ),
+            "png_or_palette_inverse_used_for_target": False,
+            "direct_float_temperature_resized": True,
+            "source_training_target_forward_colorization_exact_on_valid_support": False,
+            "source_training_target_forward_colorization_status": (
+                "not_applicable_after_direct_float_temperature_resize"
+            ),
+        }
+        for view in contract["views"]:
+            view["temperature_resolution"] = dict(receipt)
+        _write_json(bundle["temperature"], contract)
+
     def _bundle(self, root: Path, *, appearance_modality: str = "rgb", include_temperature: bool = True) -> dict:
         ref_root, model_root = root / "reference", root / "model"
         ref_root.mkdir()
@@ -346,6 +415,15 @@ class FormalEvaluatorTests(unittest.TestCase):
                     "npz_file": model_path.name,
                     "npz_size_bytes": model_path.stat().st_size,
                     "npz_sha256": _sha256(model_path),
+                    **(
+                        {
+                            "source_npz_sha256": "8" * 64,
+                            "temperature_target_sha256": "9" * 64,
+                            "valid_support_sha256": "a" * 64,
+                        }
+                        if include_temperature
+                        else {}
+                    ),
                 }
             )
 
@@ -658,6 +736,113 @@ class FormalEvaluatorTests(unittest.TestCase):
                     formal_split_manifest_path=bundle["formal"],
                     out_dir=root / "out",
                 )
+
+    def test_explicit_direct_float_temperature_resize_contract_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle = self._bundle(root)
+            self._set_explicit_temperature_resize_contract(bundle)
+            summary = evaluate(
+                reference_manifest_path=bundle["reference"],
+                model_manifest_path=bundle["model"],
+                probe_camera_manifest_path=bundle["probe"],
+                formal_split_manifest_path=bundle["formal"],
+                temperature_responsibility_manifest_path=bundle["temperature"],
+                out_dir=root / "accepted",
+            )
+            self.assertEqual(
+                summary["responsibility"]["temperature_contract"]["resolution_policy"][
+                    "requested_policy"
+                ],
+                TEMPERATURE_RESOLUTION_BILINEAR_NEAREST,
+            )
+
+    def test_temperature_resize_contract_fails_closed_on_missing_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle = self._bundle(root)
+            self._set_explicit_temperature_resize_contract(bundle)
+            contract = json.loads(bundle["temperature"].read_text(encoding="utf-8"))
+            del contract["resolution_policy"]
+            _write_json(bundle["temperature"], contract)
+            with self.assertRaisesRegex(ValueError, "Legacy/native temperature provenance"):
+                evaluate(
+                    reference_manifest_path=bundle["reference"],
+                    model_manifest_path=bundle["model"],
+                    probe_camera_manifest_path=bundle["probe"],
+                    formal_split_manifest_path=bundle["formal"],
+                    temperature_responsibility_manifest_path=bundle["temperature"],
+                    out_dir=root / "rejected-missing-policy",
+                )
+
+    def test_temperature_resize_contract_fails_closed_on_provenance_or_shape(self) -> None:
+        mutations = (
+            (
+                "source",
+                lambda payload: payload["target_provenance"].__setitem__(
+                    "source", "canonical PNG inverse"
+                ),
+                "direct float32 Celsius",
+            ),
+            (
+                "forward-exact",
+                lambda payload: payload["target_provenance"].__setitem__(
+                    "source_training_target_forward_colorization_exact_on_valid_support",
+                    True,
+                ),
+                "exact=false",
+            ),
+            (
+                "output-shape",
+                lambda payload: payload["views"][0]["temperature_resolution"].__setitem__(
+                    "output_shape_hw", [3, 2]
+                ),
+                "model/contract receipt mismatch",
+            ),
+        )
+        for label, mutate, expected_error in mutations:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                bundle = self._bundle(root)
+                self._set_explicit_temperature_resize_contract(bundle)
+                contract = json.loads(bundle["temperature"].read_text(encoding="utf-8"))
+                mutate(contract)
+                _write_json(bundle["temperature"], contract)
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    evaluate(
+                        reference_manifest_path=bundle["reference"],
+                        model_manifest_path=bundle["model"],
+                        probe_camera_manifest_path=bundle["probe"],
+                        formal_split_manifest_path=bundle["formal"],
+                        temperature_responsibility_manifest_path=bundle["temperature"],
+                        out_dir=root / f"rejected-{label}",
+                    )
+
+    def test_temperature_view_lineage_hashes_require_exact_model_contract_binding(
+        self,
+    ) -> None:
+        for key in (
+            "temperature_target_sha256",
+            "valid_support_sha256",
+            "source_npz_sha256",
+        ):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                bundle = self._bundle(root)
+                contract = json.loads(bundle["temperature"].read_text(encoding="utf-8"))
+                contract["views"][0][key] = "b" * 64
+                _write_json(bundle["temperature"], contract)
+                with self.assertRaisesRegex(
+                    ValueError, rf"{key} exact binding mismatch"
+                ):
+                    evaluate(
+                        reference_manifest_path=bundle["reference"],
+                        model_manifest_path=bundle["model"],
+                        probe_camera_manifest_path=bundle["probe"],
+                        formal_split_manifest_path=bundle["formal"],
+                        temperature_responsibility_manifest_path=bundle["temperature"],
+                        out_dir=root / f"rejected-{key}",
+                    )
 
     def test_thermal_palette_bundle_does_not_emit_rgb_responsibility(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

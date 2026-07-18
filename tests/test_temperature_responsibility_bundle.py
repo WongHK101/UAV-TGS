@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,10 +18,13 @@ from tools.geometric_repeatability.build_temperature_responsibility_bundle impor
     OUTPUT_CONTRACT_MANIFEST,
     OUTPUT_MODEL_MANIFEST,
     PROTOCOL,
+    RESOLUTION_POLICY_BILINEAR_TEMPERATURE_NEAREST_SUPPORT,
+    RESOLUTION_POLICY_NATIVE_EXACT,
     SEMANTICS,
     SOURCE_RENDER_BINDING_PROTOCOL,
     TEMPERATURE_KEYS,
     UNDISTORTED_SCHEMA,
+    _align_temperature_and_support,
     build_temperature_responsibility_bundle,
 )
 from tools.geometric_repeatability.build_thermal_render_binding import (
@@ -327,7 +333,55 @@ class TemperatureResponsibilityBundleTests(unittest.TestCase):
             "split_counts": split_counts,
         }
 
-    def _build(self, fixture: dict[str, Any], output: Path) -> dict[str, Any]:
+    def _replace_temperature_resolution(
+        self,
+        fixture: dict[str, Any],
+        *,
+        target_factory: Any,
+        support_factory: Any,
+    ) -> None:
+        target_manifest = json.loads(
+            fixture["target_manifest"].read_text(encoding="utf-8")
+        )
+        support_manifest = json.loads(
+            fixture["support_manifest"].read_text(encoding="utf-8")
+        )
+        for ordinal, target_record in enumerate(target_manifest["files"]):
+            stem = Path(target_record["image_name"]).stem
+            target = np.asarray(target_factory(ordinal), dtype=np.float32)
+            support = np.asarray(support_factory(ordinal), dtype=np.bool_)
+            self.assertEqual(target.shape, support.shape)
+            target_path = fixture["target_root"] / f"{stem}.npy"
+            support_path = fixture["support_root"] / f"{stem}.npy"
+            np.save(target_path, target, allow_pickle=False)
+            np.save(support_path, support, allow_pickle=False)
+            fixture["targets"][stem] = target
+            for payload in (target_manifest, support_manifest):
+                record = payload["files"][ordinal]
+                record["output_temperature"].update(
+                    {
+                        "sha256": _sha(target_path),
+                        "dtype": "float32",
+                        "shape": list(target.shape),
+                    }
+                )
+                record["valid_support"].update(
+                    {
+                        "sha256": _sha(support_path),
+                        "dtype": "bool",
+                        "shape": list(support.shape),
+                    }
+                )
+        _write_json(fixture["target_manifest"], target_manifest)
+        _write_json(fixture["support_manifest"], support_manifest)
+
+    def _build(
+        self,
+        fixture: dict[str, Any],
+        output: Path,
+        *,
+        resolution_policy: str = RESOLUTION_POLICY_NATIVE_EXACT,
+    ) -> dict[str, Any]:
         return build_temperature_responsibility_bundle(
             source_model_manifest_path=fixture["source_manifest"],
             source_render_binding_manifest_path=fixture["source_render_binding"],
@@ -342,7 +396,63 @@ class TemperatureResponsibilityBundleTests(unittest.TestCase):
             output_root=output,
             expected_view_count=fixture["view_count"],
             chunk_pixels=2,
+            resolution_policy=resolution_policy,
         )
+
+    def test_alignment_helper_is_explicit_numeric_and_fail_closed(self) -> None:
+        target = np.arange(16, dtype=np.float32).reshape(4, 4)
+        support = np.array(
+            [
+                [True, False, False, True],
+                [False, False, False, False],
+                [False, True, True, False],
+                [True, False, True, False],
+            ],
+            dtype=np.bool_,
+        )
+        with self.assertRaisesRegex(ValueError, "native_exact forbids resampling"):
+            _align_temperature_and_support(
+                target,
+                support,
+                output_shape=(2, 2),
+                label="fixture",
+            )
+
+        resized_target, resized_support, receipt = _align_temperature_and_support(
+            target,
+            support,
+            output_shape=(2, 2),
+            policy=RESOLUTION_POLICY_BILINEAR_TEMPERATURE_NEAREST_SUPPORT,
+            label="fixture",
+        )
+        np.testing.assert_array_equal(
+            resized_target,
+            np.array([[2.5, 4.5], [10.5, 12.5]], dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            resized_support,
+            np.array([[True, False], [False, True]], dtype=np.bool_),
+        )
+        self.assertEqual(receipt["original_shape_hw"], [4, 4])
+        self.assertEqual(receipt["output_shape_hw"], [2, 2])
+        self.assertTrue(receipt["resized"])
+        self.assertEqual(receipt["temperature_interpolation"], "bilinear")
+        self.assertEqual(receipt["support_interpolation"], "nearest")
+        self.assertIs(receipt["align_corners"], False)
+        self.assertFalse(receipt["png_or_palette_inverse_used_for_target"])
+
+        nonfinite = target.copy()
+        nonfinite[0, 1] = np.nan
+        support_without_nan = support.copy()
+        support_without_nan[0, 1] = False
+        with self.assertRaisesRegex(ValueError, "fully finite before bilinear resize"):
+            _align_temperature_and_support(
+                nonfinite,
+                support_without_nan,
+                output_shape=(2, 2),
+                policy=RESOLUTION_POLICY_BILINEAR_TEMPERATURE_NEAREST_SUPPORT,
+                label="fixture",
+            )
 
     def test_full_all_split_contract_is_evaluator_compatible_and_target_is_direct_float32(
         self,
@@ -416,6 +526,238 @@ class TemperatureResponsibilityBundleTests(unittest.TestCase):
             np.testing.assert_array_equal(target, fixture["targets"]["0001"])
             self.assertEqual(target.dtype, np.float32)
             self.assertEqual(valid.dtype, np.bool_)
+
+    def test_explicit_resize_policy_builds_direct_float_bundle_with_exact_provenance(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = self._fixture(root)
+            # Odd native dimensions exercise the same non-integral sampling
+            # geometry as the formal 1007x1259 -> diagnostic-domain resize.
+            support_5x7 = np.ones((5, 7), dtype=np.bool_)
+            support_5x7[0, 3] = False
+            support_5x7[2, 0] = False
+            self._replace_temperature_resolution(
+                fixture,
+                target_factory=lambda ordinal: (
+                    np.arange(35, dtype=np.float32).reshape(5, 7)
+                    + np.float32(10 + ordinal)
+                ),
+                support_factory=lambda _ordinal: support_5x7,
+            )
+            output = root / "resized_output"
+            result = self._build(
+                fixture,
+                output,
+                resolution_policy=(
+                    RESOLUTION_POLICY_BILINEAR_TEMPERATURE_NEAREST_SUPPORT
+                ),
+            )
+            model_path = Path(result["model_manifest"])
+            contract_path = Path(result["temperature_responsibility_manifest"])
+            model = json.loads(model_path.read_text(encoding="utf-8"))
+            contract = json.loads(contract_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(
+                contract["resolution_policy"]["requested_policy"],
+                RESOLUTION_POLICY_BILINEAR_TEMPERATURE_NEAREST_SUPPORT,
+            )
+            self.assertEqual(contract["resolution_policy"]["resized_view_count"], 3)
+            provenance = contract["target_provenance"]
+            self.assertTrue(provenance["direct_float_temperature_resized"])
+            self.assertFalse(provenance["png_or_palette_inverse_used_for_target"])
+            self.assertFalse(
+                provenance[
+                    "source_training_target_forward_colorization_exact_on_valid_support"
+                ]
+            )
+            self.assertEqual(
+                provenance["source_training_target_forward_colorization_status"],
+                "not_applicable_after_direct_float_temperature_resize",
+            )
+            derivation_forward = model["temperature_responsibility_derivation"][
+                "source_target_forward_validation_receipt"
+            ]
+            self.assertFalse(derivation_forward["exact"])
+            self.assertIn("not_applicable", derivation_forward["status"])
+
+            first = model["views"][0]
+            resolution = first["temperature_resolution"]
+            self.assertEqual(resolution["original_shape_hw"], [5, 7])
+            self.assertEqual(resolution["output_shape_hw"], [2, 2])
+            self.assertTrue(resolution["resized"])
+            self.assertIn("direct float32", resolution["target_semantics"])
+            with np.load(
+                model_path.parent / first["npz_file"], allow_pickle=False
+            ) as arrays:
+                np.testing.assert_array_equal(
+                    arrays[TEMPERATURE_KEYS["target"]],
+                    np.array([[16.5, 20.0], [34.0, 37.5]], dtype=np.float32),
+                )
+                np.testing.assert_array_equal(
+                    arrays[TEMPERATURE_KEYS["valid_mask"]],
+                    np.array([[True, False], [False, True]], dtype=np.bool_),
+                )
+
+            contract_first = contract["views"][0]
+            self.assertEqual(
+                contract_first["temperature_target_sha256"],
+                _sha(fixture["target_root"] / "0001.npy"),
+            )
+            self.assertEqual(
+                contract_first["valid_support_sha256"],
+                _sha(fixture["support_root"] / "0001.npy"),
+            )
+
+    def test_explicit_resize_cli_cold_start_without_kmp_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = self._fixture(root)
+            self._replace_temperature_resolution(
+                fixture,
+                target_factory=lambda ordinal: (
+                    np.arange(35, dtype=np.float32).reshape(5, 7)
+                    + np.float32(10 + ordinal)
+                ),
+                support_factory=lambda _ordinal: np.ones((5, 7), dtype=np.bool_),
+            )
+            output = root / "cold_start_output"
+            repo_root = Path(__file__).resolve().parents[1]
+            command = [
+                sys.executable,
+                str(
+                    repo_root
+                    / "tools"
+                    / "geometric_repeatability"
+                    / "build_temperature_responsibility_bundle.py"
+                ),
+                "--source-model-manifest",
+                str(fixture["source_manifest"]),
+                "--source-render-binding-manifest",
+                str(fixture["source_render_binding"]),
+                "--formal-split-manifest",
+                str(fixture["formal"]),
+                "--tsdk-binding-manifest",
+                str(fixture["binding"]),
+                "--temperature-root",
+                str(fixture["target_root"]),
+                "--temperature-manifest",
+                str(fixture["target_manifest"]),
+                "--valid-support-root",
+                str(fixture["support_root"]),
+                "--valid-support-manifest",
+                str(fixture["support_manifest"]),
+                "--range-manifest",
+                str(fixture["range"]),
+                "--canonical-manifest",
+                str(fixture["canonical"]),
+                "--output-root",
+                str(output),
+                "--expected-view-count",
+                str(fixture["view_count"]),
+                "--chunk-pixels",
+                "2",
+                "--resolution-policy",
+                RESOLUTION_POLICY_BILINEAR_TEMPERATURE_NEAREST_SUPPORT,
+            ]
+            environment = os.environ.copy()
+            environment.pop("KMP_DUPLICATE_LIB_OK", None)
+            self.assertNotIn("KMP_DUPLICATE_LIB_OK", environment)
+            completed = subprocess.run(
+                command,
+                cwd=repo_root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(
+                completed.returncode,
+                0,
+                msg=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+            payload = json.loads(completed.stdout.strip().splitlines()[-1])
+            self.assertEqual(payload["status"], "complete")
+            self.assertTrue((output / OUTPUT_CONTRACT_MANIFEST).is_file())
+
+    def test_explicit_resize_policy_rejects_noop_before_publishing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = self._fixture(root)
+            output = root / "noop_must_not_publish"
+            with self.assertRaisesRegex(ValueError, "requires at least one actual"):
+                self._build(
+                    fixture,
+                    output,
+                    resolution_policy=(
+                        RESOLUTION_POLICY_BILINEAR_TEMPERATURE_NEAREST_SUPPORT
+                    ),
+                )
+            self.assertFalse(output.exists())
+
+    def test_native_exact_default_rejects_resolution_mismatch_without_output(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = self._fixture(root)
+            self._replace_temperature_resolution(
+                fixture,
+                target_factory=lambda ordinal: np.full(
+                    (4, 4), 20.0 + ordinal, dtype=np.float32
+                ),
+                support_factory=lambda _ordinal: np.ones((4, 4), dtype=np.bool_),
+            )
+            output = root / "must_not_publish"
+            with self.assertRaisesRegex(ValueError, "native_exact forbids resampling"):
+                self._build(fixture, output)
+            self.assertFalse(output.exists())
+
+    def test_resize_policy_preserves_tamper_and_fresh_output_guards(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = self._fixture(root)
+            self._replace_temperature_resolution(
+                fixture,
+                target_factory=lambda ordinal: np.full(
+                    (4, 4), 20.0 + ordinal, dtype=np.float32
+                ),
+                support_factory=lambda _ordinal: np.ones((4, 4), dtype=np.bool_),
+            )
+            tampered_target = fixture["target_root"] / "0001.npy"
+            with tampered_target.open("ab") as handle:
+                handle.write(b"tamper")
+            rejected_output = root / "tamper_rejected"
+            with self.assertRaisesRegex(
+                RuntimeError, "temperature target NPY SHA-256 mismatch"
+            ):
+                self._build(
+                    fixture,
+                    rejected_output,
+                    resolution_policy=(
+                        RESOLUTION_POLICY_BILINEAR_TEMPERATURE_NEAREST_SUPPORT
+                    ),
+                )
+            self.assertFalse(rejected_output.exists())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = self._fixture(root)
+            output = root / "existing_output"
+            output.mkdir()
+            sentinel = output / "sentinel.txt"
+            sentinel.write_text("preserve", encoding="utf-8")
+            with self.assertRaises(FileExistsError):
+                self._build(
+                    fixture,
+                    output,
+                    resolution_policy=(
+                        RESOLUTION_POLICY_BILINEAR_TEMPERATURE_NEAREST_SUPPORT
+                    ),
+                )
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve")
 
     def test_off_lut_render_uses_nearest_fixed_palette_and_records_distance(
         self,
