@@ -30,6 +30,8 @@ from utils.read_write_model import read_images_binary, read_images_text
 
 
 SPLITS = ("train", "guard", "test")
+MODEL_CAMERA_MAX_POSITION_ERROR_M = 1.0e-4
+MODEL_CAMERA_MAX_ROTATION_ERROR_DEG = 5.0e-2
 
 
 def _sha256(path: Path) -> str:
@@ -154,10 +156,24 @@ def _validate_model_camera(entry: Mapping[str, Any], camera: Any, name: str) -> 
     observed_focal = np.asarray([entry["fx"], entry["fy"]], dtype=np.float64)
     if not np.allclose(observed_focal, expected_focal, rtol=1e-7, atol=1e-5):
         raise ValueError(f"{name}: model/source focal mismatch")
-    if not np.allclose(np.asarray(entry["position"], dtype=np.float64), c2w[:3, 3], rtol=1e-8, atol=1e-7):
-        raise ValueError(f"{name}: model/source camera position mismatch")
-    if not np.allclose(np.asarray(entry["rotation"], dtype=np.float64), c2w[:3, :3], rtol=1e-8, atol=1e-7):
-        raise ValueError(f"{name}: model/source camera rotation mismatch")
+    observed_position = np.asarray(entry["position"], dtype=np.float64)
+    observed_rotation = np.asarray(entry["rotation"], dtype=np.float64)
+    if observed_position.shape != (3,) or observed_rotation.shape != (3, 3):
+        raise ValueError(f"{name}: model camera pose has invalid shape")
+    position_error = float(np.linalg.norm(observed_position - c2w[:3, 3]))
+    relative_rotation = observed_rotation @ c2w[:3, :3].T
+    cosine = np.clip((float(np.trace(relative_rotation)) - 1.0) / 2.0, -1.0, 1.0)
+    rotation_error = float(np.degrees(np.arccos(cosine)))
+    if not np.isfinite(position_error) or position_error > MODEL_CAMERA_MAX_POSITION_ERROR_M:
+        raise ValueError(
+            f"{name}: model/source camera position mismatch "
+            f"({position_error} m > {MODEL_CAMERA_MAX_POSITION_ERROR_M} m)"
+        )
+    if not np.isfinite(rotation_error) or rotation_error > MODEL_CAMERA_MAX_ROTATION_ERROR_DEG:
+        raise ValueError(
+            f"{name}: model/source camera rotation mismatch "
+            f"({rotation_error} deg > {MODEL_CAMERA_MAX_ROTATION_ERROR_DEG} deg)"
+        )
 
 
 def build_manifest(

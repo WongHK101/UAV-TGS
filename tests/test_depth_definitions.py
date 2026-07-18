@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import tempfile
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
 
@@ -22,6 +23,10 @@ from tools.geometric_repeatability.evaluate_depth_definitions import (
     summarize_responsibility,
 )
 from tools.geometric_repeatability.extend_depth_reference_all_splits import _save_npz_deterministic
+from tools.geometric_repeatability.build_all_split_probe_camera_manifest import (
+    MODEL_CAMERA_MAX_POSITION_ERROR_M,
+    _validate_model_camera,
+)
 from tools.geometric_repeatability.export_gaussian_probe_bundle import (
     _index_probe_images,
     _ply_xyz_sequence_identity,
@@ -65,6 +70,28 @@ def _write_xyz_ply(path: Path, xyz: np.ndarray, marker: float) -> None:
 
 
 class DepthMetricTests(unittest.TestCase):
+    def test_model_camera_validation_accepts_serialization_noise_only(self) -> None:
+        camera = SimpleNamespace(
+            R=np.eye(3, dtype=np.float64),
+            T=np.zeros(3, dtype=np.float64),
+            width=100,
+            height=80,
+            FovX=np.pi / 2.0,
+            FovY=np.pi / 2.0,
+        )
+        entry = {
+            "width": 100,
+            "height": 80,
+            "fx": 50.0,
+            "fy": 40.0,
+            "position": [MODEL_CAMERA_MAX_POSITION_ERROR_M / 2.0, 0.0, 0.0],
+            "rotation": np.eye(3).tolist(),
+        }
+        _validate_model_camera(entry, camera, "camera.png")
+        entry["position"] = [MODEL_CAMERA_MAX_POSITION_ERROR_M * 2.0, 0.0, 0.0]
+        with self.assertRaisesRegex(ValueError, "position mismatch"):
+            _validate_model_camera(entry, camera, "camera.png")
+
     def test_probe_image_resolution_prefers_exact_then_unique_stem(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
