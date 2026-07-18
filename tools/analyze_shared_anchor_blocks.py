@@ -268,10 +268,14 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
     test_names = _read_test_list(test_list)
     blocks, split_protocol, _ = _load_blocks(bound_split, test_names)
     appearance_paths = _parse_group_paths(args.appearance, "appearance")
-    groups = tuple(appearance_paths)
+    group_order = tuple(appearance_paths)
     depth_paths = _parse_group_paths(
-        args.depth_endpoint, "depth endpoint", expected_groups=groups
+        args.depth_endpoint, "depth endpoint", expected_groups=group_order
     )
+    if not {"Anchor", "S"}.issubset(group_order):
+        raise SharedAnchorBlockError(
+            "block comparison requires Anchor and S reference groups"
+        )
     appearances = {
         group: _appearance(path, args.anchor_iteration, test_names)
         for group, path in appearance_paths.items()
@@ -286,9 +290,9 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     for block in blocks:
         names = list(block["views"])
-        groups: dict[str, Any] = {}
-        for group in groups:
-            groups[group] = {
+        block_groups: dict[str, Any] = {}
+        for group in group_order:
+            block_groups[group] = {
                 "appearance_frame_macro": {
                     metric: float(
                         np.mean(
@@ -302,31 +306,31 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
         records.append(
             {
                 "block": dict(block),
-                "groups": groups,
+                "groups": block_groups,
                 "S_minus_Anchor": {
                     "PSNR": (
-                        groups["S"]["appearance_frame_macro"]["PSNR"]
-                        - groups["Anchor"]["appearance_frame_macro"]["PSNR"]
+                        block_groups["S"]["appearance_frame_macro"]["PSNR"]
+                        - block_groups["Anchor"]["appearance_frame_macro"]["PSNR"]
                     ),
                     "SSIM": (
-                        groups["S"]["appearance_frame_macro"]["SSIM"]
-                        - groups["Anchor"]["appearance_frame_macro"]["SSIM"]
+                        block_groups["S"]["appearance_frame_macro"]["SSIM"]
+                        - block_groups["Anchor"]["appearance_frame_macro"]["SSIM"]
                     ),
                     "LPIPS": (
-                        groups["S"]["appearance_frame_macro"]["LPIPS"]
-                        - groups["Anchor"]["appearance_frame_macro"]["LPIPS"]
+                        block_groups["S"]["appearance_frame_macro"]["LPIPS"]
+                        - block_groups["Anchor"]["appearance_frame_macro"]["LPIPS"]
                     ),
                     "front_at_1m": (
-                        groups["S"]["depth_pixel_micro"]["thresholds"]["1"]["front"]
-                        - groups["Anchor"]["depth_pixel_micro"]["thresholds"]["1"]["front"]
+                        block_groups["S"]["depth_pixel_micro"]["thresholds"]["1"]["front"]
+                        - block_groups["Anchor"]["depth_pixel_micro"]["thresholds"]["1"]["front"]
                     ),
                     "mean_error_m": (
-                        groups["S"]["depth_pixel_micro"]["abs_depth_error_mean"]
-                        - groups["Anchor"]["depth_pixel_micro"]["abs_depth_error_mean"]
+                        block_groups["S"]["depth_pixel_micro"]["abs_depth_error_mean"]
+                        - block_groups["Anchor"]["depth_pixel_micro"]["abs_depth_error_mean"]
                     ),
                     "missing_rate": (
-                        groups["S"]["depth_pixel_micro"]["missing_rate"]
-                        - groups["Anchor"]["depth_pixel_micro"]["missing_rate"]
+                        block_groups["S"]["depth_pixel_micro"]["missing_rate"]
+                        - block_groups["Anchor"]["depth_pixel_micro"]["missing_rate"]
                     ),
                 },
             }
@@ -336,7 +340,7 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
         "status": "complete",
         "scene": str(args.scene),
         "anchor_iteration": int(args.anchor_iteration),
-        "groups": list(groups),
+        "groups": list(group_order),
         "protocol": {
             "split_protocol": split_protocol,
             "views_per_block": 16,
