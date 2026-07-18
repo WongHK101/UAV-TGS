@@ -15,6 +15,8 @@ from utils.camera_sequence import (
     camera_parameters_hash,
     load_sequence_manifest,
     save_sequence_manifest,
+    sequence_hash,
+    sha256_json,
 )
 
 
@@ -113,6 +115,23 @@ class FixedCameraSequenceTests(unittest.TestCase):
             tampered["sequence"][0] = "b" if tampered["sequence"][0] != "b" else "a"
             path.write_text(json.dumps(tampered), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "sequence SHA-256"):
+                load_sequence_manifest(
+                    path, camera_names=["a", "b", "c"], expected_steps=5000
+                )
+
+    def test_self_consistent_sequence_reordering_is_rejected(self):
+        manifest = build_sequence_manifest(["a", "b", "c"], steps=5000, seed=2)
+        manifest["sequence"][0], manifest["sequence"][1] = (
+            manifest["sequence"][1],
+            manifest["sequence"][0],
+        )
+        manifest["sequence_sha256"] = sequence_hash(manifest["sequence"])
+        manifest.pop("manifest_sha256")
+        manifest["manifest_sha256"] = sha256_json(manifest)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "sequence.json"
+            save_sequence_manifest(path, manifest)
+            with self.assertRaisesRegex(ValueError, "deterministic sequence"):
                 load_sequence_manifest(
                     path, camera_names=["a", "b", "c"], expected_steps=5000
                 )

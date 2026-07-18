@@ -163,6 +163,21 @@ def validate_sequence_manifest(
     if payload.get("sequence_sha256") != actual_sequence_hash:
         raise ValueError("Camera sequence SHA-256 mismatch")
 
+    try:
+        stored_seed = int(payload["seed"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Camera sequence manifest must declare an integer seed") from exc
+    expected_sequence = build_sequence_manifest(
+        expected_names,
+        steps=int(expected_steps),
+        seed=stored_seed,
+    )["sequence"]
+    if sequence != expected_sequence:
+        raise ValueError(
+            "Camera sequence does not match the deterministic sequence generated "
+            "from ordered_camera_names, steps, and seed"
+        )
+
     expected_manifest_hash = payload.pop("manifest_sha256", None)
     actual_manifest_hash = sha256_json(payload)
     payload["manifest_sha256"] = expected_manifest_hash
