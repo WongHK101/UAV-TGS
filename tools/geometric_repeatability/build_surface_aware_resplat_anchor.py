@@ -747,7 +747,12 @@ def _load_contract(
             diagnostic_map[index].get("local_support_distance_m"),
             f"candidate local support distance for {index}",
         )
-        if not math.isclose(distance, candidate_distance, rel_tol=1e-7, abs_tol=1e-9):
+        # The locked SCSP receipt stores the authoritative float32 distance.
+        # Candidate-v2 recomputes the same diagnostic through a separate
+        # centroid reduction whose float32 accumulation can differ by a few
+        # parts per million.  Keep a tight identity check without mistaking
+        # that benign reduction-order noise for a protocol mismatch.
+        if not math.isclose(distance, candidate_distance, rel_tol=1e-5, abs_tol=1e-6):
             raise SurfaceAwareResplatError(f"candidate/SCSP support distance differs for {index}")
         distances[index] = distance
     return candidates, distances, voxel_size

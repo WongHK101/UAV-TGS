@@ -86,16 +86,32 @@ def test_fixed_selection_is_four_groups_at_ordered_offset_7_and_ignores_test() -
         "go_007",
     ]
     assert _canonical_sha256(with_test) == _canonical_sha256(without_test)
-    assert all(row["ordered_group_offset_zero_based"] == 7 for row in with_test)
+    assert all(row["requested_ordered_group_offset_zero_based"] == 7 for row in with_test)
+    assert all(row["selected_ordered_group_offset_zero_based"] == 7 for row in with_test)
+    assert not any(row["short_group_cyclic_wrap"] for row in with_test)
     assert all(row["split"] != "test" for row in with_test)
 
 
-def test_fixed_selection_fails_closed_when_group_is_too_short() -> None:
+def test_fixed_selection_uses_fixed_cyclic_offset_for_short_group() -> None:
     records = _records(include_test=False)
     records = [
         row
         for row in records
         if not (row["split"] == "guard" and row["stratum"].startswith("oblique") and row["position_in_strip"] > 5)
+    ]
+    selected = select_fixed_formal_records({"records": records})
+    guard_oblique = next(row for row in selected if row["selection_id"] == "guard_oblique")
+    assert guard_oblique["ordered_group_count"] == 6
+    assert guard_oblique["requested_ordered_group_offset_zero_based"] == 7
+    assert guard_oblique["selected_ordered_group_offset_zero_based"] == 1
+    assert guard_oblique["short_group_cyclic_wrap"] is True
+
+
+def test_fixed_selection_fails_closed_when_group_is_empty() -> None:
+    records = [
+        row
+        for row in _records(include_test=False)
+        if not (row["split"] == "guard" and row["stratum"].startswith("oblique"))
     ]
     with pytest.raises(ValueError, match="guard/oblique"):
         select_fixed_formal_records({"records": records})

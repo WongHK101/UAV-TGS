@@ -282,7 +282,9 @@ class SurfaceAwareResplatCheckpointTests(unittest.TestCase):
                         "candidate_diagnostics": [
                             {
                                 "gaussian_index": 7,
-                                "local_support_distance_m": 1.0,
+                                # Separate float32 centroid reductions may
+                                # differ by a few parts per million.
+                                "local_support_distance_m": 1.000003,
                             }
                         ],
                     },

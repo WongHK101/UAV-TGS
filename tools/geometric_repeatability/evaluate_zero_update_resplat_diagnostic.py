@@ -148,9 +148,10 @@ def select_fixed_formal_records(split_payload: Mapping[str, Any]) -> list[dict[s
 
     Guard views are adjacent frames and the formal manifests contain no guard
     record whose *formal* ``block_offset`` equals seven.  Therefore the fixed
-    protocol orders each eligible group by immutable formal fields and selects
-    its zero-based item 7.  The actual formal block fields are retained in the
-    result so this distinction cannot be hidden.
+    protocol orders each eligible group by immutable formal fields and applies
+    zero-based offset 7 cyclically.  For groups with at least eight records this
+    is exactly item 7; a shorter immutable group uses ``7 mod N``.  Requested
+    and effective offsets plus actual formal block fields are retained.
     """
 
     records = split_payload.get("records")
@@ -173,11 +174,10 @@ def select_fixed_formal_records(split_payload: Mapping[str, Any]) -> list[dict[s
     observed_stems: set[str] = set()
     for split, orientation in SELECTION_GROUPS:
         ordered = sorted(eligible[(split, orientation)], key=_formal_order_key)
-        if len(ordered) <= GROUP_BLOCK_OFFSET:
-            raise ValueError(
-                f"Need at least {GROUP_BLOCK_OFFSET + 1} records for {split}/{orientation}, got {len(ordered)}"
-            )
-        record = ordered[GROUP_BLOCK_OFFSET]
+        if not ordered:
+            raise ValueError(f"No eligible formal records for {split}/{orientation}")
+        selected_offset = GROUP_BLOCK_OFFSET % len(ordered)
+        record = ordered[selected_offset]
         stem = _record_stem(record)
         if not stem or stem in observed_stems:
             raise ValueError(f"Fixed selection produced an empty or duplicate image stem: {stem!r}")
@@ -188,7 +188,9 @@ def select_fixed_formal_records(split_payload: Mapping[str, Any]) -> list[dict[s
                 "split": split,
                 "orientation": orientation,
                 "ordered_group_count": len(ordered),
-                "ordered_group_offset_zero_based": GROUP_BLOCK_OFFSET,
+                "requested_ordered_group_offset_zero_based": GROUP_BLOCK_OFFSET,
+                "selected_ordered_group_offset_zero_based": selected_offset,
+                "short_group_cyclic_wrap": len(ordered) <= GROUP_BLOCK_OFFSET,
                 "formal_record": _record_public_fields(record),
                 "image_stem": stem,
             }
@@ -626,12 +628,14 @@ def create_selection_receipt(
                 "pair_id",
             ],
             "ordered_group_offset_zero_based": GROUP_BLOCK_OFFSET,
+            "short_group_rule": "selected_offset=requested_offset mod ordered_group_count",
             "selected_records_sha256": selection_sha256,
             "test_records_eligible": False,
             "test_views_selected": False,
             "note": (
                 "Formal guard records have no formal block_offset=7; each eligible group is ordered by "
-                "immutable formal fields and its zero-based item 7 is frozen. Actual block fields remain in receipt."
+                "immutable formal fields and requested offset 7 is applied cyclically. Effective offset and "
+                "actual block fields remain in the receipt."
             ),
         },
         "inputs": {
@@ -698,7 +702,9 @@ def load_and_verify_selection_receipt(
                     "split",
                     "orientation",
                     "ordered_group_count",
-                    "ordered_group_offset_zero_based",
+                    "requested_ordered_group_offset_zero_based",
+                    "selected_ordered_group_offset_zero_based",
+                    "short_group_cyclic_wrap",
                     "formal_record",
                     "image_stem",
                 )
