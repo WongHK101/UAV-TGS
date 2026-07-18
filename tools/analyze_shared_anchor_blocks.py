@@ -25,7 +25,6 @@ class SharedAnchorBlockError(RuntimeError):
     pass
 
 
-GROUPS = ("Anchor", "S")
 THRESHOLDS = (1.0, 2.0, 5.0)
 
 
@@ -57,7 +56,9 @@ def _finite(value: Any, label: str) -> float:
     return result
 
 
-def _parse_group_paths(values: list[str], label: str) -> dict[str, Path]:
+def _parse_group_paths(
+    values: list[str], label: str, expected_groups: tuple[str, ...] | None = None
+) -> dict[str, Path]:
     result: dict[str, Path] = {}
     for value in values:
         group, separator, raw_path = value.partition("=")
@@ -66,9 +67,11 @@ def _parse_group_paths(values: list[str], label: str) -> dict[str, Path]:
         if group in result:
             raise SharedAnchorBlockError(f"duplicate {label} group: {group}")
         result[group] = Path(raw_path).resolve()
-    if tuple(result) != GROUPS:
+    if not result:
+        raise SharedAnchorBlockError(f"{label} requires at least one group")
+    if expected_groups is not None and tuple(result) != expected_groups:
         raise SharedAnchorBlockError(
-            f"{label} groups/order must be {list(GROUPS)}, got {list(result)}"
+            f"{label} groups/order must be {list(expected_groups)}, got {list(result)}"
         )
     for path in result.values():
         if not path.exists():
@@ -265,7 +268,10 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
     test_names = _read_test_list(test_list)
     blocks, split_protocol, _ = _load_blocks(bound_split, test_names)
     appearance_paths = _parse_group_paths(args.appearance, "appearance")
-    depth_paths = _parse_group_paths(args.depth_endpoint, "depth endpoint")
+    groups = tuple(appearance_paths)
+    depth_paths = _parse_group_paths(
+        args.depth_endpoint, "depth endpoint", expected_groups=groups
+    )
     appearances = {
         group: _appearance(path, args.anchor_iteration, test_names)
         for group, path in appearance_paths.items()
@@ -281,7 +287,7 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
     for block in blocks:
         names = list(block["views"])
         groups: dict[str, Any] = {}
-        for group in GROUPS:
+        for group in groups:
             groups[group] = {
                 "appearance_frame_macro": {
                     metric: float(
@@ -330,7 +336,7 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
         "status": "complete",
         "scene": str(args.scene),
         "anchor_iteration": int(args.anchor_iteration),
-        "groups": list(GROUPS),
+        "groups": list(groups),
         "protocol": {
             "split_protocol": split_protocol,
             "views_per_block": 16,
