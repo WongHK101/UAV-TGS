@@ -217,6 +217,12 @@ int CudaRasterizer::Rasterizer::forward(
 	const bool prefiltered,
 	float* out_color,
 	float* depth,
+	float* alpha_normalized_depth,
+	float* transmittance_median_depth,
+	float* max_contribution_depth,
+	int* top_contributor_index,
+	float* top_contributor_weight,
+	float* accumulated_opacity,
 	bool antialiasing,
 	int* radii,
 	bool debug)
@@ -335,7 +341,13 @@ int CudaRasterizer::Rasterizer::forward(
 		background,
 		out_color,
 		geomState.depths,
-		depth), debug)
+		depth,
+		alpha_normalized_depth,
+		transmittance_median_depth,
+		max_contribution_depth,
+		top_contributor_index,
+		top_contributor_weight,
+		accumulated_opacity), debug)
 
 	return num_rendered;
 }

@@ -62,7 +62,13 @@ namespace FORWARD
 		const float* bg_color,
 		float* out_color,
 		float* depths,
-		float* depth);
+		float* depth,
+		float* alpha_normalized_depth,
+		float* transmittance_median_depth,
+		float* max_contribution_depth,
+		int* top_contributor_index,
+		float* top_contributor_weight,
+		float* accumulated_opacity);
 }
 
 

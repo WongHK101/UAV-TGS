@@ -41,6 +41,34 @@ def rasterize_gaussians(
         raster_settings,
     )
 
+def rasterize_gaussians_diagnostics(
+    means3D,
+    means2D,
+    sh,
+    colors_precomp,
+    opacities,
+    scales,
+    rotations,
+    cov3Ds_precomp,
+    raster_settings,
+):
+    """Rasterize with non-differentiable depth/responsibility diagnostics.
+
+    This is deliberately a separate entry point so the historical
+    ``rasterize_gaussians`` ABI and its three-output Python path remain exact.
+    """
+    return _RasterizeGaussiansDiagnostics.apply(
+        means3D,
+        means2D,
+        sh,
+        colors_precomp,
+        opacities,
+        scales,
+        rotations,
+        cov3Ds_precomp,
+        raster_settings,
+    )
+
 class _RasterizeGaussians(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -140,6 +168,168 @@ class _RasterizeGaussians(torch.autograd.Function):
 
         return grads
 
+class _RasterizeGaussiansDiagnostics(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        means3D,
+        means2D,
+        sh,
+        colors_precomp,
+        opacities,
+        scales,
+        rotations,
+        cov3Ds_precomp,
+        raster_settings,
+    ):
+        args = (
+            raster_settings.bg,
+            means3D,
+            colors_precomp,
+            opacities,
+            scales,
+            rotations,
+            raster_settings.scale_modifier,
+            cov3Ds_precomp,
+            raster_settings.viewmatrix,
+            raster_settings.projmatrix,
+            raster_settings.tanfovx,
+            raster_settings.tanfovy,
+            raster_settings.image_height,
+            raster_settings.image_width,
+            sh,
+            raster_settings.sh_degree,
+            raster_settings.campos,
+            raster_settings.prefiltered,
+            raster_settings.antialiasing,
+            raster_settings.debug,
+        )
+        (
+            num_rendered,
+            color,
+            radii,
+            geomBuffer,
+            binningBuffer,
+            imgBuffer,
+            invdepths,
+            expected_depth,
+            median_depth,
+            max_contribution_depth,
+            top_contributor_index,
+            top_contributor_weight,
+            accumulated_opacity,
+        ) = _C.rasterize_gaussians_diagnostics(*args)
+
+        ctx.raster_settings = raster_settings
+        ctx.num_rendered = num_rendered
+        ctx.save_for_backward(
+            colors_precomp,
+            means3D,
+            scales,
+            rotations,
+            cov3Ds_precomp,
+            radii,
+            sh,
+            opacities,
+            geomBuffer,
+            binningBuffer,
+            imgBuffer,
+        )
+        ctx.mark_non_differentiable(
+            expected_depth,
+            median_depth,
+            max_contribution_depth,
+            top_contributor_index,
+            top_contributor_weight,
+            accumulated_opacity,
+        )
+        return (
+            color,
+            radii,
+            invdepths,
+            expected_depth,
+            median_depth,
+            max_contribution_depth,
+            top_contributor_index,
+            top_contributor_weight,
+            accumulated_opacity,
+        )
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_out_color,
+        _,
+        grad_out_depth,
+        _grad_expected_depth,
+        _grad_median_depth,
+        _grad_max_contribution_depth,
+        _grad_top_contributor_index,
+        _grad_top_contributor_weight,
+        _grad_accumulated_opacity,
+    ):
+        raster_settings = ctx.raster_settings
+        (
+            colors_precomp,
+            means3D,
+            scales,
+            rotations,
+            cov3Ds_precomp,
+            radii,
+            sh,
+            opacities,
+            geomBuffer,
+            binningBuffer,
+            imgBuffer,
+        ) = ctx.saved_tensors
+        args = (
+            raster_settings.bg,
+            means3D,
+            radii,
+            colors_precomp,
+            opacities,
+            scales,
+            rotations,
+            raster_settings.scale_modifier,
+            cov3Ds_precomp,
+            raster_settings.viewmatrix,
+            raster_settings.projmatrix,
+            raster_settings.tanfovx,
+            raster_settings.tanfovy,
+            grad_out_color,
+            grad_out_depth,
+            sh,
+            raster_settings.sh_degree,
+            raster_settings.campos,
+            geomBuffer,
+            ctx.num_rendered,
+            binningBuffer,
+            imgBuffer,
+            raster_settings.antialiasing,
+            raster_settings.debug,
+        )
+        (
+            grad_means2D,
+            grad_colors_precomp,
+            grad_opacities,
+            grad_means3D,
+            grad_cov3Ds_precomp,
+            grad_sh,
+            grad_scales,
+            grad_rotations,
+        ) = _C.rasterize_gaussians_backward(*args)
+        return (
+            grad_means3D,
+            grad_means2D,
+            grad_sh,
+            grad_colors_precomp,
+            grad_opacities,
+            grad_scales,
+            grad_rotations,
+            grad_cov3Ds_precomp,
+            None,
+        )
+
 class GaussianRasterizationSettings(NamedTuple):
     image_height: int
     image_width: int 
@@ -171,7 +361,18 @@ class GaussianRasterizer(nn.Module):
             
         return visible
 
-    def forward(self, means3D, means2D, opacities, shs = None, colors_precomp = None, scales = None, rotations = None, cov3D_precomp = None):
+    def forward(
+        self,
+        means3D,
+        means2D,
+        opacities,
+        shs=None,
+        colors_precomp=None,
+        scales=None,
+        rotations=None,
+        cov3D_precomp=None,
+        return_diagnostics=False,
+    ):
         
         raster_settings = self.raster_settings
 
@@ -194,7 +395,8 @@ class GaussianRasterizer(nn.Module):
             cov3D_precomp = torch.Tensor([])
 
         # Invoke C++/CUDA rasterization routine
-        return rasterize_gaussians(
+        rasterize = rasterize_gaussians_diagnostics if return_diagnostics else rasterize_gaussians
+        return rasterize(
             means3D,
             means2D,
             shs,
@@ -203,6 +405,6 @@ class GaussianRasterizer(nn.Module):
             scales, 
             rotations,
             cov3D_precomp,
-            raster_settings, 
+            raster_settings,
         )
 

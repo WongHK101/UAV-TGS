@@ -32,8 +32,9 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
     return lambda;
 }
 
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-RasterizeGaussiansCUDA(
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+  torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+RasterizeGaussiansCUDAImpl(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
     const torch::Tensor& colors,
@@ -53,7 +54,8 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& campos,
 	const bool prefiltered,
 	const bool antialiasing,
-	const bool debug)
+	const bool debug,
+	const bool return_diagnostics)
 {
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
     AT_ERROR("means3D must have dimensions (num_points, 3)");
@@ -72,6 +74,36 @@ RasterizeGaussiansCUDA(
 
   out_invdepth = torch::full({1, H, W}, 0.0, float_opts).contiguous();
   out_invdepthptr = out_invdepth.data<float>();
+
+  // Undefined tensors keep the legacy path allocation-free for diagnostics.
+  // They are never exposed by the historical seven-return wrapper.
+  torch::Tensor out_expected_depth;
+  torch::Tensor out_median_depth;
+  torch::Tensor out_max_contribution_depth;
+  torch::Tensor out_top_contributor_index;
+  torch::Tensor out_top_contributor_weight;
+  torch::Tensor out_accumulated_opacity;
+  float* out_expected_depth_ptr = nullptr;
+  float* out_median_depth_ptr = nullptr;
+  float* out_max_contribution_depth_ptr = nullptr;
+  int* out_top_contributor_index_ptr = nullptr;
+  float* out_top_contributor_weight_ptr = nullptr;
+  float* out_accumulated_opacity_ptr = nullptr;
+  if (return_diagnostics)
+  {
+    out_expected_depth = torch::zeros({1, H, W}, float_opts).contiguous();
+    out_median_depth = torch::zeros({1, H, W}, float_opts).contiguous();
+    out_max_contribution_depth = torch::zeros({1, H, W}, float_opts).contiguous();
+    out_top_contributor_index = torch::full({1, H, W}, -1, int_opts).contiguous();
+    out_top_contributor_weight = torch::zeros({1, H, W}, float_opts).contiguous();
+    out_accumulated_opacity = torch::zeros({1, H, W}, float_opts).contiguous();
+    out_expected_depth_ptr = out_expected_depth.data<float>();
+    out_median_depth_ptr = out_median_depth.data<float>();
+    out_max_contribution_depth_ptr = out_max_contribution_depth.data<float>();
+    out_top_contributor_index_ptr = out_top_contributor_index.data<int>();
+    out_top_contributor_weight_ptr = out_top_contributor_weight.data<float>();
+    out_accumulated_opacity_ptr = out_accumulated_opacity.data<float>();
+  }
 
   torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
   
@@ -116,11 +148,85 @@ RasterizeGaussiansCUDA(
 		prefiltered,
 		out_color.contiguous().data<float>(),
 		out_invdepthptr,
+		out_expected_depth_ptr,
+		out_median_depth_ptr,
+		out_max_contribution_depth_ptr,
+		out_top_contributor_index_ptr,
+		out_top_contributor_weight_ptr,
+		out_accumulated_opacity_ptr,
 		antialiasing,
 		radii.contiguous().data<int>(),
 		debug);
   }
-  return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_invdepth);
+  return std::make_tuple(
+    rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_invdepth,
+    out_expected_depth, out_median_depth, out_max_contribution_depth,
+    out_top_contributor_index, out_top_contributor_weight, out_accumulated_opacity);
+}
+
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+RasterizeGaussiansCUDA(
+	const torch::Tensor& background,
+	const torch::Tensor& means3D,
+    const torch::Tensor& colors,
+    const torch::Tensor& opacity,
+	const torch::Tensor& scales,
+	const torch::Tensor& rotations,
+	const float scale_modifier,
+	const torch::Tensor& cov3D_precomp,
+	const torch::Tensor& viewmatrix,
+	const torch::Tensor& projmatrix,
+	const float tan_fovx,
+	const float tan_fovy,
+    const int image_height,
+    const int image_width,
+	const torch::Tensor& sh,
+	const int degree,
+	const torch::Tensor& campos,
+	const bool prefiltered,
+	const bool antialiasing,
+	const bool debug)
+{
+  auto outputs = RasterizeGaussiansCUDAImpl(
+    background, means3D, colors, opacity, scales, rotations, scale_modifier,
+    cov3D_precomp, viewmatrix, projmatrix, tan_fovx, tan_fovy,
+    image_height, image_width, sh, degree, campos, prefiltered,
+    antialiasing, debug, false);
+  return std::make_tuple(
+    std::get<0>(outputs), std::get<1>(outputs), std::get<2>(outputs),
+    std::get<3>(outputs), std::get<4>(outputs), std::get<5>(outputs),
+    std::get<6>(outputs));
+}
+
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+  torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+RasterizeGaussiansDiagnosticsCUDA(
+	const torch::Tensor& background,
+	const torch::Tensor& means3D,
+    const torch::Tensor& colors,
+    const torch::Tensor& opacity,
+	const torch::Tensor& scales,
+	const torch::Tensor& rotations,
+	const float scale_modifier,
+	const torch::Tensor& cov3D_precomp,
+	const torch::Tensor& viewmatrix,
+	const torch::Tensor& projmatrix,
+	const float tan_fovx,
+	const float tan_fovy,
+    const int image_height,
+    const int image_width,
+	const torch::Tensor& sh,
+	const int degree,
+	const torch::Tensor& campos,
+	const bool prefiltered,
+	const bool antialiasing,
+	const bool debug)
+{
+  return RasterizeGaussiansCUDAImpl(
+    background, means3D, colors, opacity, scales, rotations, scale_modifier,
+    cov3D_precomp, viewmatrix, projmatrix, tan_fovx, tan_fovy,
+    image_height, image_width, sh, degree, campos, prefiltered,
+    antialiasing, debug, true);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>

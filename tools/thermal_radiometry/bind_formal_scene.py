@@ -82,6 +82,36 @@ PARAMETER_NAMES = (
     "ambient_c",
     "reflected_c",
 )
+BINDING_BASIS_FIELDS = (
+    "collection_hash",
+    "collection_split_hash",
+    "formal_rule_hash",
+    "scene_split_hash",
+    "scene_rule_hash",
+    "scene_manifest_sha256",
+    "collection_manifest_sha256",
+    "decode_manifest_sha256",
+    "decode_protocol_sha256",
+    "decode_protocol_hash",
+    "decode_protocol_basis",
+    "formal_protocol_schema",
+    "formal_decode_schema",
+    "adapter",
+    "adapter_backend",
+    "adapter_executable_sha256",
+    "dirp_api_version",
+    "rjpeg_version",
+    "sfm_image_scope",
+    "counts",
+    "files",
+)
+# Early schema-v2 manifests predate the explicit protocol-basis discriminator;
+# those files were produced only by the legacy_frozen_v1 path.  Their hash
+# basis is retained so already-frozen formal bindings can be authenticated
+# without rewriting them in place.
+LEGACY_V2_BINDING_BASIS_FIELDS = tuple(
+    key for key in BINDING_BASIS_FIELDS if key != "decode_protocol_basis"
+)
 
 
 def _sha256(path: Path) -> str:
@@ -97,6 +127,70 @@ def _json_hash(value: Any) -> str:
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def binding_basis_sha256(payload: Mapping[str, Any]) -> str:
+    fields = (
+        BINDING_BASIS_FIELDS
+        if "decode_protocol_basis" in payload
+        else LEGACY_V2_BINDING_BASIS_FIELDS
+    )
+    missing = [key for key in fields if key not in payload]
+    if missing:
+        raise ValueError(f"formal binding is missing binding-basis fields: {missing}")
+    basis = {key: payload[key] for key in fields}
+    return _json_hash(basis)
+
+
+def validate_binding_manifest_self_hash(payload: Mapping[str, Any]) -> str:
+    """Recompute the producer's self-hash and validate its file coverage."""
+
+    if payload.get("schema_name") != SCHEMA_NAME or int(payload.get("schema_version", -1)) != SCHEMA_VERSION:
+        raise ValueError(
+            f"formal binding must use {SCHEMA_NAME} schema v{SCHEMA_VERSION}"
+        )
+    if str(payload.get("status", "")).strip().lower() != "passed":
+        raise ValueError("formal binding must declare status=passed")
+    scene = str(payload.get("scene", "")).strip()
+    if not scene:
+        raise ValueError("formal binding scene is missing")
+    expected_hash = _require_sha256("formal binding_hash", payload.get("binding_hash"))
+    actual_hash = binding_basis_sha256(payload)
+    _require_equal("formal binding_hash", actual_hash, expected_hash)
+
+    counts = _require_mapping("formal binding counts", payload.get("counts"))
+    required_count_keys = {"total", "train", "guard", "test"}
+    if set(counts) != required_count_keys:
+        raise ValueError(
+            f"formal binding counts must contain exactly {sorted(required_count_keys)}"
+        )
+    files = payload.get("files")
+    if not isinstance(files, list) or not files:
+        raise ValueError("formal binding files must be a non-empty list")
+    pair_ids: set[str] = set()
+    split_counts: Counter[str] = Counter()
+    for index, row in enumerate(files, 1):
+        record = _require_mapping(f"formal binding file {index}", row)
+        pair_id = str(record.get("pair_id", "")).strip()
+        split = str(record.get("split", "")).strip().lower()
+        if not pair_id or pair_id in pair_ids:
+            raise ValueError(f"formal binding file {index} has missing/duplicate pair_id")
+        if split not in {"train", "guard", "test"}:
+            raise ValueError(f"formal binding file {index} has invalid split {split!r}")
+        pair_ids.add(pair_id)
+        split_counts[split] += 1
+    observed_counts = {
+        "total": len(files),
+        "train": split_counts["train"],
+        "guard": split_counts["guard"],
+        "test": split_counts["test"],
+    }
+    declared_counts = {key: int(counts[key]) for key in required_count_keys}
+    if declared_counts != observed_counts:
+        raise ValueError(
+            f"formal binding counts/files mismatch: {declared_counts} != {observed_counts}"
+        )
+    return actual_hash
 
 
 def _require_sha256(label: str, value: Any) -> str:
@@ -747,6 +841,8 @@ def bind_formal_scene(
         "counts": actual_counts,
         "files": file_rows,
     }
+    if set(binding_basis) != set(BINDING_BASIS_FIELDS):
+        raise RuntimeError("formal binding producer basis drifted from its validator")
     binding_manifest = {
         "schema_name": SCHEMA_NAME,
         "schema_version": SCHEMA_VERSION,

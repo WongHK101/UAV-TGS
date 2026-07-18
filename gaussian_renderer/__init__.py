@@ -15,9 +15,25 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
+def render(
+    viewpoint_camera,
+    pc: GaussianModel,
+    pipe,
+    bg_color: torch.Tensor,
+    scaling_modifier=1.0,
+    separate_sh=False,
+    override_color=None,
+    use_trained_exp=False,
+    return_diagnostics=False,
+):
     """
-    Render the scene. 
+    Render the scene.
+
+    ``return_diagnostics=False`` preserves the legacy output and native
+    rasterization path.  When explicitly enabled, the returned dictionary also
+    contains metric camera-z expected/median/max-contribution depths, the
+    top-contributor Gaussian index and raw compositing weight, and accumulated
+    opacity.  These diagnostic tensors are intentionally non-differentiable.
     
     Background tensor (bg_color) must be on GPU!
     """
@@ -87,8 +103,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         colors_precomp = override_color
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
+    raster_kwargs = {}
+    if return_diagnostics:
+        # Keep the legacy call ABI byte-for-byte compatible with an installed
+        # extension that predates the optional diagnostic outputs.
+        raster_kwargs["return_diagnostics"] = True
     if separate_sh:
-        rendered_image, radii, depth_image = rasterizer(
+        raster_outputs = rasterizer(
             means3D = means3D,
             means2D = means2D,
             dc = dc,
@@ -97,9 +118,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             opacities = opacity,
             scales = scales,
             rotations = rotations,
-            cov3D_precomp = cov3D_precomp)
+            cov3D_precomp = cov3D_precomp,
+            **raster_kwargs)
     else:
-        rendered_image, radii, depth_image = rasterizer(
+        raster_outputs = rasterizer(
             means3D = means3D,
             means2D = means2D,
             shs = shs,
@@ -107,7 +129,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             opacities = opacity,
             scales = scales,
             rotations = rotations,
-            cov3D_precomp = cov3D_precomp)
+            cov3D_precomp = cov3D_precomp,
+            **raster_kwargs)
+
+    rendered_image, radii, depth_image = raster_outputs[:3]
         
     # Apply exposure to rendered image (training only)
     if use_trained_exp:
@@ -124,5 +149,28 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         "radii": radii,
         "depth" : depth_image
         }
+
+    if return_diagnostics:
+        (
+            _rendered,
+            _radii,
+            _legacy_depth,
+            expected_depth,
+            median_depth,
+            max_contribution_depth,
+            top_contributor_index,
+            top_contributor_weight,
+            accumulated_opacity,
+        ) = raster_outputs
+        out.update(
+            {
+                "depth_expected_alpha_normalized": expected_depth,
+                "depth_transmittance_median": median_depth,
+                "depth_max_contribution": max_contribution_depth,
+                "top_contributor_index": top_contributor_index,
+                "top_contributor_weight": top_contributor_weight,
+                "accumulated_opacity": accumulated_opacity,
+            }
+        )
     
     return out

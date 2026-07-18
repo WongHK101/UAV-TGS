@@ -271,7 +271,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 // Main rasterization method. Collaboratively works on one tile per
 // block, each thread treats one pixel. Alternates between fetching 
 // and rasterizing data.
-template <uint32_t CHANNELS>
+template <uint32_t CHANNELS, bool WRITE_DIAGNOSTICS>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
@@ -285,7 +285,13 @@ renderCUDA(
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
 	const float* __restrict__ depths,
-	float* __restrict__ invdepth)
+	float* __restrict__ invdepth,
+	float* __restrict__ alpha_normalized_depth,
+	float* __restrict__ transmittance_median_depth,
+	float* __restrict__ max_contribution_depth,
+	int* __restrict__ top_contributor_index,
+	float* __restrict__ top_contributor_weight,
+	float* __restrict__ accumulated_opacity)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -318,6 +324,12 @@ renderCUDA(
 	float C[CHANNELS] = { 0 };
 
 	float expected_invdepth = 0.0f;
+	float expected_depth_sum = 0.0f;
+	float median_depth = 0.0f;
+	float max_weight = 0.0f;
+	float max_weight_depth = 0.0f;
+	int max_weight_index = -1;
+	float opacity_sum = 0.0f;
 
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -374,6 +386,25 @@ renderCUDA(
 			if(invdepth)
 			expected_invdepth += (1 / depths[collected_id[j]]) * alpha * T;
 
+			if (WRITE_DIAGNOSTICS)
+			{
+				const float weight = alpha * T;
+				const float gaussian_depth = depths[collected_id[j]];
+				expected_depth_sum += gaussian_depth * weight;
+				opacity_sum += weight;
+				// The transmittance median is the first contributing surface at
+				// which foreground transmittance falls to 0.5 or below. Pixels
+				// whose accumulated opacity never reaches 0.5 remain missing (0).
+				if (median_depth == 0.0f && test_T <= 0.5f)
+					median_depth = gaussian_depth;
+				if (weight > max_weight)
+				{
+					max_weight = weight;
+					max_weight_depth = gaussian_depth;
+					max_weight_index = collected_id[j];
+				}
+			}
+
 			T = test_T;
 
 			// Keep track of last range entry to update this
@@ -393,6 +424,16 @@ renderCUDA(
 
 		if (invdepth)
 		invdepth[pix_id] = expected_invdepth;// 1. / (expected_depth + T * 1e3);
+
+		if (WRITE_DIAGNOSTICS)
+		{
+			alpha_normalized_depth[pix_id] = opacity_sum > 1e-8f ? expected_depth_sum / opacity_sum : 0.0f;
+			transmittance_median_depth[pix_id] = median_depth;
+			max_contribution_depth[pix_id] = max_weight_depth;
+			top_contributor_index[pix_id] = max_weight_index;
+			top_contributor_weight[pix_id] = max_weight;
+			accumulated_opacity[pix_id] = opacity_sum;
+		}
 	}
 }
 
@@ -409,21 +450,30 @@ void FORWARD::render(
 	const float* bg_color,
 	float* out_color,
 	float* depths,
-	float* depth)
+	float* depth,
+	float* alpha_normalized_depth,
+	float* transmittance_median_depth,
+	float* max_contribution_depth,
+	int* top_contributor_index,
+	float* top_contributor_weight,
+	float* accumulated_opacity)
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
-		ranges,
-		point_list,
-		W, H,
-		means2D,
-		colors,
-		conic_opacity,
-		final_T,
-		n_contrib,
-		bg_color,
-		out_color,
-		depths, 
-		depth);
+	if (alpha_normalized_depth != nullptr)
+	{
+		renderCUDA<NUM_CHANNELS, true> << <grid, block >> > (
+			ranges, point_list, W, H, means2D, colors, conic_opacity,
+			final_T, n_contrib, bg_color, out_color, depths, depth,
+			alpha_normalized_depth, transmittance_median_depth,
+			max_contribution_depth, top_contributor_index,
+			top_contributor_weight, accumulated_opacity);
+	}
+	else
+	{
+		renderCUDA<NUM_CHANNELS, false> << <grid, block >> > (
+			ranges, point_list, W, H, means2D, colors, conic_opacity,
+			final_T, n_contrib, bg_color, out_color, depths, depth,
+			nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+	}
 }
 
 void FORWARD::preprocess(int P, int D, int M,
