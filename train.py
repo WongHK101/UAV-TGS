@@ -16,6 +16,16 @@ import torch
 from efficiency_probe import TorchStageProbe
 from random import randint
 from utils.loss_utils import l1_loss, ssim
+from utils.temperature_loss import (
+    FORMULA_VERSION as TEMPERATURE_LOSS_FORMULA_VERSION,
+    SCALAR_GRADIENT_TARGET,
+    SPATIAL_GRADIENT_TARGET,
+    TemperatureTargetStore,
+    adjacent_lut_tau,
+    canonical_lut_tensor,
+    load_calibration_manifest,
+    temperature_consistency_losses,
+)
 
 # Optional: pseudo-color thermal structure loss (added for improved thermal texture preservation)
 try:
@@ -281,6 +291,148 @@ def _file_sha256(path, chunk_size=8 * 1024 * 1024):
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _combined_gradient_norm(gradients):
+    finite = [gradient.detach() for gradient in gradients if gradient is not None]
+    if not finite:
+        return 0.0
+    squared = sum(float(gradient.pow(2).sum().item()) for gradient in finite)
+    return squared ** 0.5
+
+
+def _calibrate_temperature_loss(
+    scene,
+    gaussians,
+    pipe,
+    background,
+    dataset,
+    opt,
+    target_store,
+    tau,
+    calibration_views,
+):
+    """One train-only batch calibration of auxiliary SH gradient magnitudes."""
+
+    train_cameras = sorted(scene.getTrainCameras(), key=lambda camera: str(camera.image_name))
+    count = min(int(calibration_views), len(train_cameras))
+    if count <= 0:
+        raise RuntimeError("temperature loss calibration has no train cameras")
+    indices = sorted({min((index * len(train_cameras)) // count, len(train_cameras) - 1) for index in range(count)})
+    cameras = [train_cameras[index] for index in indices]
+    appearance_parameters = (gaussians._features_dc, gaussians._features_rest)
+    image_norms, scalar_norms, gradient_norms = [], [], []
+    loss_records = []
+    for camera in cameras:
+        rendered = render(
+            camera,
+            gaussians,
+            pipe,
+            background,
+            use_trained_exp=dataset.train_test_exp,
+            separate_sh=SPARSE_ADAM_AVAILABLE,
+        )["render"]
+        alpha = None
+        if camera.alpha_mask is not None:
+            alpha = camera.alpha_mask.cuda()
+            rendered = rendered * alpha
+        ground_truth = camera.original_image.cuda()
+        image_l1 = l1_loss(rendered, ground_truth)
+        if FUSED_SSIM_AVAILABLE:
+            image_ssim = fused_ssim(rendered.unsqueeze(0), ground_truth.unsqueeze(0))
+        else:
+            image_ssim = ssim(rendered, ground_truth)
+        image_loss = (1.0 - opt.lambda_dssim) * image_l1 + opt.lambda_dssim * (1.0 - image_ssim)
+        if float(getattr(args, "t_struct_grad_w", 0.0)) > 0.0:
+            if structure_grad_loss is None:
+                raise RuntimeError("temperature calibration requires structure_grad_loss")
+            image_loss = image_loss + float(args.t_struct_grad_w) * structure_grad_loss(
+                rendered,
+                ground_truth,
+                mask=alpha,
+                normalize=bool(getattr(args, "t_struct_grad_norm", True)),
+            )
+        target_u, support = target_store.get(
+            camera.image_name,
+            int(rendered.shape[-2]),
+            int(rendered.shape[-1]),
+            rendered.device,
+        )
+        if alpha is not None:
+            support = support * alpha.to(device=support.device, dtype=support.dtype)
+        auxiliary = temperature_consistency_losses(
+            rendered,
+            target_u,
+            mask=support,
+            tau=tau,
+            chunk_pixels=int(getattr(args, "temperature_lut_chunk_pixels", 16384)),
+        )
+        image_gradients = torch.autograd.grad(
+            image_loss, appearance_parameters, retain_graph=True, allow_unused=True
+        )
+        image_norm = _combined_gradient_norm(image_gradients)
+        del image_gradients
+        scalar_gradients = torch.autograd.grad(
+            auxiliary["scalar"], appearance_parameters, retain_graph=True, allow_unused=True
+        )
+        scalar_norm = _combined_gradient_norm(scalar_gradients)
+        del scalar_gradients
+        spatial_gradients = torch.autograd.grad(
+            auxiliary["gradient"], appearance_parameters, retain_graph=False, allow_unused=True
+        )
+        gradient_norm = _combined_gradient_norm(spatial_gradients)
+        del spatial_gradients
+        values = (image_norm, scalar_norm, gradient_norm)
+        if any(not torch.isfinite(torch.tensor(value)).item() for value in values):
+            raise RuntimeError("temperature calibration produced non-finite gradient norms")
+        image_norms.append(image_norm)
+        scalar_norms.append(scalar_norm)
+        gradient_norms.append(gradient_norm)
+        loss_records.append(
+            {
+                "image_name": str(camera.image_name),
+                "image_loss": float(image_loss.detach().item()),
+                "scalar_loss": float(auxiliary["scalar"].detach().item()),
+                "gradient_loss": float(auxiliary["gradient"].detach().item()),
+                "image_sh_grad_norm": image_norm,
+                "scalar_sh_grad_norm": scalar_norm,
+                "gradient_sh_grad_norm": gradient_norm,
+                "valid_fraction": float(auxiliary["valid_fraction"]),
+            }
+        )
+        del rendered, ground_truth, image_loss, auxiliary, target_u, support
+    mean_image = sum(image_norms) / len(image_norms)
+    mean_scalar = sum(scalar_norms) / len(scalar_norms)
+    mean_gradient = sum(gradient_norms) / len(gradient_norms)
+    if min(mean_image, mean_scalar, mean_gradient) <= 0.0:
+        raise RuntimeError(
+            "temperature calibration requires positive mean SH gradient norms: "
+            f"image={mean_image} scalar={mean_scalar} gradient={mean_gradient}"
+        )
+    return {
+        "schema": "uav-tgs-temperature-loss-calibration-v1",
+        "status": "passed",
+        "formula_version": TEMPERATURE_LOSS_FORMULA_VERSION,
+        "lut_sha256": target_store.metadata()["lut_sha256"],
+        "tau": float(tau),
+        "tau_rule": "median positive adjacent squared distance of normalized fixed LUT",
+        "camera_selection": "evenly_spaced_over_sorted_train_image_names",
+        "camera_names": [str(camera.image_name) for camera in cameras],
+        "train_only": True,
+        "targets": {
+            "scalar_aux_over_image_sh_gradient": SCALAR_GRADIENT_TARGET,
+            "gradient_aux_over_image_sh_gradient": SPATIAL_GRADIENT_TARGET,
+        },
+        "mean_gradient_norms": {
+            "image": mean_image,
+            "scalar_unweighted": mean_scalar,
+            "gradient_unweighted": mean_gradient,
+        },
+        "lambda_temp": SCALAR_GRADIENT_TARGET * mean_image / mean_scalar,
+        "lambda_grad": SPATIAL_GRADIENT_TARGET * mean_image / mean_gradient,
+        "records": loss_records,
+        "temperature_target": target_store.metadata(),
+    }
 
 
 def _normalized_sha256(value, label):
@@ -955,6 +1107,104 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+    temperature_loss_mode = str(getattr(args, "temperature_loss_mode", "none"))
+    temperature_target_store = None
+    temperature_loss_weights = {"lambda_temp": 0.0, "lambda_grad": 0.0}
+    temperature_tau = None
+    temperature_protocol = None
+    if temperature_loss_mode != "none":
+        if not strict_freeze:
+            raise RuntimeError("temperature loss requires strict appearance-only Stage 2")
+        temperature_target_store = TemperatureTargetStore(
+            getattr(args, "temperature_gt_root"),
+            getattr(args, "temperature_range_manifest"),
+            getattr(args, "temperature_support_root", None) or None,
+            max_cache_items=int(getattr(args, "temperature_target_cache_items", 1024)),
+        )
+        temperature_tau = adjacent_lut_tau(
+            canonical_lut_tensor(torch.device("cuda"), torch.float32)
+        )
+        calibration_source = str(
+            getattr(args, "temperature_loss_calibration", "manifest")
+        )
+        if calibration_source == "calibrate":
+            calibration = _calibrate_temperature_loss(
+                scene,
+                gaussians,
+                pipe,
+                background,
+                dataset,
+                opt,
+                temperature_target_store,
+                temperature_tau,
+                int(getattr(args, "temperature_calibration_views", 8)),
+            )
+            calibration_path = (
+                getattr(args, "temperature_loss_calibration_manifest", "")
+                or os.path.join(scene.model_path, "temperature_loss_calibration.json")
+            )
+            os.makedirs(os.path.dirname(os.path.abspath(calibration_path)), exist_ok=True)
+            temporary_path = calibration_path + f".tmp-{os.getpid()}"
+            with open(temporary_path, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump(calibration, handle, indent=2, sort_keys=True, allow_nan=False)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, calibration_path)
+            calibration = {
+                **calibration,
+                "manifest_path": os.path.abspath(calibration_path),
+                "manifest_sha256": _file_sha256(calibration_path),
+            }
+        elif calibration_source == "manifest":
+            calibration_path = getattr(args, "temperature_loss_calibration_manifest", "")
+            if not calibration_path:
+                raise RuntimeError("temperature loss manifest mode requires a calibration manifest")
+            calibration = load_calibration_manifest(calibration_path, temperature_tau)
+        else:
+            raise RuntimeError(f"unsupported temperature calibration source: {calibration_source}")
+        temperature_loss_weights = {
+            "lambda_temp": float(calibration["lambda_temp"]),
+            "lambda_grad": (
+                float(calibration["lambda_grad"])
+                if temperature_loss_mode == "scalar_grad"
+                else 0.0
+            ),
+        }
+        temperature_protocol = {
+            "schema": "uav-tgs-temperature-loss-runtime-v1",
+            "status": "passed",
+            "mode": temperature_loss_mode,
+            "formula_version": TEMPERATURE_LOSS_FORMULA_VERSION,
+            "tau": temperature_tau,
+            "tau_rule": "median positive adjacent squared distance of normalized fixed LUT",
+            "lambda_temp": temperature_loss_weights["lambda_temp"],
+            "lambda_grad": temperature_loss_weights["lambda_grad"],
+            "calibration_source": calibration_source,
+            "calibration_manifest_path": calibration["manifest_path"],
+            "calibration_manifest_sha256": calibration["manifest_sha256"],
+            "calibration_scene_target": calibration.get("temperature_target"),
+            "runtime_scene_target": temperature_target_store.metadata(),
+            "image_loss_preserved": True,
+            "manifold_loss": False,
+            "geometry_opacity_frozen": True,
+        }
+        protocol_path = os.path.join(scene.model_path, "temperature_loss_protocol.json")
+        os.makedirs(scene.model_path, exist_ok=True)
+        temporary_path = protocol_path + f".tmp-{os.getpid()}"
+        with open(temporary_path, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(temperature_protocol, handle, indent=2, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, protocol_path)
+        print(
+            "[INFO] TemperatureConsistencyLoss: "
+            f"mode={temperature_loss_mode} tau={temperature_tau:.9g} "
+            f"lambda_temp={temperature_loss_weights['lambda_temp']:.9g} "
+            f"lambda_grad={temperature_loss_weights['lambda_grad']:.9g}"
+        )
+
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
@@ -1449,8 +1699,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
+        current_alpha_mask = None
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
+            current_alpha_mask = alpha_mask
             image *= alpha_mask
 
         # Loss
@@ -1488,6 +1740,79 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         if not struct_warned:
                             print(f"[WARN] structure_grad_loss failed once; skipping. err={_e}")
                             struct_warned = True
+
+        temperature_result = None
+        if temperature_target_store is not None:
+            target_u, temperature_support = temperature_target_store.get(
+                viewpoint_cam.image_name,
+                int(image.shape[-2]),
+                int(image.shape[-1]),
+                image.device,
+            )
+            if current_alpha_mask is not None:
+                temperature_support = temperature_support * current_alpha_mask.to(
+                    device=temperature_support.device,
+                    dtype=temperature_support.dtype,
+                )
+            temperature_result = temperature_consistency_losses(
+                image,
+                target_u,
+                mask=temperature_support,
+                tau=temperature_tau,
+                chunk_pixels=int(getattr(args, "temperature_lut_chunk_pixels", 16384)),
+            )
+            if not (
+                torch.isfinite(temperature_result["scalar"]).item()
+                and torch.isfinite(temperature_result["gradient"]).item()
+            ):
+                raise RuntimeError(
+                    f"non-finite temperature loss at iteration {iteration}"
+                )
+            loss = (
+                loss
+                + temperature_loss_weights["lambda_temp"]
+                * temperature_result["scalar"]
+                + temperature_loss_weights["lambda_grad"]
+                * temperature_result["gradient"]
+            )
+            if iteration == first_iter or iteration % 1000 == 0:
+                temperature_log_path = os.path.join(
+                    scene.model_path, "temperature_loss_train.jsonl"
+                )
+                _append_jsonl(
+                    temperature_log_path,
+                    {
+                        "schema": "uav-tgs-temperature-loss-training-v1",
+                        "iteration": int(iteration),
+                        "image_name": str(viewpoint_cam.image_name),
+                        "mode": temperature_loss_mode,
+                        "scalar_unweighted": float(
+                            temperature_result["scalar"].detach().item()
+                        ),
+                        "gradient_unweighted": float(
+                            temperature_result["gradient"].detach().item()
+                        ),
+                        "scalar_weighted": float(
+                            (
+                                temperature_loss_weights["lambda_temp"]
+                                * temperature_result["scalar"]
+                            ).detach().item()
+                        ),
+                        "gradient_weighted": float(
+                            (
+                                temperature_loss_weights["lambda_grad"]
+                                * temperature_result["gradient"]
+                            ).detach().item()
+                        ),
+                        "valid_fraction": float(
+                            temperature_result["valid_fraction"]
+                        ),
+                        "finite": bool(
+                            torch.isfinite(temperature_result["scalar"]).item()
+                            and torch.isfinite(temperature_result["gradient"]).item()
+                        ),
+                    },
+                )
 
         # Depth regularization
         Ll1depth_pure = 0.0
@@ -2036,6 +2361,24 @@ if __name__ == "__main__":
     # Improved-4 (optional): pseudo-color thermal structure-gradient loss
     parser.add_argument("--t_struct_grad_w", type=float, default=0.0)
     parser.add_argument("--t_struct_grad_norm", type=_str2bool, default=True)
+    parser.add_argument(
+        "--temperature_loss_mode",
+        choices=["none", "scalar", "scalar_grad"],
+        default="none",
+        help="Optional normalized apparent-temperature auxiliary objective.",
+    )
+    parser.add_argument("--temperature_gt_root", type=str, default="")
+    parser.add_argument("--temperature_support_root", type=str, default="")
+    parser.add_argument("--temperature_range_manifest", type=str, default="")
+    parser.add_argument(
+        "--temperature_loss_calibration",
+        choices=["calibrate", "manifest"],
+        default="manifest",
+    )
+    parser.add_argument("--temperature_loss_calibration_manifest", type=str, default="")
+    parser.add_argument("--temperature_calibration_views", type=int, default=8)
+    parser.add_argument("--temperature_lut_chunk_pixels", type=int, default=16384)
+    parser.add_argument("--temperature_target_cache_items", type=int, default=1024)
 
     cli_args = sys.argv[1:]
     args = parser.parse_args(cli_args)
@@ -2047,6 +2390,26 @@ if __name__ == "__main__":
         parser.error("--thermal_max_sh_degree requires --start_checkpoint")
     if args.thermal_optimizer_state == "fresh" and not args.start_checkpoint:
         parser.error("--thermal_optimizer_state fresh requires --start_checkpoint")
+    if args.temperature_loss_mode == "none":
+        extra_temperature_options = [
+            token.split("=", 1)[0]
+            for token in cli_args
+            if token.startswith("--temperature_")
+            and not token.startswith("--temperature_loss_mode")
+        ]
+        if extra_temperature_options:
+            parser.error("temperature options require --temperature_loss_mode scalar or scalar_grad")
+    else:
+        if args.thermal_recipe != "aaai_strict":
+            parser.error("temperature loss requires --thermal_recipe aaai_strict")
+        if not args.temperature_gt_root or not args.temperature_range_manifest:
+            parser.error("temperature loss requires --temperature_gt_root and --temperature_range_manifest")
+        if args.temperature_loss_calibration == "manifest" and not args.temperature_loss_calibration_manifest:
+            parser.error("temperature manifest calibration requires --temperature_loss_calibration_manifest")
+        if args.temperature_calibration_views <= 0:
+            parser.error("--temperature_calibration_views must be positive")
+        if args.temperature_lut_chunk_pixels <= 0 or args.temperature_target_cache_items <= 0:
+            parser.error("temperature LUT chunk and target cache sizes must be positive")
 
     if (args.baseline_restore_ssp or args.baseline_restore_stt) and (not args.baseline_modules_off):
         parser.error("--baseline_restore_ssp/--baseline_restore_stt require --baseline_modules_off")
@@ -2106,6 +2469,7 @@ if __name__ == "__main__":
             )
         forbidden_prefixes = (
             "--thermal_",
+            "--temperature_",
             "--baseline_",
             "--sgf_disable",
             "--t_struct_grad_",
@@ -2418,6 +2782,13 @@ if __name__ == "__main__":
             "thermal_optimizer_state": str(args.thermal_optimizer_state),
             "thermal_freeze_mode": str(args.thermal_freeze_mode),
             "thermal_scale_clamp": str(args.thermal_scale_clamp),
+            "temperature_loss_mode": str(args.temperature_loss_mode),
+            "temperature_loss_calibration": str(
+                args.temperature_loss_calibration
+            ),
+            "temperature_loss_calibration_manifest": str(
+                args.temperature_loss_calibration_manifest
+            ),
             "optimizer_step_at_final_iteration": bool(
                 args.optimizer_step_at_final_iteration
             ),
