@@ -390,6 +390,80 @@ class VoxelHashNN:
         self._offset_cache_dev = {}
         return self
 
+    def query_topk_torch(self, query_xyz, k: int = 2, max_voxel_radius: int = 2):
+        """Query the ``k`` nearest voxel-centroid distances.
+
+        The query is limited to the same fixed voxel neighborhood as
+        :meth:`query_torch`.  Missing neighbors are returned as ``+inf``.  This
+        makes the local-support fallback explicit for one-shot diagnostics such
+        as SCSP, without introducing a repeated global kNN search.
+
+        Returns
+        -------
+        d : torch.Tensor, shape (Q, k), float32
+            Sorted Euclidean distances to the nearest voxel centroids.
+        """
+        import torch
+        q = self._as_torch_xyz(query_xyz)
+        k = int(k)
+        if k <= 0:
+            raise ValueError(f"k must be positive, got {k}")
+
+        if q.numel() == 0:
+            return torch.empty((0, k), dtype=torch.float32, device=q.device)
+        if q.ndim != 2 or q.shape[-1] != 3:
+            raise ValueError(f"query_xyz must have shape (Q,3), got {tuple(q.shape)}")
+        if self._keys_sorted is None or self._keys_sorted.numel() == 0:
+            return torch.full((q.shape[0], k), float("inf"), dtype=torch.float32, device=q.device)
+
+        if self.device is None or self._keys_sorted.device != q.device:
+            self.to(q.device)
+
+        q = q.to(dtype=torch.float32)
+        q_vox = torch.floor(q / float(self.voxel_size)).to(torch.int64)
+        radius = max(int(max_voxel_radius), 0)
+        offsets = self._get_offsets(radius, q.device)
+        neighbor_count = int(offsets.shape[0])
+
+        neigh_coords = q_vox[:, None, :] + offsets[None, :, :]
+        neigh_keys = self._pack_key(neigh_coords).reshape(-1)
+        keys_sorted = self._keys_sorted
+        support_count = int(keys_sorted.numel())
+        pos = torch.searchsorted(keys_sorted, neigh_keys)
+        pos_clamped = torch.clamp(pos, 0, max(support_count - 1, 0))
+        hit = (pos < support_count) & (keys_sorted[pos_clamped] == neigh_keys)
+        if hit.any():
+            coords_ref = self._coords_sorted[pos_clamped]
+            coords_q = neigh_coords.reshape(-1, 3)
+            hit = hit & (coords_ref == coords_q).all(dim=-1)
+
+        centroids = self._centroids_sorted[pos_clamped]
+        q_repeated = q.repeat_interleave(neighbor_count, dim=0)
+        dist2 = (centroids - q_repeated).pow(2).sum(dim=-1)
+        dist2 = torch.where(hit, dist2, torch.full_like(dist2, float("inf")))
+        requested = min(k, neighbor_count)
+        nearest2 = torch.topk(
+            dist2.view(q.shape[0], neighbor_count),
+            k=requested,
+            dim=1,
+            largest=False,
+            sorted=True,
+        ).values
+        if requested < k:
+            nearest2 = torch.cat(
+                [
+                    nearest2,
+                    torch.full(
+                        (q.shape[0], k - requested),
+                        float("inf"),
+                        dtype=torch.float32,
+                        device=q.device,
+                    ),
+                ],
+                dim=1,
+            )
+        return torch.sqrt(nearest2)
+
     def query_torch(self, query_xyz, max_voxel_radius: int = 2):
         """
         Query nearest centroid distance for each query point.
@@ -400,58 +474,9 @@ class VoxelHashNN:
             Euclidean distance to nearest voxel centroid in neighbor voxels.
             If no neighbor voxel exists, distance is +inf.
         """
-        import torch
-        q = self._as_torch_xyz(query_xyz)
-
-        if q.numel() == 0:
-            return torch.empty((0,), dtype=torch.float32, device=q.device)
-
-        if q.ndim != 2 or q.shape[-1] != 3:
-            raise ValueError(f"query_xyz must have shape (Q,3), got {tuple(q.shape)}")
-
-        if self._keys_sorted is None or self._keys_sorted.numel() == 0:
-            return torch.full((q.shape[0],), float("inf"), dtype=torch.float32, device=q.device)
-
-        # Ensure index on same device as query
-        if self.device is None or self._keys_sorted.device != q.device:
-            # non-blocking move when possible; caller should preferably call .to() once.
-            self.to(q.device)
-
-        q = q.to(dtype=torch.float32)
-        q_vox = torch.floor(q / float(self.voxel_size)).to(torch.int64)
-
-        r = int(max_voxel_radius)
-        if r < 0:
-            r = 0
-        offsets = self._get_offsets(r, q.device)  # (K,3)
-        k = offsets.shape[0]
-
-        # neighbor coords and keys
-        neigh_coords = q_vox[:, None, :] + offsets[None, :, :]          # (Q,K,3)
-        neigh_keys = self._pack_key(neigh_coords).reshape(-1)           # (Q*K,)
-
-        keys_sorted = self._keys_sorted
-        m = keys_sorted.numel()
-
-        # searchsorted
-        pos = torch.searchsorted(keys_sorted, neigh_keys)               # (Q*K,)
-        pos_clamped = torch.clamp(pos, 0, max(m - 1, 0))
-
-        hit = (pos < m) & (keys_sorted[pos_clamped] == neigh_keys)
-        # Extra safety for rare packing collisions: verify coords equality
-        if hit.any():
-            coords_ref = self._coords_sorted[pos_clamped]
-            coords_q = neigh_coords.reshape(-1, 3)
-            hit = hit & (coords_ref == coords_q).all(dim=-1)
-
-        # gather centroids and compute distances
-        cent = self._centroids_sorted[pos_clamped]                      # (Q*K,3)
-        q_rep = q.repeat_interleave(k, dim=0)                            # (Q*K,3)
-        dist2 = (cent - q_rep).pow(2).sum(dim=-1)                        # (Q*K,)
-        dist2 = torch.where(hit, dist2, torch.full_like(dist2, float("inf")))
-
-        d2_min, _ = dist2.view(q.shape[0], k).min(dim=1)
-        return torch.sqrt(d2_min)
+        return self.query_topk_torch(
+            query_xyz, k=1, max_voxel_radius=max_voxel_radius
+        )[:, 0]
 
     def query(self, query_xyz, max_voxel_radius: int = 2, return_index: bool = True):
         """
