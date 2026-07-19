@@ -26,6 +26,9 @@ from tools.thermal_radiometry.palette_lut import (
     temperature_to_rgb,
     rgb_to_temperature,
 )
+from tools.thermal_radiometry.build_formal_evaluation_binding import (
+    build_formal_evaluation_binding,
+)
 from oct_gs.radiance import METHOD_SEMANTICS, TARGET_SEMANTICS
 
 
@@ -649,6 +652,61 @@ class FormalBaselineHotspotEvaluatorTests(unittest.TestCase):
             report["method_name"] = "tampered"
             with self.assertRaisesRegex(ValueError, "self-hash mismatch"):
                 write_atomic_report(fixture.args().output, report)
+
+    def test_generic_radiometry_binding_matches_legacy_oct_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = _Fixture(Path(temporary))
+            legacy = evaluate_formal_baseline_hotspots(fixture.args())
+            binding = build_formal_evaluation_binding(
+                scene_name=fixture.scene,
+                bound_split_path=fixture.bound_split,
+                decode_manifest_path=fixture.decode_manifest,
+                decode_protocol_path=fixture.decode_protocol,
+                range_manifest_path=fixture.range_manifest,
+                canonical_manifest_path=fixture.canonical_manifest,
+                optimization_support_manifest_path=fixture.optimization_support_manifest,
+                evaluation_support_manifest_path=fixture.evaluation_support_manifest,
+                temperature_root=fixture.temperature_root,
+            )
+            binding_path = fixture.root / "formal_radiometry_evaluation_binding.json"
+            _write_json(binding_path, binding)
+            args = fixture.args()
+            args.formal_protocol_manifest = None
+            args.formal_radiometry_binding_manifest = binding_path
+            generic = evaluate_formal_baseline_hotspots(args)
+            self.assertEqual(generic["metrics"], legacy["metrics"])
+            self.assertEqual(generic["per_view"], legacy["per_view"])
+            self.assertEqual(generic["per_block"], legacy["per_block"])
+            self.assertEqual(generic["display_semantics"], legacy["display_semantics"])
+            self.assertEqual(
+                generic["inputs"]["formal_binding_kind"],
+                "generic_radiometry_evaluation",
+            )
+
+    def test_generic_radiometry_binding_self_hash_tamper_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = _Fixture(Path(temporary))
+            protocol = json.loads(fixture.formal_protocol_manifest.read_text())
+            core = dict(protocol["formal_binding"])
+            core["schema"] = "uav-tgs-formal-radiometry-evaluation-core-v1"
+            core.pop("formal_protocol_sha256")
+            core["formal_protocol_sha256"] = sha256_json(core)
+            binding = {
+                "schema": "uav-tgs-formal-radiometry-evaluation-binding-v1",
+                "schema_version": 1,
+                "status": "complete",
+                "purpose": "method-independent formal radiometry evaluation only",
+                "formal_binding": core,
+            }
+            binding["binding_manifest_sha256"] = sha256_json(binding)
+            binding["purpose"] = "tampered"
+            binding_path = fixture.root / "tampered_binding.json"
+            _write_json(binding_path, binding)
+            args = fixture.args()
+            args.formal_protocol_manifest = None
+            args.formal_radiometry_binding_manifest = binding_path
+            with self.assertRaisesRegex(ValueError, "manifest hash mismatch"):
+                evaluate_formal_baseline_hotspots(args)
 
 
 if __name__ == "__main__":

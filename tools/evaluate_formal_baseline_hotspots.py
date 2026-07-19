@@ -6,7 +6,8 @@ renders.  It validates the complete radiometry chain before opening any test
 artifact, then compares nearest-fixed-LUT (8-bit display-equivalent)
 temperatures with direct float32 TSDK targets on the formal evaluation support.
 The hotspot threshold is accepted only from the immutable train-only q95/65536
-receipt produced by ``tools/oct_gs_formal.py freeze-hotspot-threshold``.
+receipt produced by ``tools/thermal_radiometry/freeze_train_hotspot_threshold.py``
+or the schema-identical legacy OCT command.
 """
 
 from __future__ import annotations
@@ -42,6 +43,8 @@ from tools.thermal_radiometry.palette_lut import (
 
 
 REPORT_SCHEMA = "uav-tgs-formal-baseline-hotspot-evaluation-v1"
+GENERIC_BINDING_SCHEMA = "uav-tgs-formal-radiometry-evaluation-binding-v1"
+GENERIC_BINDING_CORE_SCHEMA = "uav-tgs-formal-radiometry-evaluation-core-v1"
 THRESHOLD_SCHEMA = "uav-tgs-oct-train-only-hotspot-threshold-v1"
 CANONICAL_SCHEMA = "uav-tgs-canonical-hot-iron-v1"
 OPTIMIZATION_SUPPORT_SCHEMA = "uav-tgs-undistorted-temperature-v1"
@@ -57,6 +60,59 @@ EVALUATION_SUPPORT_POLICY = {
     "opacity_proxy_semantics": "black_bg_plus_white_override_color_render",
     "threshold_applied_only_by_this_combiner": True,
 }
+
+
+def _load_formal_evaluation_binding(
+    *,
+    oct_protocol_path: Path | None,
+    generic_binding_path: Path | None,
+) -> tuple[dict[str, Any], Path, str]:
+    """Load either the legacy OCT protocol or an evaluation-only binding.
+
+    The OCT loader remains authoritative for legacy manifests.  The generic
+    receipt carries only the radiometry/evaluation subset consumed by this
+    evaluator and deliberately has no OCT field, optimizer, or checkpoint
+    semantics.
+    """
+
+    supplied = [path for path in (oct_protocol_path, generic_binding_path) if path is not None]
+    if len(supplied) != 1:
+        raise ValueError(
+            "exactly one formal binding is required: --formal-protocol-manifest "
+            "or --formal-radiometry-binding-manifest"
+        )
+    if oct_protocol_path is not None:
+        path = Path(oct_protocol_path).resolve()
+        return load_oct_protocol_manifest(path), path, "oct_formal_protocol"
+
+    path = Path(generic_binding_path).resolve()  # type: ignore[arg-type]
+    payload = _load_json(path, "formal radiometry evaluation binding")
+    if (
+        payload.get("schema") != GENERIC_BINDING_SCHEMA
+        or payload.get("schema_version") != 1
+        or payload.get("status") != "complete"
+    ):
+        raise ValueError("formal radiometry evaluation binding schema/status mismatch")
+    supplied_hash = payload.get("binding_manifest_sha256")
+    basis = dict(payload)
+    basis.pop("binding_manifest_sha256", None)
+    if supplied_hash != sha256_json(basis):
+        raise ValueError("formal radiometry evaluation binding manifest hash mismatch")
+    formal = payload.get("formal_binding")
+    if not isinstance(formal, Mapping) or formal.get("schema") != GENERIC_BINDING_CORE_SCHEMA:
+        raise ValueError("formal radiometry evaluation binding lacks its immutable core")
+    formal_hash = formal.get("formal_protocol_sha256")
+    formal_basis = dict(formal)
+    formal_basis.pop("formal_protocol_sha256", None)
+    if formal_hash != sha256_json(formal_basis):
+        raise ValueError("embedded formal radiometry evaluation binding hash mismatch")
+    loaded = dict(payload)
+    # Expose the same two keys used below for legacy OCT manifests.  This is an
+    # in-memory compatibility view; the on-disk generic receipt remains explicit.
+    loaded["manifest_sha256"] = supplied_hash
+    loaded["manifest_path"] = str(path)
+    loaded["manifest_file_sha256"] = sha256_file(path)
+    return loaded, path, "generic_radiometry_evaluation"
 
 
 def _load_json(path: Path, label: str) -> dict[str, Any]:
@@ -373,8 +429,18 @@ class _FormalInputs:
 def _validate_formal_inputs(args: argparse.Namespace) -> _FormalInputs:
     """Validate every train-only/radiometry gate before test data is opened."""
 
+    oct_path_value = getattr(args, "formal_protocol_manifest", None)
+    generic_path_value = getattr(args, "formal_radiometry_binding_manifest", None)
+    oct_path = None if oct_path_value is None else Path(oct_path_value).resolve()
+    generic_path = None if generic_path_value is None else Path(generic_path_value).resolve()
+    binding_manifest, binding_path, binding_kind = _load_formal_evaluation_binding(
+        oct_protocol_path=oct_path,
+        generic_binding_path=generic_path,
+    )
     paths = {
-        "formal_protocol_manifest": Path(args.formal_protocol_manifest).resolve(),
+        # Preserve the established provenance key/report schema for both
+        # binding kinds; binding_kind below disambiguates its semantics.
+        "formal_protocol_manifest": binding_path,
         "bound_split": Path(args.bound_split).resolve(),
         "decode_manifest": Path(args.decode_manifest).resolve(),
         "decode_protocol": Path(args.decode_protocol).resolve(),
@@ -387,10 +453,9 @@ def _validate_formal_inputs(args: argparse.Namespace) -> _FormalInputs:
         if not path.is_file():
             raise FileNotFoundError(f"missing {label}: {path}")
 
-    oct_protocol = load_oct_protocol_manifest(paths["formal_protocol_manifest"])
-    formal_binding = oct_protocol.get("formal_binding")
+    formal_binding = binding_manifest.get("formal_binding")
     if not isinstance(formal_binding, Mapping):
-        raise ValueError("formal OCT protocol lacks its immutable binding")
+        raise ValueError("formal evaluation manifest lacks its immutable binding")
 
     split = _load_json(paths["bound_split"], "bound split")
     split_records_raw = split.get("records")
@@ -750,9 +815,10 @@ def _validate_formal_inputs(args: argparse.Namespace) -> _FormalInputs:
             "range_hash": range_hash,
             "hotspot_source_receipt": source_receipt,
             "threshold_sha256": supplied_threshold_hash,
-            "formal_protocol_manifest_sha256": oct_protocol["manifest_sha256"],
+            "formal_protocol_manifest_sha256": binding_manifest["manifest_sha256"],
             "formal_protocol_sha256": formal_binding["formal_protocol_sha256"],
             "pair_parameter_index_sha256": pair_parameter_index_sha,
+            "formal_binding_kind": binding_kind,
         }
     )
     return _FormalInputs(
@@ -1343,7 +1409,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--method-name", required=True)
     parser.add_argument("--scene-name", required=True)
-    parser.add_argument("--formal-protocol-manifest", required=True, type=Path)
+    binding = parser.add_mutually_exclusive_group(required=True)
+    binding.add_argument(
+        "--formal-protocol-manifest",
+        type=Path,
+        help="Legacy immutable OCT formal protocol manifest",
+    )
+    binding.add_argument(
+        "--formal-radiometry-binding-manifest",
+        type=Path,
+        help="Method-independent formal radiometry evaluation binding receipt",
+    )
     parser.add_argument("--bound-split", required=True, type=Path)
     parser.add_argument("--decode-manifest", required=True, type=Path)
     parser.add_argument("--decode-protocol", required=True, type=Path)
