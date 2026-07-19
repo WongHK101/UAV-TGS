@@ -1,0 +1,144 @@
+{
+  "protocol_id": "uav-tgs-aaai27-hold8-v2",
+  "protocol_version": 2,
+  "creation_timestamp": "2026-07-20T04:48:01+08:00",
+  "status": "WAITING_GPT_PHASE0_V2",
+  "code_commit": "693b7fcc68de01227cb7cb8f602fac55998c8169",
+  "protocol_markdown": "protocols/aaai27_hold8_v2.md",
+  "protocol_markdown_sha256": "5be87ca00d363579720d4c720e5968c6b0aa986ce453c1cfae3d8665be762fc2",
+  "supersedes": {
+    "formal_table_protocol": "aaai27_final_experiment_protocol_v1",
+    "guard4_status": "exploratory_internal_ablation_only",
+    "guard4_status_file": "protocols/aaai27_guard4_v1_status.json"
+  },
+  "collection": {
+    "source_manifest_sha256": "be956f0f6d8d67a01d3529059521634985fdb80c275e80636e6eb2f189b04581",
+    "collection_hash": "4ad9cb62bcb3cc5102ba69a2de75cd7eda87641dbbb26fa4e8fd899ad1bc3fa2",
+    "collection_split_hash": "62c9bb66f48f89db37c41b02b7007456498168329e0c69d345d33a25bc00a64c",
+    "collection_manifest_sha256": "fd9603c04fb5ab92f4ee162a9d154e38f2b7481910980003fdf98aa59b46e2ef",
+    "split_generator_commit": "693b7fcc68de01227cb7cb8f602fac55998c8169",
+    "split_generator_source_sha256": "86dbdbffb16135fe37110da50488101e94a09b05f273b7e97968f83d13a3fbcd",
+    "counts": {
+      "total": 8232,
+      "train": 7198,
+      "test": 1034
+    },
+    "scene_counts": {
+      "Building": {"total": 614, "train": 537, "test": 77},
+      "Garden": {"total": 656, "train": 574, "test": 82},
+      "InternalRoad": {"total": 559, "train": 489, "test": 70},
+      "Orchard": {"total": 588, "train": 514, "test": 74},
+      "PVpanel": {"total": 289, "train": 252, "test": 37},
+      "Plaza": {"total": 668, "train": 584, "test": 84},
+      "Road": {"total": 467, "train": 408, "test": 59},
+      "TransmissionTower": {"total": 673, "train": 588, "test": 85},
+      "Urban100K": {"total": 1671, "train": 1462, "test": 209},
+      "Urban20K": {"total": 748, "train": 654, "test": 94},
+      "Urban50K": {"total": 1299, "train": 1136, "test": 163}
+    },
+    "rule": {
+      "ordering": "numeric-aware natural sort of canonical RGB-T pair_id",
+      "index_base": 0,
+      "test_condition": "index % 8 == 0",
+      "train_condition": "index % 8 != 0",
+      "guard": false,
+      "validation": false
+    }
+  },
+  "representative_scenes": [
+    "Building",
+    "InternalRoad",
+    "PVpanel",
+    "TransmissionTower",
+    "Urban20K",
+    "Orchard"
+  ],
+  "internal_methods": [
+    "Raw-F3",
+    "SCSP-Refit+strict-F3",
+    "Adaptive-Opacity+Scale-Clamp"
+  ],
+  "external_methods": [
+    "Thermal3D-GS",
+    "ThermalGaussian-OMMG",
+    "MMOne",
+    "ThermoNeRF",
+    "PhysIR-Splat"
+  ],
+  "asset_policy": {
+    "reusable_after_hash_verification": [
+      "CFR observations",
+      "full-frame TSDK float32 Celsius NPY",
+      "fixed repository Hot-Iron LUT",
+      "split-independent valid masks",
+      "shared full-collection SfM cameras/sparse model"
+    ],
+    "must_rebuild_from_hold8_train_membership": [
+      "train-only Tmin/Tmax",
+      "canonical Hot-Iron observations and manifest",
+      "train-only hotspot threshold",
+      "train-only OpenMVS reference",
+      "RGB 30k anchor",
+      "SCSP projection/refit",
+      "all formal Stage-2 endpoints"
+    ],
+    "pose_policy": "pose reconstruction is common preprocessing; photometric fitting reads Hold-8 train images only"
+  },
+  "formal_metrics": {
+    "appearance": ["RGB PSNR", "RGB SSIM", "RGB LPIPS", "T PSNR", "T SSIM", "T LPIPS"],
+    "temperature": ["MAE Celsius", "RMSE Celsius"],
+    "hotspot": ["AUPRC"],
+    "geometry_depth": "alpha/volume-weighted expected camera-z depth",
+    "geometry_main_thresholds_m": [1, 2, 5],
+    "geometry_supplemental_thresholds_m": [0.25, 0.5, 1, 2, 5, 10, 15, 20],
+    "geometry_main": ["front", "agreement", "median absolute depth error", "missing rate"],
+    "efficiency": ["method-specific training time", "peak VRAM", "model size or Gaussian count", "render FPS"]
+  },
+  "minimal_provenance": {
+    "training_and_evaluation_signatures": "one flat non-recursive scoped signature each",
+    "whole_repository_commit_is_informational": true,
+    "endpoint_reuse_requires_scoped_match": true,
+    "alias_cost_rule": "batch execution may be zero; reported method cost inherits Raw-F3",
+    "aggregation": "metric-specific common-scene macro with failed/unsupported values never imputed"
+  },
+  "host_policy": {
+    "authoritative_archive": "900",
+    "temporary_compute": "901",
+    "default_phase1_assignment": {
+      "900": ["Building", "InternalRoad", "Urban20K"],
+      "901": ["PVpanel", "TransmissionTower", "Orchard"]
+    },
+    "assignment_is_scheduler_default_not_protocol_identity": true,
+    "901_results_must_be_hash_verified_on_900": true
+  },
+  "mandatory_review_gates": [
+    "Phase 0-v2 protocol/evaluator/assets",
+    "Phase 1 six-scene internal matrix",
+    "Phase 2 main-method 11-scene coverage",
+    "Thermal3D-GS Building formal qualification",
+    "ThermalGaussian-OMMG Building formal qualification",
+    "MMOne Building formal qualification",
+    "ThermoNeRF Building formal qualification",
+    "PhysIR-Splat Building formal qualification",
+    "Phase 8 final audit"
+  ],
+  "execution_phases": [
+    {"phase": "0-v2", "scope": "protocol, manifests, evaluator, receipts, assets, host preflight", "status": "WAITING_GPT"},
+    {"phase": 1, "scope": "six representative scenes x three internal endpoints", "status": "NOT_AUTHORIZED"},
+    {"phase": 2, "scope": "SCSP-Refit+strict-F3 on all 11 scenes", "status": "NOT_AUTHORIZED"},
+    {"phase": 3, "scope": "Thermal3D-GS Building qualification then remaining five scenes", "status": "NOT_AUTHORIZED"},
+    {"phase": 4, "scope": "ThermalGaussian-OMMG Building qualification then remaining five scenes", "status": "NOT_AUTHORIZED"},
+    {"phase": 5, "scope": "MMOne Building qualification then remaining five scenes", "status": "NOT_AUTHORIZED"},
+    {"phase": 6, "scope": "ThermoNeRF Building qualification then remaining five scenes", "status": "NOT_AUTHORIZED"},
+    {"phase": 7, "scope": "PhysIR-Splat Building qualification then remaining five scenes", "status": "NOT_AUTHORIZED"},
+    {"phase": 8, "scope": "paired macros, coverage/failure, efficiency, archive audit", "status": "NOT_AUTHORIZED"}
+  ],
+  "prohibited_tasks": [
+    "formal RGB 30k training before Phase 0-v2 approval",
+    "formal thermal 30k training before Phase 0-v2 approval",
+    "external-method training before its approved phase and Building gate",
+    "test-set model, recipe, checkpoint, threshold, seed, or fallback selection",
+    "mixing guard4 exploratory results into Hold-8 formal tables",
+    "claiming spatial isolation or out-of-region generalization"
+  ]
+}

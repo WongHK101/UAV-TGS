@@ -2,8 +2,10 @@
 
 Protocol ID: `uav-tgs-aaai27-hold8-v2`
 
-Status: `PHASE0_IMPLEMENTATION`; formal training is not authorized until the
-Phase 0-v2 GPT review gate is approved.
+Status: `WAITING_GPT_PHASE0_V2`; Phase 0-v2 is complete, but formal training
+is not authorized until the GPT review gate is approved. This protocol
+supersedes the formal-table role of `aaai27_final_experiment_protocol_v1`;
+the earlier guard4 evidence remains archived under the boundary below.
 
 ## 1. Evidence boundary and archived guard4 work
 
