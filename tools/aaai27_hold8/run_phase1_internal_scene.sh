@@ -253,7 +253,7 @@ prepare_thermal() {
   run_rgb
   if [[ -f "$DERIVED/THERMAL_STATUS" ]]; then test "$(tr -d '\r\n' < "$DERIVED/THERMAL_STATUS")" = passed; return; fi
   for path in "$TEMP_UD" "$THERMAL" "$FORMAL_SUPPORT" "$HOTSPOT"; do test ! -e "$path"; done
-  mkdir -p "$DERIVED/radiometry" "$THERMAL/sparse/0" "$EXP/protocol" "$LOG_ROOT"
+  mkdir -p "$DERIVED/radiometry" "$THERMAL" "$EXP/protocol" "$LOG_ROOT"
   local train_sha test_sha anchor_native sparse_bin
   train_sha="$(sha "$THERMAL_TRAIN_LIST")"; test_sha="$(sha "$THERMAL_TEST_LIST")"
   anchor_native="$DERIVED/support_anchor_native"; sparse_bin="$DERIVED/thermal_sparse_source"
