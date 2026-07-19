@@ -39,6 +39,11 @@ fi
 
 DERIVED="$ROOT/derived/aaai27_hold8_v2/$SCENE"
 WORK="$DERIVED/workspace"
+RUNTIME_LISTS="$DERIVED/runtime_lists"
+RGB_TRAIN_LIST="$RUNTIME_LISTS/train_list.txt"
+RGB_TEST_LIST="$RUNTIME_LISTS/test_list.txt"
+THERMAL_TRAIN_LIST="$RUNTIME_LISTS/thermal_train_list.txt"
+THERMAL_TEST_LIST="$RUNTIME_LISTS/thermal_test_list.txt"
 RANGE="$DERIVED/radiometry/range_manifest.json"
 TEMP_UD="$DERIVED/thermal_undistorted"
 THERMAL="$DERIVED/thermal_benchmark"
@@ -95,10 +100,113 @@ verify_binding() {
   test "$(find "$TEMP_SOURCE" -maxdepth 1 -type f -name '*.npy' | wc -l)" -eq "$TOTAL"
 }
 
+materialize_runtime_inputs() {
+  mkdir -p "$RUNTIME_LISTS" "$WORK/images"
+  "$PY" - "$CODE" "$WORK/sparse/0/images.bin" "$CFR/rgb" \
+    "$BIND/train_list.txt" "$BIND/test_list.txt" "$WORK/images" \
+    "$RGB_TRAIN_LIST" "$RGB_TEST_LIST" "$THERMAL_TRAIN_LIST" "$THERMAL_TEST_LIST" \
+    "$RUNTIME_LISTS/manifest.json" "$SCENE" <<'PY'
+import hashlib, json, os, sys
+from pathlib import Path
+
+(code, images_bin, source_root, train_in, test_in, images_out,
+ train_out, test_out, thermal_train_out, thermal_test_out, manifest_out, scene) = sys.argv[1:]
+sys.path.insert(0, code)
+from scene.colmap_loader import read_extrinsics_binary
+
+def stem(value):
+    return Path(str(value).replace("\\", "/")).stem.casefold()
+
+def read_list(path):
+    return [line.strip() for line in Path(path).read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+cameras = read_extrinsics_binary(images_bin)
+actual = {}
+for item in cameras.values():
+    key = stem(item.name)
+    if key in actual:
+        raise RuntimeError(f"duplicate COLMAP camera stem: {key}")
+    actual[key] = item.name
+
+sources = {}
+for item in Path(source_root).iterdir():
+    if not item.is_file():
+        continue
+    key = stem(item.name)
+    if key in sources:
+        raise RuntimeError(f"duplicate CFR image stem: {key}")
+    sources[key] = item.resolve()
+if set(actual) != set(sources):
+    raise RuntimeError(
+        f"COLMAP/CFR stem mismatch: missing={sorted(set(actual)-set(sources))[:8]} "
+        f"extra={sorted(set(sources)-set(actual))[:8]}"
+    )
+
+def map_list(path):
+    values = read_list(path)
+    keys = [stem(value) for value in values]
+    if len(keys) != len(set(keys)):
+        raise RuntimeError(f"duplicate split member in {path}")
+    missing = [key for key in keys if key not in actual]
+    if missing:
+        raise RuntimeError(f"split/COLMAP mismatch in {path}: {missing[:8]}")
+    return [actual[key] for key in keys]
+
+train = map_list(train_in)
+test = map_list(test_in)
+if set(map(stem, train)) & set(map(stem, test)):
+    raise RuntimeError("runtime train/test overlap")
+if len(train) + len(test) != len(actual):
+    raise RuntimeError("runtime train/test lists do not cover the camera collection")
+
+image_dir = Path(images_out)
+for item in image_dir.iterdir():
+    if not item.is_symlink():
+        raise RuntimeError(f"refusing to replace non-symlink runtime image: {item}")
+    item.unlink()
+for name in actual.values():
+    os.symlink(sources[stem(name)], image_dir / name)
+
+def atomic_lines(path, values):
+    target = Path(path); target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + f".tmp-{os.getpid()}")
+    temporary.write_text("".join(f"{value}\n" for value in values), encoding="utf-8")
+    os.replace(temporary, target)
+
+atomic_lines(train_out, train)
+atomic_lines(test_out, test)
+atomic_lines(thermal_train_out, [str(Path(value).with_suffix(".png")) for value in train])
+atomic_lines(thermal_test_out, [str(Path(value).with_suffix(".png")) for value in test])
+payload = {
+    "schema": "uav-tgs-hold8-runtime-camera-binding-v1",
+    "scene": scene,
+    "mapping_rule": "case-insensitive pair stem to exact shared-COLMAP camera name",
+    "membership_changed": False,
+    "counts": {"total": len(actual), "train": len(train), "test": len(test)},
+    "inputs": {"train_list_sha256": sha(train_in), "test_list_sha256": sha(test_in)},
+    "outputs": {
+        "train_list_sha256": sha(train_out), "test_list_sha256": sha(test_out),
+        "thermal_train_list_sha256": sha(thermal_train_out),
+        "thermal_test_list_sha256": sha(thermal_test_out),
+    },
+}
+target = Path(manifest_out); temporary = target.with_name(target.name + f".tmp-{os.getpid()}")
+temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+os.replace(temporary, target)
+PY
+  test "$(find "$WORK/images" -maxdepth 1 -type l | wc -l)" -eq "$TOTAL"
+  test "$(wc -l < "$RGB_TRAIN_LIST")" -eq "$TRAIN"
+  test "$(wc -l < "$RGB_TEST_LIST")" -eq "$TEST"
+}
+
 prepare_scene() {
   verify_binding
   if [[ -f "$DERIVED/PREPARE_STATUS" ]]; then
     test "$(tr -d '\r\n' < "$DERIVED/PREPARE_STATUS")" = passed
+    materialize_runtime_inputs
     return
   fi
   test ! -e "$WORK" -a ! -e "$RANGE"
@@ -107,11 +215,11 @@ prepare_scene() {
     --split-manifest "$BIND/bound_split.json" --npy-root "$DECODE/temperature_c" --output "$RANGE"
   cp -a "$SOURCE_CANON/workspace/sparse/0/." "$WORK/sparse/0/"
   cp -a "$SOURCE_CANON/workspace/distorted/sparse_aligned/." "$WORK/distorted/sparse_aligned/"
-  for image in "$CFR"/rgb/*; do ln -s "$image" "$WORK/images/$(basename "$image")"; done
-  test "$(find "$WORK/images" -maxdepth 1 -type l | wc -l)" -eq "$TOTAL"
+  materialize_runtime_inputs
   write_json_receipt "$EXP/protocol/prepare.json" prepare passed \
     "binding=$BIND/binding_manifest.json" "split=$BIND/bound_split.json" "range=$RANGE" \
-    "cameras=$WORK/sparse/0/cameras.bin" "images=$WORK/sparse/0/images.bin"
+    "cameras=$WORK/sparse/0/cameras.bin" "images=$WORK/sparse/0/images.bin" \
+    "runtime_lists=$RUNTIME_LISTS/manifest.json"
   printf 'passed\n' > "$DERIVED/PREPARE_STATUS"
 }
 
@@ -123,7 +231,7 @@ run_rgb() {
   cd "$CODE"
   "$PY" run_uavfgs_pipeline.py \
     --data_root "$WORK" --out_root "$RGB_ROOT" --rgb_dir "$CFR/rgb" --th_dir "$CFR/thermal" \
-    --train_list "$BIND/train_list.txt" --test_list "$BIND/test_list.txt" \
+    --train_list "$RGB_TRAIN_LIST" --test_list "$RGB_TEST_LIST" \
     --from_step 5 --to_step 7 --align fit --no_comparison --rgb_iter 30000 --rgb_res 4 \
     --rgb_densify_from 1500 --rgb_densify_until 10000 --rgb_densify_interval 300 \
     --rgb_densify_grad 0.001 --rgb_lambda_dssim 0.3 \
@@ -136,7 +244,7 @@ run_rgb() {
     2>&1 | tee "$LOG_ROOT/rgb_anchor.log"
   test -f "$RGB_CKPT" -a -f "$RGB_PLY" -a -f "$RGB_MODEL/results.json" -a -f "$RGB_MODEL/per_view.json"
   write_json_receipt "$RGB_ROOT/completion.json" rgb_anchor passed \
-    "checkpoint=$RGB_CKPT" "ply=$RGB_PLY" "train_list=$BIND/train_list.txt" "test_list=$BIND/test_list.txt" \
+    "checkpoint=$RGB_CKPT" "ply=$RGB_PLY" "train_list=$RGB_TRAIN_LIST" "test_list=$RGB_TEST_LIST" \
     "results=$RGB_MODEL/results.json" "per_view=$RGB_MODEL/per_view.json"
   printf 'passed\n' > "$RGB_ROOT/STATUS"
 }
@@ -147,7 +255,7 @@ prepare_thermal() {
   for path in "$TEMP_UD" "$THERMAL" "$FORMAL_SUPPORT" "$HOTSPOT"; do test ! -e "$path"; done
   mkdir -p "$DERIVED/radiometry" "$THERMAL/sparse/0" "$EXP/protocol" "$LOG_ROOT"
   local train_sha test_sha anchor_native sparse_bin
-  train_sha="$(sha "$BIND/thermal_train_list.txt")"; test_sha="$(sha "$BIND/thermal_test_list.txt")"
+  train_sha="$(sha "$THERMAL_TRAIN_LIST")"; test_sha="$(sha "$THERMAL_TEST_LIST")"
   anchor_native="$DERIVED/support_anchor_native"; sparse_bin="$DERIVED/thermal_sparse_source"
   cd "$CODE"
   "$PY" tools/thermal_radiometry/undistort_temperature.py \
@@ -173,7 +281,7 @@ prepare_thermal() {
   mkdir -p "$anchor_native/point_cloud"; cp -al "$RGB_MODEL/point_cloud/iteration_30000" "$anchor_native/point_cloud/"
   cp -a "$RGB_MODEL/cfg_args" "$anchor_native/cfg_args"; cp -a "$RGB_MODEL/cameras.json" "$anchor_native/cameras.json"
   "$PY" render.py -s "$THERMAL" --images images -m "$anchor_native" -r 1 --eval \
-    --train_list "$BIND/thermal_train_list.txt" --test_list "$BIND/thermal_test_list.txt" \
+    --train_list "$THERMAL_TRAIN_LIST" --test_list "$THERMAL_TEST_LIST" \
     --train_list_sha256 "$train_sha" --test_list_sha256 "$test_sha" --iteration 30000 \
     --skip_train --save_by_image_name --save_opacity_proxy 2>&1 | tee "$LOG_ROOT/support_render.log"
   "$PY" tools/thermal_radiometry/combine_formal_support.py \
@@ -192,10 +300,10 @@ prepare_thermal() {
 render_thermal() {
   local model="$1" iteration="$2" out="$3"
   local train_sha test_sha
-  train_sha="$(sha "$BIND/thermal_train_list.txt")"; test_sha="$(sha "$BIND/thermal_test_list.txt")"
+  train_sha="$(sha "$THERMAL_TRAIN_LIST")"; test_sha="$(sha "$THERMAL_TEST_LIST")"
   cd "$CODE"
   "$PY" render.py -s "$THERMAL" --images images -m "$model" -r 4 --eval \
-    --train_list "$BIND/thermal_train_list.txt" --test_list "$BIND/thermal_test_list.txt" \
+    --train_list "$THERMAL_TRAIN_LIST" --test_list "$THERMAL_TEST_LIST" \
     --train_list_sha256 "$train_sha" --test_list_sha256 "$test_sha" --iteration "$iteration" \
     --skip_train --save_by_image_name --benchmark_efficiency --benchmark_warmup_views 10 \
     --benchmark_repeats 3 --benchmark_output "$out/render_efficiency.json"
@@ -207,7 +315,7 @@ run_raw_or_adaptive() {
   method_root="$EXP/methods/$method"; model="$method_root/model"; iteration=60000
   if [[ -f "$method_root/STATUS" ]]; then test "$(tr -d '\r\n' < "$method_root/STATUS")" = passed; return; fi
   test ! -e "$method_root"; mkdir -p "$method_root/logs" "$method_root/efficiency" "$method_root/protocol"
-  local train_sha test_sha; train_sha="$(sha "$BIND/thermal_train_list.txt")"; test_sha="$(sha "$BIND/thermal_test_list.txt")"
+  local train_sha test_sha; train_sha="$(sha "$THERMAL_TRAIN_LIST")"; test_sha="$(sha "$THERMAL_TEST_LIST")"
   local extra=()
   if [[ "$method" == raw_f3 ]]; then
     recipe=raw_f3_strict_sh3_v1
@@ -218,7 +326,7 @@ run_raw_or_adaptive() {
   fi
   cd "$CODE"
   "$PY" train.py -s "$THERMAL" --images images -r 4 -m "$model" \
-    --train_list "$BIND/thermal_train_list.txt" --test_list "$BIND/thermal_test_list.txt" \
+    --train_list "$THERMAL_TRAIN_LIST" --test_list "$THERMAL_TEST_LIST" \
     --train_list_sha256 "$train_sha" --test_list_sha256 "$test_sha" --start_checkpoint "$RGB_CKPT" \
     --iterations "$iteration" --checkpoint_iterations "$iteration" --save_iterations "$iteration" --test_iterations "$iteration" \
     --position_lr_init 0 --position_lr_final 0 --scaling_lr 0 --rotation_lr 0 --feature_lr 0.001 \
@@ -260,12 +368,12 @@ run_scsp() {
   fi
   local refit="$method_root/rgb_refit" sequence="$method_root/protocol/camera_sequence.json"
   local train_sha test_sha anchor_ckpt anchor_ply
-  train_sha="$(sha "$BIND/train_list.txt")"; test_sha="$(sha "$BIND/test_list.txt")"
+  train_sha="$(sha "$RGB_TRAIN_LIST")"; test_sha="$(sha "$RGB_TEST_LIST")"
   anchor_ckpt="$anchor/chkpnt30000.pth"; anchor_ply="$anchor/point_cloud/iteration_30000/point_cloud.ply"
-  "$PY" tools/build_fixed_camera_sequence.py --camera-names "$BIND/train_list.txt" --output "$sequence" \
+  "$PY" tools/build_fixed_camera_sequence.py --camera-names "$RGB_TRAIN_LIST" --output "$sequence" \
     --seed 0 --steps 5000 --scene "$SCENE" --split-sha256 "$train_sha" --anchor-sha256 "$(sha "$anchor_ckpt")"
   "$PY" train.py -s "$WORK" --images images -r 4 --eval -m "$refit" \
-    --train_list "$BIND/train_list.txt" --test_list "$BIND/test_list.txt" --train_list_sha256 "$train_sha" --test_list_sha256 "$test_sha" \
+    --train_list "$RGB_TRAIN_LIST" --test_list "$RGB_TEST_LIST" --train_list_sha256 "$train_sha" --test_list_sha256 "$test_sha" \
     --start_checkpoint "$anchor_ckpt" --iterations 35000 --save_iterations 35000 --checkpoint_iterations 35000 --test_iterations 35000 \
     --position_lr_max_steps 30000 --rgb_continuation_anchor_iteration 30000 --rgb_continuation_scheduler_horizon 30000 \
     --rgb_continuation_updates 5000 --rgb_continuation_recipe appearance_only --rgb_optimizer_state fresh \
@@ -273,9 +381,9 @@ run_scsp() {
     --benchmark_efficiency --efficiency_output "$method_root/efficiency/rgb_refit.json" --efficiency_stage rgb_sh_only_refit \
     2>&1 | tee "$method_root/logs/rgb_refit.log"
   local model="$method_root/model" refit_ckpt="$refit/chkpnt35000.pth" refit_ply="$refit/point_cloud/iteration_35000/point_cloud.ply"
-  local ttrain ttest; ttrain="$(sha "$BIND/thermal_train_list.txt")"; ttest="$(sha "$BIND/thermal_test_list.txt")"
+  local ttrain ttest; ttrain="$(sha "$THERMAL_TRAIN_LIST")"; ttest="$(sha "$THERMAL_TEST_LIST")"
   "$PY" train.py -s "$THERMAL" --images images -r 4 -m "$model" \
-    --train_list "$BIND/thermal_train_list.txt" --test_list "$BIND/thermal_test_list.txt" --train_list_sha256 "$ttrain" --test_list_sha256 "$ttest" \
+    --train_list "$THERMAL_TRAIN_LIST" --test_list "$THERMAL_TEST_LIST" --train_list_sha256 "$ttrain" --test_list_sha256 "$ttest" \
     --start_checkpoint "$refit_ckpt" --iterations 65000 --checkpoint_iterations 65000 --save_iterations 65000 --test_iterations 65000 \
     --position_lr_init 0 --position_lr_final 0 --scaling_lr 0 --rotation_lr 0 --opacity_lr 0 --feature_lr 0.001 \
     --densify_from_iter 999999 --densify_until_iter 0 --densification_interval 999999 --opacity_reset_interval 999999 \
