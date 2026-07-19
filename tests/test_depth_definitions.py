@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import tempfile
@@ -14,11 +15,20 @@ from tools.thermal_radiometry.palette_lut import lut_sha256
 from tools.geometric_repeatability.evaluate_depth_definitions import (
     DEFAULT_THRESHOLDS_M,
     DIAGNOSTIC_DEPTH_SEMANTICS,
+    FORMAL_DEPTH_MIN_M,
+    FORMAL_DEPTH_SEMANTICS,
+    FORMAL_GEOMETRY_PROTOCOL,
+    FORMAL_GEOMETRY_PROTOCOL_SHA256,
+    FORMAL_OPACITY_THRESHOLD,
+    FORMAL_SUPPORT_POLICY_SHA256,
     TEMPERATURE_RESOLUTION_BILINEAR_NEAREST,
     TEMPERATURE_RESPONSIBILITY_PROTOCOL,
     TEMPERATURE_SEMANTICS,
+    ViewDepthStats,
     _camera_set_sha256,
     _camera_sha256,
+    _log_curve_auc,
+    _summarize_view_stats,
     compute_depth_metrics,
     evaluate,
     summarize_responsibility,
@@ -71,6 +81,131 @@ def _write_xyz_ply(path: Path, xyz: np.ndarray, marker: float) -> None:
 
 
 class DepthMetricTests(unittest.TestCase):
+    def test_default_thresholds_are_formal_eight_level_sweep(self) -> None:
+        self.assertEqual(
+            DEFAULT_THRESHOLDS_M,
+            (0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 20.0),
+        )
+
+    def test_gaussian_and_nerf_contribution_weights_are_equivalent(self) -> None:
+        alpha = np.array([0.2, 0.5, 0.75], dtype=np.float64)
+        depths = np.array([2.0, 4.0, 9.0], dtype=np.float64)
+
+        transmittance = 1.0
+        gaussian_weights = []
+        for value in alpha:
+            gaussian_weights.append(value * transmittance)
+            transmittance *= 1.0 - value
+        gaussian_weights = np.asarray(gaussian_weights)
+
+        nerf_exclusive_transmittance = np.concatenate(
+            ([1.0], np.cumprod(1.0 - alpha[:-1]))
+        )
+        nerf_weights = alpha * nerf_exclusive_transmittance
+        np.testing.assert_allclose(gaussian_weights, nerf_weights, rtol=0.0, atol=1.0e-15)
+
+        def definitions(weights: np.ndarray) -> tuple[float, float, float]:
+            expected = float(np.sum(weights * depths) / np.sum(weights))
+            median = float(depths[np.flatnonzero(np.cumsum(weights) >= 0.5)[0]])
+            maximum = float(depths[int(np.argmax(weights))])
+            return expected, median, maximum
+
+        gaussian_depths = definitions(gaussian_weights)
+        nerf_depths = definitions(nerf_weights)
+        np.testing.assert_allclose(gaussian_depths, nerf_depths, rtol=0.0, atol=1.0e-15)
+        self.assertEqual(gaussian_depths[1:], (4.0, 4.0))
+
+    def test_eight_level_front_agreement_behind_and_log_auc(self) -> None:
+        reference = np.full((2, 3), 30.0, dtype=np.float32)
+        rendered = np.array([[5.0, 28.0, 30.0], [33.0, 55.0, 0.0]], dtype=np.float32)
+        metrics = compute_depth_metrics(reference, rendered)
+        stats = ViewDepthStats(
+            image_name="synthetic.png",
+            metadata={"split": "train", "block": "b0", "orientation": "nadir"},
+            reference_count=metrics["reference_count"],
+            valid_count=metrics["valid_count"],
+            missing_count=metrics["missing_count"],
+            signed_residual=metrics["signed_residual"],
+            front_counts=metrics["front_counts"],
+            agreement_counts=metrics["agreement_counts"],
+            behind_counts=metrics["behind_counts"],
+        )
+        summary = _summarize_view_stats([stats], DEFAULT_THRESHOLDS_M)
+
+        self.assertEqual(metrics["reference_count"], 6)
+        self.assertEqual(metrics["valid_count"], 5)
+        self.assertEqual(metrics["missing_count"], 1)
+        for tau in DEFAULT_THRESHOLDS_M:
+            self.assertEqual(
+                metrics["front_counts"][tau]
+                + metrics["agreement_counts"][tau]
+                + metrics["behind_counts"][tau],
+                metrics["valid_count"],
+            )
+        self.assertEqual(metrics["front_counts"][0.25], 2)
+        self.assertEqual(metrics["behind_counts"][0.25], 2)
+        self.assertEqual(metrics["front_counts"][20.0], 1)
+        self.assertEqual(metrics["behind_counts"][20.0], 1)
+        self.assertAlmostEqual(summary["missing_rate"], 1.0 / 6.0)
+        self.assertAlmostEqual(summary["mean_abs_error_m"], 11.0)
+        self.assertAlmostEqual(summary["median_abs_error_m"], 3.0)
+        self.assertAlmostEqual(summary["signed_bias_m"], 0.2)
+
+        front_rates = [
+            metrics["front_counts"][tau] / metrics["reference_count"]
+            for tau in DEFAULT_THRESHOLDS_M
+        ]
+        log_tau = np.log(np.asarray(DEFAULT_THRESHOLDS_M, dtype=np.float64))
+        front_array = np.asarray(front_rates, dtype=np.float64)
+        expected_auc = float(
+            np.sum(0.5 * (front_array[:-1] + front_array[1:]) * np.diff(log_tau))
+            / np.log(20.0 / 0.25)
+        )
+        self.assertAlmostEqual(summary["front_auc_log_0p25_20m"], expected_auc)
+        self.assertEqual(
+            summary["front_curve_auc_log"]["sample_thresholds_m"],
+            list(DEFAULT_THRESHOLDS_M),
+        )
+        self.assertIsNone(_log_curve_auc(DEFAULT_THRESHOLDS_M[:-1], front_rates[:-1]))
+        incomplete_with_endpoints = (
+            0.25,
+            0.5,
+            1.0,
+            2.0,
+            10.0,
+            15.0,
+            20.0,
+        )
+        self.assertIsNone(
+            _log_curve_auc(incomplete_with_endpoints, [0.0] * 7)
+        )
+
+    def test_legacy_custom_mode_keeps_linear_auc_explicitly_legacy(self) -> None:
+        metrics = compute_depth_metrics(
+            np.full((1, 2), 10.0, dtype=np.float32),
+            np.array([[9.0, 11.0]], dtype=np.float32),
+            thresholds_m=(1.0, 5.0),
+        )
+        stats = ViewDepthStats(
+            image_name="legacy.png",
+            metadata={"split": "test", "block": "b0", "orientation": "nadir"},
+            reference_count=metrics["reference_count"],
+            valid_count=metrics["valid_count"],
+            missing_count=metrics["missing_count"],
+            signed_residual=metrics["signed_residual"],
+            front_counts=metrics["front_counts"],
+            agreement_counts=metrics["agreement_counts"],
+            behind_counts=metrics["behind_counts"],
+        )
+        summary = _summarize_view_stats(
+            [stats],
+            (1.0, 5.0),
+            evaluation_mode="legacy_custom",
+        )
+        self.assertIsNone(summary["front_auc_log_0p25_20m"])
+        self.assertIn("front_curve_auc_linear_legacy", summary)
+        self.assertNotIn("front_curve_auc", summary)
+
     def test_model_camera_validation_accepts_serialization_noise_only(self) -> None:
         camera = SimpleNamespace(
             R=np.eye(3, dtype=np.float64),
@@ -140,6 +275,7 @@ class DepthMetricTests(unittest.TestCase):
         self.assertEqual(metrics["missing_count"], 1)
         self.assertEqual(metrics["front_counts"][1.0], 1)
         self.assertEqual(metrics["agreement_counts"][1.0], 2)
+        self.assertEqual(metrics["behind_counts"][1.0], 0)
 
     def test_positive_mass_only_realized_k_and_set_mass(self) -> None:
         mass = np.zeros((1000,), dtype=np.float64)
@@ -542,6 +678,16 @@ class FormalEvaluatorTests(unittest.TestCase):
                 },
                 "appearance_modality": appearance_modality,
                 "depth_diagnostics": {"enabled": True, **DIAGNOSTIC_DEPTH_SEMANTICS},
+                "formal_geometry_metric_contract": {
+                    "protocol": FORMAL_GEOMETRY_PROTOCOL,
+                    "protocol_sha256": FORMAL_GEOMETRY_PROTOCOL_SHA256,
+                    "support_policy_sha256": FORMAL_SUPPORT_POLICY_SHA256,
+                    "thresholds_m": list(DEFAULT_THRESHOLDS_M),
+                    "depth_definitions": FORMAL_DEPTH_SEMANTICS,
+                    "opacity_threshold": FORMAL_OPACITY_THRESHOLD,
+                    "depth_min_m": FORMAL_DEPTH_MIN_M,
+                    "support_mode": "gaussian_accumulated_opacity",
+                },
                 "camera_set_sha256": _camera_set_sha256({view["image_name"]: view for view in model_views}),
                 "render_camera_set_sha256": _camera_set_sha256(
                     {view["image_name"]: view for view in model_views}
@@ -681,10 +827,135 @@ class FormalEvaluatorTests(unittest.TestCase):
                     0.0,
                 )
             expected = summary["depth_definitions"]["expected"]
-            self.assertIn("front_curve_auc", expected["groups"]["split"]["train"])
+            self.assertNotIn("front_curve_auc", expected["groups"]["split"]["train"])
+            self.assertNotIn(
+                "front_curve_auc_linear_legacy",
+                expected["groups"]["split"]["train"],
+            )
+            self.assertEqual(summary["thresholds_m"], list(DEFAULT_THRESHOLDS_M))
+            for depth in summary["depth_definitions"].values():
+                for split in ("train", "guard", "test"):
+                    split_summary = depth["groups"]["split"][split]
+                    self.assertEqual(len(split_summary["threshold_metrics"]), 8)
+                    self.assertIn("front_auc_log_0p25_20m", split_summary)
+                    self.assertIsNotNone(split_summary["front_auc_log_0p25_20m"])
+                    for point in split_summary["threshold_metrics"]:
+                        self.assertIn("front_rate", point)
+                        self.assertIn("agreement_rate", point)
+                        self.assertIn("behind_rate", point)
+                    for metric_name in (
+                        "missing_rate",
+                        "mean_abs_error_m",
+                        "median_abs_error_m",
+                        "signed_bias_m",
+                    ):
+                        self.assertIn(metric_name, split_summary)
+            expected_splits = expected["groups"]["split"]
+            train_tau_1 = next(
+                point for point in expected_splits["train"]["threshold_metrics"]
+                if point["threshold_m"] == 1.0
+            )
+            guard_tau_1 = next(
+                point for point in expected_splits["guard"]["threshold_metrics"]
+                if point["threshold_m"] == 1.0
+            )
+            test_tau_1 = next(
+                point for point in expected_splits["test"]["threshold_metrics"]
+                if point["threshold_m"] == 1.0
+            )
+            self.assertEqual(train_tau_1["front_rate"], 0.25)
+            self.assertEqual(guard_tau_1["front_rate"], 0.0)
+            self.assertEqual(test_tau_1["front_rate"], 0.0)
+            with (out / "depth_metrics.csv").open(newline="", encoding="utf-8") as handle:
+                depth_rows = list(csv.DictReader(handle))
+            self.assertEqual(len(depth_rows), 3 * len(DEFAULT_THRESHOLDS_M))
+            self.assertIn("behind_rate", depth_rows[0])
+            self.assertIn("front_auc_log_0p25_20m", depth_rows[0])
+            self.assertNotIn("front_auc_normalized", depth_rows[0])
+            self.assertEqual(summary["protocol"], FORMAL_GEOMETRY_PROTOCOL)
+            self.assertEqual(
+                summary["protocol_sha256"], FORMAL_GEOMETRY_PROTOCOL_SHA256
+            )
             self.assertIn("no_opacity_mask", expected["opacity_sensitivity"])
             self.assertIn("[0.25,0.5)", expected["opacity_sensitivity"]["opacity_bins"])
             self.assertTrue((out / expected["signed_residual_cdf"]["groups"]["split"]["train"]).is_file())
+
+    def test_non_gaussian_metric_only_needs_only_three_depth_maps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle = self._bundle(
+                root,
+                appearance_modality="none",
+                include_temperature=False,
+            )
+            model = json.loads(bundle["model"].read_text(encoding="utf-8"))
+            for key in (
+                "gaussian_count",
+                "gaussian_index_anchor",
+                "gaussian_index_binding",
+                "model_point_cloud",
+            ):
+                model.pop(key, None)
+            model["model_family"] = "non_gaussian_metric_only_fixture"
+            model["depth_diagnostics"] = {
+                "enabled": True,
+                **{
+                    array_key: DIAGNOSTIC_DEPTH_SEMANTICS[array_key]
+                    for array_key in (
+                        "depth_expected_alpha_normalized",
+                        "depth_transmittance_median",
+                        "depth_max_contribution",
+                    )
+                },
+            }
+            model["formal_geometry_metric_contract"]["support_mode"] = (
+                "finite_positive_depth_metric_only"
+            )
+            for view in model["views"]:
+                npz_path = bundle["model"].parent / view["npz_file"]
+                with np.load(npz_path, allow_pickle=False) as payload:
+                    arrays = {
+                        key: np.asarray(payload[key])
+                        for key in (
+                            "depth_expected_alpha_normalized",
+                            "depth_transmittance_median",
+                            "depth_max_contribution",
+                        )
+                    }
+                np.savez_compressed(npz_path, **arrays)
+                view["npz_size_bytes"] = npz_path.stat().st_size
+                view["npz_sha256"] = _sha256(npz_path)
+            _write_json(bundle["model"], model)
+
+            out = root / "metric-only"
+            summary = evaluate(
+                reference_manifest_path=bundle["reference"],
+                model_manifest_path=bundle["model"],
+                probe_camera_manifest_path=bundle["probe"],
+                formal_split_manifest_path=bundle["formal"],
+                metric_only=True,
+                out_dir=out,
+            )
+            self.assertTrue(summary["metric_only"])
+            self.assertEqual(
+                summary["support_mode"], "finite_positive_depth_metric_only"
+            )
+            self.assertEqual(
+                summary["responsibility"]["status"],
+                "not_requested_metric_only",
+            )
+            self.assertEqual(summary["responsibility"]["signals"], {})
+            self.assertFalse((out / "responsibility_arrays.npz").exists())
+            self.assertEqual(
+                set(summary["depth_definitions"]),
+                {"expected", "median", "max_contribution"},
+            )
+            self.assertEqual(
+                summary["depth_definitions"]["expected"]["opacity_sensitivity"][
+                    "status"
+                ],
+                "not_applicable_metric_only",
+            )
 
     def test_base_reference_identity_is_bound_and_immutable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -858,19 +1129,48 @@ class FormalEvaluatorTests(unittest.TestCase):
             self.assertEqual(summary["responsibility"]["rgb_responsibility_status"], "not_applicable")
             self.assertNotIn("rgb_abs_top1_occupancy_approx", summary["responsibility"]["splits"]["test"])
 
-    def test_formal_threshold_below_half_fails(self) -> None:
+    def test_formal_custom_thresholds_and_opacity_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             bundle = self._bundle(root, include_temperature=False)
-            with self.assertRaisesRegex(ValueError, ">= 0.5"):
+            with self.assertRaisesRegex(ValueError, "custom thresholds are legacy_custom only"):
+                evaluate(
+                    reference_manifest_path=bundle["reference"],
+                    model_manifest_path=bundle["model"],
+                    probe_camera_manifest_path=bundle["probe"],
+                    formal_split_manifest_path=bundle["formal"],
+                    thresholds_m=(0.25, 1.0, 20.0),
+                    out_dir=root / "custom-thresholds",
+                )
+            with self.assertRaisesRegex(ValueError, "requires opacity_threshold=0.5"):
                 evaluate(
                     reference_manifest_path=bundle["reference"],
                     model_manifest_path=bundle["model"],
                     probe_camera_manifest_path=bundle["probe"],
                     formal_split_manifest_path=bundle["formal"],
                     opacity_threshold=0.49,
-                    out_dir=root / "out",
+                    out_dir=root / "custom-opacity",
                 )
+
+    def test_formal_protocol_and_support_hashes_fail_closed(self) -> None:
+        for field in ("protocol_sha256", "support_policy_sha256"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                bundle = self._bundle(root, include_temperature=False)
+                model = json.loads(bundle["model"].read_text(encoding="utf-8"))
+                model["formal_geometry_metric_contract"][field] = "0" * 64
+                _write_json(bundle["model"], model)
+                with self.assertRaisesRegex(
+                    ValueError,
+                    rf"contract mismatch for {field}",
+                ):
+                    evaluate(
+                        reference_manifest_path=bundle["reference"],
+                        model_manifest_path=bundle["model"],
+                        probe_camera_manifest_path=bundle["probe"],
+                        formal_split_manifest_path=bundle["formal"],
+                        out_dir=root / "rejected",
+                    )
 
 
 if __name__ == "__main__":

@@ -1,11 +1,16 @@
-"""Evaluate alternative Gaussian-splat depth definitions and responsibilities.
+"""Evaluate the three formal depth definitions and optional responsibilities.
 
 This diagnostic is deliberately separate from the legacy reference-depth
 evaluator.  It consumes diagnostic NPZ bundles produced by
 ``export_gaussian_probe_bundle.py --depth_diagnostics`` and never changes the
 formal split or reference backend.
 
-Responsibility attribution is intentionally narrow. Front error is assigned
+``--metric_only`` accepts a non-Gaussian adapter bundle containing only the
+three registered depth maps and uses finite positive depth as the fixed model
+support rule. It does not require Gaussian indices, opacity, top contributors,
+or responsibility attribution.
+
+Responsibility attribution on the Gaussian path is intentionally narrow. Front error is assigned
 only for max-contribution Gaussian-center depth, whose depth and Gaussian index
 refer to the same compositing event. RGB or Celsius residual attribution, when
 allowed by explicit modality/provenance manifests, is a top-1 shared-occupancy
@@ -34,7 +39,11 @@ if str(REPO_ROOT) not in sys.path:
 from tools.thermal_radiometry.palette_lut import hot_iron_lut, lut_sha256
 
 
-DEFAULT_THRESHOLDS_M = (0.25, 0.5, 1.0, 2.0, 3.0, 5.0)
+DEFAULT_THRESHOLDS_M = (0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 20.0)
+FRONT_AUC_LOG_MIN_M = 0.25
+FRONT_AUC_LOG_MAX_M = 20.0
+FORMAL_OPACITY_THRESHOLD = 0.5
+FORMAL_DEPTH_MIN_M = 1.0e-6
 FORMAL_SPLIT_LABELS = frozenset({"train", "guard", "test"})
 REFERENCE_DEPTH_SEMANTICS = "metric_camera_z_reference_mesh"
 TEMPERATURE_RESPONSIBILITY_PROTOCOL = "uav-tgs-temperature-responsibility-v1"
@@ -63,6 +72,45 @@ DEPTH_DEFINITIONS = {
     "median": "depth_transmittance_median",
     "max_contribution": "depth_max_contribution",
 }
+FORMAL_DEPTH_SEMANTICS = {
+    key: DIAGNOSTIC_DEPTH_SEMANTICS[value]
+    for key, value in DEPTH_DEFINITIONS.items()
+}
+FORMAL_SUPPORT_POLICY = {
+    "reference_support": "reference_valid and finite positive reference depth",
+    "gaussian_model_support": (
+        "finite positive rendered depth and finite accumulated_opacity >= 0.5"
+    ),
+    "metric_only_model_support": "finite positive rendered depth",
+    "missing": "reference support and not model support",
+    "depth_min_m": FORMAL_DEPTH_MIN_M,
+    "opacity_threshold": FORMAL_OPACITY_THRESHOLD,
+}
+
+
+def _canonical_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+FORMAL_SUPPORT_POLICY_SHA256 = _canonical_sha256(FORMAL_SUPPORT_POLICY)
+FORMAL_GEOMETRY_PROTOCOL = "uav-tgs-aaai27-formal-geometry-metrics-v1"
+FORMAL_GEOMETRY_PROTOCOL_SPEC = {
+    "protocol": FORMAL_GEOMETRY_PROTOCOL,
+    "thresholds_m": list(DEFAULT_THRESHOLDS_M),
+    "depth_definitions": FORMAL_DEPTH_SEMANTICS,
+    "support_policy_sha256": FORMAL_SUPPORT_POLICY_SHA256,
+    "formal_auc": "front_auc_log_0p25_20m; trapezoid over all eight log-threshold samples",
+}
+FORMAL_GEOMETRY_PROTOCOL_SHA256 = _canonical_sha256(
+    FORMAL_GEOMETRY_PROTOCOL_SPEC
+)
 ALIGNMENT_MAX_TRANSLATION_ERROR_M = 1.0e-4
 ALIGNMENT_MAX_ROTATION_ERROR_DEG = 5.0e-2
 PRINCIPAL_POINT_CENTER_TOLERANCE_PX = 1.0e-6
@@ -119,6 +167,50 @@ def _parse_thresholds(value: str | Sequence[float]) -> tuple[float, ...]:
     if tuple(sorted(set(parsed))) != parsed:
         raise ValueError("Depth thresholds must be unique and strictly increasing")
     return parsed
+
+
+def _validate_formal_geometry_contract(
+    model_manifest: Mapping[str, Any],
+    *,
+    metric_only: bool,
+) -> Dict[str, Any]:
+    contract = model_manifest.get("formal_geometry_metric_contract")
+    if not isinstance(contract, Mapping):
+        raise ValueError("Model manifest is missing formal_geometry_metric_contract")
+    expected = {
+        "protocol": FORMAL_GEOMETRY_PROTOCOL,
+        "protocol_sha256": FORMAL_GEOMETRY_PROTOCOL_SHA256,
+        "support_policy_sha256": FORMAL_SUPPORT_POLICY_SHA256,
+        "thresholds_m": list(DEFAULT_THRESHOLDS_M),
+        "depth_definitions": FORMAL_DEPTH_SEMANTICS,
+        "opacity_threshold": FORMAL_OPACITY_THRESHOLD,
+        "depth_min_m": FORMAL_DEPTH_MIN_M,
+        "support_mode": (
+            "finite_positive_depth_metric_only"
+            if metric_only
+            else "gaussian_accumulated_opacity"
+        ),
+    }
+    for key, expected_value in expected.items():
+        observed = contract.get(key)
+        if isinstance(expected_value, float):
+            try:
+                matches = math.isclose(
+                    float(observed),
+                    expected_value,
+                    rel_tol=0.0,
+                    abs_tol=1.0e-15,
+                )
+            except (TypeError, ValueError):
+                matches = False
+        else:
+            matches = observed == expected_value
+        if not matches:
+            raise ValueError(
+                f"Formal geometry metric contract mismatch for {key}: "
+                f"observed={observed!r} expected={expected_value!r}"
+            )
+    return dict(contract)
 
 
 def _as_hw(value: np.ndarray, *, label: str) -> np.ndarray:
@@ -442,6 +534,7 @@ class ViewDepthStats:
     signed_residual: np.ndarray
     front_counts: Dict[float, int]
     agreement_counts: Dict[float, int]
+    behind_counts: Dict[float, int]
 
 
 def _curve_auc(thresholds: Sequence[float], values: Sequence[float]) -> Dict[str, float]:
@@ -455,6 +548,55 @@ def _curve_auc(thresholds: Sequence[float], values: Sequence[float]) -> Dict[str
         raw = float(trapezoid(y, x) if trapezoid is not None else np.trapz(y, x))
         normalized = raw / float(x[-1] - x[0])
     return {"raw_rate_m": raw, "normalized": normalized, "tau_min_m": float(x[0]), "tau_max_m": float(x[-1])}
+
+
+def _log_curve_auc(
+    thresholds: Sequence[float],
+    values: Sequence[float],
+    *,
+    tau_min_m: float = FRONT_AUC_LOG_MIN_M,
+    tau_max_m: float = FRONT_AUC_LOG_MAX_M,
+) -> Dict[str, Any] | None:
+    """Integrate a threshold curve uniformly in log-distance.
+
+    The named 0.25--20 m score is emitted only for the exact formal eight-point
+    grid. Merely including both endpoints is insufficient. Samples are
+    integrated with the trapezoid rule in ``log(tau)`` and the result is
+    normalized by the log-interval width.
+    """
+
+    x = np.asarray(thresholds, dtype=np.float64)
+    y = np.asarray(values, dtype=np.float64)
+    if x.ndim != 1 or y.ndim != 1 or x.size != y.size or x.size == 0:
+        raise ValueError("Log-AUC thresholds and values must be non-empty 1-D arrays of equal length")
+    if np.any(~np.isfinite(x)) or np.any(x <= 0.0) or np.any(~np.isfinite(y)):
+        raise ValueError("Log-AUC thresholds must be positive and all inputs finite")
+    if not np.all(np.diff(x) > 0.0):
+        raise ValueError("Log-AUC thresholds must be strictly increasing")
+    expected_grid = np.asarray(DEFAULT_THRESHOLDS_M, dtype=np.float64)
+    if (
+        x.size != expected_grid.size
+        or not np.allclose(x, expected_grid, rtol=0.0, atol=1.0e-12)
+        or not math.isclose(float(x[0]), tau_min_m, rel_tol=0.0, abs_tol=1.0e-12)
+        or not math.isclose(float(x[-1]), tau_max_m, rel_tol=0.0, abs_tol=1.0e-12)
+    ):
+        return None
+    selected_x = x
+    selected_y = y
+    log_x = np.log(selected_x)
+    trapezoid = getattr(np, "trapezoid", None)
+    raw = float(
+        trapezoid(selected_y, log_x) if trapezoid is not None else np.trapz(selected_y, log_x)
+    )
+    normalized = raw / float(math.log(tau_max_m / tau_min_m))
+    return {
+        "raw_rate_log_interval": raw,
+        "normalized": normalized,
+        "tau_min_m": float(tau_min_m),
+        "tau_max_m": float(tau_max_m),
+        "integration_domain": "natural_log_threshold_m",
+        "sample_thresholds_m": [float(value) for value in selected_x],
+    }
 
 
 def compute_depth_metrics(
@@ -500,6 +642,9 @@ def compute_depth_metrics(
     agreement_counts = {
         tau: int(np.count_nonzero(joint & (np.abs(rendered_depth - reference_depth) <= tau))) for tau in thresholds
     }
+    behind_counts = {
+        tau: int(np.count_nonzero(joint & (rendered_depth > reference_depth + tau))) for tau in thresholds
+    }
     return {
         "reference_count": int(np.count_nonzero(reference_mask)),
         "valid_count": int(np.count_nonzero(joint)),
@@ -507,16 +652,24 @@ def compute_depth_metrics(
         "signed_residual": signed,
         "front_counts": front_counts,
         "agreement_counts": agreement_counts,
+        "behind_counts": behind_counts,
         "joint_valid_mask": joint,
     }
 
 
-def _summarize_view_stats(stats: Sequence[ViewDepthStats], thresholds: Sequence[float]) -> Dict[str, Any]:
+def _summarize_view_stats(
+    stats: Sequence[ViewDepthStats],
+    thresholds: Sequence[float],
+    *,
+    evaluation_mode: str = "formal",
+) -> Dict[str, Any]:
+    if evaluation_mode not in {"formal", "legacy_custom"}:
+        raise ValueError(f"Unsupported evaluation mode: {evaluation_mode!r}")
     reference_count = sum(item.reference_count for item in stats)
     valid_count = sum(item.valid_count for item in stats)
     missing_count = sum(item.missing_count for item in stats)
     if reference_count <= 0:
-        return {
+        empty_payload = {
             "view_count": len(stats),
             "reference_valid_pixels": 0,
             "model_valid_pixels": 0,
@@ -526,9 +679,14 @@ def _summarize_view_stats(stats: Sequence[ViewDepthStats], thresholds: Sequence[
             "median_abs_error_m": None,
             "signed_bias_m": None,
             "threshold_metrics": [],
-            "front_curve_auc": None,
-            "agreement_curve_auc": None,
+            "front_curve_auc_log": None,
+            "front_auc_log_0p25_20m": None,
+            "evaluation_mode": evaluation_mode,
         }
+        if evaluation_mode == "legacy_custom":
+            empty_payload["front_curve_auc_linear_legacy"] = None
+            empty_payload["agreement_curve_auc_linear_legacy"] = None
+        return empty_payload
     residual_arrays = [item.signed_residual for item in stats if item.signed_residual.size]
     residual = np.concatenate(residual_arrays) if residual_arrays else np.zeros((0,), dtype=np.float32)
     front_rates: List[float] = []
@@ -537,8 +695,10 @@ def _summarize_view_stats(stats: Sequence[ViewDepthStats], thresholds: Sequence[
     for tau in thresholds:
         front_count = sum(item.front_counts[tau] for item in stats)
         agreement_count = sum(item.agreement_counts[tau] for item in stats)
+        behind_count = sum(item.behind_counts[tau] for item in stats)
         front_rate = float(front_count) / float(reference_count)
         agreement_rate = float(agreement_count) / float(reference_count)
+        behind_rate = float(behind_count) / float(reference_count)
         front_rates.append(front_rate)
         agreement_rates.append(agreement_rate)
         threshold_metrics.append(
@@ -548,9 +708,20 @@ def _summarize_view_stats(stats: Sequence[ViewDepthStats], thresholds: Sequence[
                 "front_rate": front_rate,
                 "agreement_count": int(agreement_count),
                 "agreement_rate": agreement_rate,
+                "behind_count": int(behind_count),
+                "behind_rate": behind_rate,
             }
         )
-    return {
+    front_curve_auc_log = (
+        _log_curve_auc(thresholds, front_rates)
+        if evaluation_mode == "formal"
+        else None
+    )
+    if evaluation_mode == "formal" and front_curve_auc_log is None:
+        raise ValueError(
+            "Formal front_auc_log_0p25_20m requires the exact complete eight-point threshold grid"
+        )
+    payload = {
         "view_count": len(stats),
         "reference_valid_pixels": int(reference_count),
         "model_valid_pixels": int(valid_count),
@@ -560,9 +731,20 @@ def _summarize_view_stats(stats: Sequence[ViewDepthStats], thresholds: Sequence[
         "median_abs_error_m": float(np.median(np.abs(residual))) if residual.size else None,
         "signed_bias_m": float(np.mean(residual)) if residual.size else None,
         "threshold_metrics": threshold_metrics,
-        "front_curve_auc": _curve_auc(thresholds, front_rates),
-        "agreement_curve_auc": _curve_auc(thresholds, agreement_rates),
+        "front_curve_auc_log": front_curve_auc_log,
+        "front_auc_log_0p25_20m": (
+            front_curve_auc_log["normalized"] if front_curve_auc_log is not None else None
+        ),
+        "evaluation_mode": evaluation_mode,
     }
+    if evaluation_mode == "legacy_custom":
+        payload["front_curve_auc_linear_legacy"] = _curve_auc(
+            thresholds, front_rates
+        )
+        payload["agreement_curve_auc_linear_legacy"] = _curve_auc(
+            thresholds, agreement_rates
+        )
+    return payload
 
 
 def _write_cdf(path: Path, residual_arrays: Sequence[np.ndarray], max_points: int) -> None:
@@ -1358,10 +1540,50 @@ def evaluate(
     formal_split_manifest_path: Path | None = None,
     temperature_responsibility_manifest_path: Path | None = None,
     cdf_max_points: int = 4096,
+    evaluation_mode: str = "formal",
+    metric_only: bool = False,
 ) -> Dict[str, Any]:
     thresholds = _parse_thresholds(thresholds_m)
-    if float(opacity_threshold) < 0.5:
-        raise ValueError("Formal main opacity threshold must be >= 0.5")
+    evaluation_mode = str(evaluation_mode).strip().lower()
+    if evaluation_mode not in {"formal", "legacy_custom"}:
+        raise ValueError("evaluation_mode must be 'formal' or 'legacy_custom'")
+    if evaluation_mode == "formal":
+        if thresholds != DEFAULT_THRESHOLDS_M:
+            raise ValueError(
+                "Formal mode requires exactly thresholds_m="
+                f"{list(DEFAULT_THRESHOLDS_M)}; custom thresholds are legacy_custom only"
+            )
+        if not math.isclose(
+            float(opacity_threshold),
+            FORMAL_OPACITY_THRESHOLD,
+            rel_tol=0.0,
+            abs_tol=1.0e-15,
+        ):
+            raise ValueError(
+                f"Formal mode requires opacity_threshold={FORMAL_OPACITY_THRESHOLD}"
+            )
+        if not math.isclose(
+            float(depth_min),
+            FORMAL_DEPTH_MIN_M,
+            rel_tol=0.0,
+            abs_tol=1.0e-18,
+        ):
+            raise ValueError(f"Formal mode requires depth_min={FORMAL_DEPTH_MIN_M}")
+    if metric_only and any(
+        value is not None
+        for value in (
+            scsp_indices_path,
+            clamp20_indices_path,
+            temperature_responsibility_manifest_path,
+        )
+    ):
+        raise ValueError(
+            "metric_only evaluation cannot request Gaussian responsibility sidecars"
+        )
+    if metric_only and any(
+        str(value).strip() for value in (scsp_anchor_sha256, clamp20_anchor_sha256)
+    ):
+        raise ValueError("metric_only evaluation cannot bind Gaussian index anchors")
     if int(cdf_max_points) <= 0:
         raise ValueError("cdf_max_points must be positive")
     if probe_camera_manifest_path is None:
@@ -1380,6 +1602,14 @@ def evaluate(
     model_manifest = _load_json(model_manifest_path)
     probe_manifest = _load_json(probe_camera_manifest_path)
     formal_split_manifest = _load_json(formal_split_manifest_path)
+    formal_metric_contract = (
+        _validate_formal_geometry_contract(
+            model_manifest,
+            metric_only=bool(metric_only),
+        )
+        if evaluation_mode == "formal"
+        else None
+    )
     formal_records = _formal_split_records_by_stem(formal_split_manifest)
     scene_names = {
         _manifest_scene(reference_manifest, label="reference manifest"),
@@ -1467,7 +1697,15 @@ def evaluate(
     diagnostic_semantics = model_manifest.get("depth_diagnostics")
     if not isinstance(diagnostic_semantics, dict) or diagnostic_semantics.get("enabled") is not True:
         raise ValueError("Model manifest does not declare enabled depth diagnostics")
-    for key, expected in DIAGNOSTIC_DEPTH_SEMANTICS.items():
+    required_diagnostic_semantics = (
+        {
+            array_key: DIAGNOSTIC_DEPTH_SEMANTICS[array_key]
+            for array_key in DEPTH_DEFINITIONS.values()
+        }
+        if metric_only
+        else DIAGNOSTIC_DEPTH_SEMANTICS
+    )
+    for key, expected in required_diagnostic_semantics.items():
         if str(diagnostic_semantics.get(key, "")) != expected:
             raise ValueError(f"Model diagnostic semantics mismatch for {key}")
     appearance_modality = str(model_manifest.get("appearance_modality", "")).strip().lower()
@@ -1550,53 +1788,74 @@ def evaluate(
     if str(coverage.get("render_camera_set_sha256", "")).lower() != computed_render_camera_set_sha:
         raise ValueError("Native-camera coverage/render-camera set hash mismatch")
 
-    manifest_count = model_manifest.get("gaussian_count")
-    if manifest_count is None or int(manifest_count) <= 0:
-        raise ValueError("Formal model manifest must declare a positive gaussian_count")
-    declared_count = int(manifest_count)
-    if gaussian_count is not None and int(gaussian_count) != declared_count:
-        raise ValueError("CLI/model gaussian_count mismatch")
-    index_anchor = model_manifest.get("gaussian_index_anchor")
-    if not isinstance(index_anchor, dict) or not _is_sha256(index_anchor.get("sha256", "")):
-        raise ValueError("Model manifest must declare gaussian_index_anchor.sha256")
-    model_index_anchor_sha = str(index_anchor["sha256"]).lower()
-    index_binding = model_manifest.get("gaussian_index_binding")
-    if not isinstance(index_binding, dict) or index_binding.get("status") != "verified":
-        raise ValueError("Model manifest must include a verified Gaussian index-space binding")
-    if int(index_binding.get("gaussian_count", -1)) != declared_count:
-        raise ValueError("Gaussian index-space binding count mismatch")
-    bound_anchor_identity = index_binding.get("gaussian_index_anchor")
-    rendered_ply_identity = index_binding.get("rendered_model_point_cloud")
-    model_ply_identity = model_manifest.get("model_point_cloud")
-    if not all(isinstance(value, dict) for value in (bound_anchor_identity, rendered_ply_identity, model_ply_identity)):
-        raise ValueError("Gaussian index-space binding is missing artifact identities")
-    if str(bound_anchor_identity.get("sha256", "")).lower() != model_index_anchor_sha:
-        raise ValueError("Gaussian index-space binding anchor mismatch")
-    if str(rendered_ply_identity.get("sha256", "")).lower() != str(model_ply_identity.get("sha256", "")).lower():
-        raise ValueError("Gaussian index-space binding rendered PLY mismatch")
-    proof = str(index_binding.get("proof", ""))
-    if proof not in {
-        "identical_ply_sha256",
-        "exact_ordered_xyz_sequence",
-        "fixed_topology_invariant_audit_receipt",
-    }:
-        raise ValueError("Unsupported Gaussian index-space proof")
-    if proof == "exact_ordered_xyz_sequence":
-        rendered_xyz = index_binding.get("rendered_ordered_xyz")
-        anchor_xyz = index_binding.get("anchor_ordered_xyz")
-        if not isinstance(rendered_xyz, dict) or not isinstance(anchor_xyz, dict) or str(
-            rendered_xyz.get("sequence_sha256", "")
-        ).lower() != str(anchor_xyz.get("sequence_sha256", "")).lower():
-            raise ValueError("Ordered-XYZ Gaussian index proof is inconsistent")
-    if proof == "fixed_topology_invariant_audit_receipt":
-        receipt = index_binding.get("binding_receipt_identity")
-        if not isinstance(receipt, dict) or not _is_sha256(receipt.get("sha256", "")):
-            raise ValueError("Fixed-topology Gaussian index proof is missing its receipt identity")
-        receipt_path = Path(str(receipt.get("path", ""))).resolve()
-        if not receipt_path.is_file() or _sha256(receipt_path) != str(receipt["sha256"]).lower() or int(
-            receipt_path.stat().st_size
-        ) != int(receipt.get("size_bytes", -1)):
-            raise ValueError("Fixed-topology Gaussian index receipt identity mismatch")
+    declared_count = 0
+    model_index_anchor_sha = ""
+    if metric_only:
+        if gaussian_count is not None:
+            raise ValueError("metric_only evaluation does not accept gaussian_count")
+    else:
+        manifest_count = model_manifest.get("gaussian_count")
+        if manifest_count is None or int(manifest_count) <= 0:
+            raise ValueError("Formal model manifest must declare a positive gaussian_count")
+        declared_count = int(manifest_count)
+        if gaussian_count is not None and int(gaussian_count) != declared_count:
+            raise ValueError("CLI/model gaussian_count mismatch")
+        index_anchor = model_manifest.get("gaussian_index_anchor")
+        if not isinstance(index_anchor, dict) or not _is_sha256(index_anchor.get("sha256", "")):
+            raise ValueError("Model manifest must declare gaussian_index_anchor.sha256")
+        model_index_anchor_sha = str(index_anchor["sha256"]).lower()
+        index_binding = model_manifest.get("gaussian_index_binding")
+        if not isinstance(index_binding, dict) or index_binding.get("status") != "verified":
+            raise ValueError("Model manifest must include a verified Gaussian index-space binding")
+        if int(index_binding.get("gaussian_count", -1)) != declared_count:
+            raise ValueError("Gaussian index-space binding count mismatch")
+        bound_anchor_identity = index_binding.get("gaussian_index_anchor")
+        rendered_ply_identity = index_binding.get("rendered_model_point_cloud")
+        model_ply_identity = model_manifest.get("model_point_cloud")
+        if not all(
+            isinstance(value, dict)
+            for value in (
+                bound_anchor_identity,
+                rendered_ply_identity,
+                model_ply_identity,
+            )
+        ):
+            raise ValueError("Gaussian index-space binding is missing artifact identities")
+        if str(bound_anchor_identity.get("sha256", "")).lower() != model_index_anchor_sha:
+            raise ValueError("Gaussian index-space binding anchor mismatch")
+        if str(rendered_ply_identity.get("sha256", "")).lower() != str(
+            model_ply_identity.get("sha256", "")
+        ).lower():
+            raise ValueError("Gaussian index-space binding rendered PLY mismatch")
+        proof = str(index_binding.get("proof", ""))
+        if proof not in {
+            "identical_ply_sha256",
+            "exact_ordered_xyz_sequence",
+            "fixed_topology_invariant_audit_receipt",
+        }:
+            raise ValueError("Unsupported Gaussian index-space proof")
+        if proof == "exact_ordered_xyz_sequence":
+            rendered_xyz = index_binding.get("rendered_ordered_xyz")
+            anchor_xyz = index_binding.get("anchor_ordered_xyz")
+            if (
+                not isinstance(rendered_xyz, dict)
+                or not isinstance(anchor_xyz, dict)
+                or str(rendered_xyz.get("sequence_sha256", "")).lower()
+                != str(anchor_xyz.get("sequence_sha256", "")).lower()
+            ):
+                raise ValueError("Ordered-XYZ Gaussian index proof is inconsistent")
+        if proof == "fixed_topology_invariant_audit_receipt":
+            receipt = index_binding.get("binding_receipt_identity")
+            if not isinstance(receipt, dict) or not _is_sha256(receipt.get("sha256", "")):
+                raise ValueError("Fixed-topology Gaussian index proof is missing its receipt identity")
+            receipt_path = Path(str(receipt.get("path", ""))).resolve()
+            if (
+                not receipt_path.is_file()
+                or _sha256(receipt_path) != str(receipt["sha256"]).lower()
+                or int(receipt_path.stat().st_size)
+                != int(receipt.get("size_bytes", -1))
+            ):
+                raise ValueError("Fixed-topology Gaussian index receipt identity mismatch")
 
     cached_paths: Dict[str, tuple[Path, Path, Dict[str, str], tuple[int, int]]] = {}
     temperature_field_names = {
@@ -1714,18 +1973,31 @@ def evaluate(
             reference_valid = _as_hw(np.asarray(ref_npz["valid_mask"]), label=f"{image_name} reference valid")
             if reference_depth.shape != expected_shape or reference_valid.shape != expected_shape:
                 raise ValueError(f"{image_name}: reference arrays/camera dimensions mismatch")
-            for key in (*DEPTH_DEFINITIONS.values(), "accumulated_opacity", "top_contributor_index", "top_contributor_weight"):
+            required_model_keys = list(DEPTH_DEFINITIONS.values())
+            if not metric_only:
+                required_model_keys.extend(
+                    (
+                        "accumulated_opacity",
+                        "top_contributor_index",
+                        "top_contributor_weight",
+                    )
+                )
+            for key in required_model_keys:
                 if key not in model_npz:
                     raise KeyError(f"{model_path} is missing diagnostic key {key!r}")
-            for key in (*DEPTH_DEFINITIONS.values(), "accumulated_opacity"):
+            shape_keys = list(DEPTH_DEFINITIONS.values())
+            if not metric_only:
+                shape_keys.append("accumulated_opacity")
+            for key in shape_keys:
                 if _as_hw(np.asarray(model_npz[key]), label=f"{image_name} {key}").shape != expected_shape:
                     raise ValueError(f"{image_name}: {key}/camera dimensions mismatch")
-            _validate_joint_diagnostic_arrays(
-                model_npz,
-                expected_shape=expected_shape,
-                gaussian_count=declared_count,
-                label=image_name,
-            )
+            if not metric_only:
+                _validate_joint_diagnostic_arrays(
+                    model_npz,
+                    expected_shape=expected_shape,
+                    gaussian_count=declared_count,
+                    label=image_name,
+                )
             temperature_fields_present |= bool(set(model_npz.files) & temperature_field_names)
             has_rgb_arrays = "render_rgb" in model_npz or "target_rgb" in model_npz
             if appearance_modality != "rgb" and has_rgb_arrays:
@@ -1768,20 +2040,24 @@ def evaluate(
             for split in FORMAL_SPLIT_LABELS
         },
     )
-    scsp_set = _load_bound_index_set(
-        scsp_indices_path,
-        label="SCSP set",
-        explicit_anchor_sha256=scsp_anchor_sha256,
-        model_index_anchor_sha256=model_index_anchor_sha,
-        gaussian_count=declared_count,
-    )
-    clamp20_set = _load_bound_index_set(
-        clamp20_indices_path,
-        label="clamp20 set",
-        explicit_anchor_sha256=clamp20_anchor_sha256,
-        model_index_anchor_sha256=model_index_anchor_sha,
-        gaussian_count=declared_count,
-    )
+    if metric_only:
+        scsp_set = BoundIndexSet("SCSP set", frozenset(), "", "", "")
+        clamp20_set = BoundIndexSet("clamp20 set", frozenset(), "", "", "")
+    else:
+        scsp_set = _load_bound_index_set(
+            scsp_indices_path,
+            label="SCSP set",
+            explicit_anchor_sha256=scsp_anchor_sha256,
+            model_index_anchor_sha256=model_index_anchor_sha,
+            gaussian_count=declared_count,
+        )
+        clamp20_set = _load_bound_index_set(
+            clamp20_indices_path,
+            label="clamp20 set",
+            explicit_anchor_sha256=clamp20_anchor_sha256,
+            model_index_anchor_sha256=model_index_anchor_sha,
+            gaussian_count=declared_count,
+        )
 
     depth_payload: Dict[str, Any] = {}
     depth_csv_rows: List[List[Any]] = []
@@ -1802,6 +2078,7 @@ def evaluate(
                     signed_residual=np.asarray(metrics["signed_residual"]),
                     front_counts=dict(metrics["front_counts"]),
                     agreement_counts=dict(metrics["agreement_counts"]),
+                    behind_counts=dict(metrics["behind_counts"]),
                 )
             )
 
@@ -1809,7 +2086,14 @@ def evaluate(
             with np.load(ref_path, allow_pickle=False) as ref_npz, np.load(model_path, allow_pickle=False) as model_npz:
                 reference_depth = _as_hw(np.asarray(ref_npz["depth"], dtype=np.float64), label="reference depth")
                 reference_valid = _as_hw(np.asarray(ref_npz["valid_mask"]), label="reference valid").astype(bool)
-                opacity = _as_hw(np.asarray(model_npz["accumulated_opacity"], dtype=np.float64), label="opacity")
+                opacity = (
+                    None
+                    if metric_only
+                    else _as_hw(
+                        np.asarray(model_npz["accumulated_opacity"], dtype=np.float64),
+                        label="opacity",
+                    )
+                )
                 rendered_depth = _as_hw(np.asarray(model_npz[depth_key], dtype=np.float64), label=depth_key)
                 metrics = compute_depth_metrics(
                     reference_depth,
@@ -1821,39 +2105,49 @@ def evaluate(
                     thresholds_m=thresholds,
                 )
                 append_stats(view_stats, image_name, metadata, metrics)
-                append_stats(
-                    no_opacity_stats,
-                    image_name,
-                    metadata,
-                    compute_depth_metrics(
-                        reference_depth,
-                        rendered_depth,
-                        reference_valid=reference_valid,
-                        depth_min=depth_min,
-                        thresholds_m=thresholds,
-                    ),
-                )
-                for bin_label, low, high in OPACITY_BINS:
-                    bin_mask = np.isfinite(opacity) & (opacity >= low) & (opacity < high)
+                if not metric_only:
                     append_stats(
-                        opacity_bin_stats[bin_label],
+                        no_opacity_stats,
                         image_name,
                         metadata,
                         compute_depth_metrics(
                             reference_depth,
                             rendered_depth,
-                            reference_valid=reference_valid & bin_mask,
+                            reference_valid=reference_valid,
                             depth_min=depth_min,
                             thresholds_m=thresholds,
                         ),
                     )
-        overall = _summarize_view_stats(view_stats, thresholds)
+                    assert opacity is not None
+                    for bin_label, low, high in OPACITY_BINS:
+                        bin_mask = np.isfinite(opacity) & (opacity >= low) & (opacity < high)
+                        append_stats(
+                            opacity_bin_stats[bin_label],
+                            image_name,
+                            metadata,
+                            compute_depth_metrics(
+                                reference_depth,
+                                rendered_depth,
+                                reference_valid=reference_valid & bin_mask,
+                                depth_min=depth_min,
+                                thresholds_m=thresholds,
+                            ),
+                        )
+        overall = _summarize_view_stats(
+            view_stats,
+            thresholds,
+            evaluation_mode=evaluation_mode,
+        )
         grouped: Dict[str, Dict[str, Any]] = {}
         cdf_outputs: Dict[str, Any] = {"groups": {}}
         for group_type in ("split", "block", "orientation"):
             labels = sorted({item.metadata[group_type] for item in view_stats})
             grouped[group_type] = {
-                label: _summarize_view_stats([item for item in view_stats if item.metadata[group_type] == label], thresholds)
+                label: _summarize_view_stats(
+                    [item for item in view_stats if item.metadata[group_type] == label],
+                    thresholds,
+                    evaluation_mode=evaluation_mode,
+                )
                 for label in labels
             }
             cdf_outputs["groups"][group_type] = {}
@@ -1865,21 +2159,38 @@ def evaluate(
         overall_cdf = Path("signed_residual_cdf") / depth_label / "overall.csv"
         _write_cdf(out_dir / overall_cdf, [item.signed_residual for item in view_stats], cdf_max_points)
         cdf_outputs["overall"] = str(overall_cdf).replace("\\", "/")
-        opacity_sensitivity = {
-            "diagnostic_only": True,
-            "main_opacity_threshold": float(opacity_threshold),
-            "no_opacity_mask": _summarize_view_stats(no_opacity_stats, thresholds),
-            "opacity_bins": {},
-        }
-        main_reference_count = int(overall["reference_valid_pixels"])
-        for bin_label, low, high in OPACITY_BINS:
-            summary = _summarize_view_stats(opacity_bin_stats[bin_label], thresholds)
-            summary["opacity_min_inclusive"] = low
-            summary["opacity_max_exclusive"] = high
-            summary["reference_pixel_share"] = (
-                float(summary["reference_valid_pixels"]) / float(main_reference_count) if main_reference_count > 0 else 0.0
-            )
-            opacity_sensitivity["opacity_bins"][bin_label] = summary
+        if metric_only:
+            opacity_sensitivity = {
+                "status": "not_applicable_metric_only",
+                "support_mode": "finite_positive_depth_metric_only",
+            }
+        else:
+            opacity_sensitivity = {
+                "diagnostic_only": True,
+                "main_opacity_threshold": float(opacity_threshold),
+                "no_opacity_mask": _summarize_view_stats(
+                    no_opacity_stats,
+                    thresholds,
+                    evaluation_mode=evaluation_mode,
+                ),
+                "opacity_bins": {},
+            }
+            main_reference_count = int(overall["reference_valid_pixels"])
+            for bin_label, low, high in OPACITY_BINS:
+                summary = _summarize_view_stats(
+                    opacity_bin_stats[bin_label],
+                    thresholds,
+                    evaluation_mode=evaluation_mode,
+                )
+                summary["opacity_min_inclusive"] = low
+                summary["opacity_max_exclusive"] = high
+                summary["reference_pixel_share"] = (
+                    float(summary["reference_valid_pixels"])
+                    / float(main_reference_count)
+                    if main_reference_count > 0
+                    else 0.0
+                )
+                opacity_sensitivity["opacity_bins"][bin_label] = summary
         depth_payload[depth_label] = {
             "npz_key": depth_key,
             "overall": overall,
@@ -1898,8 +2209,18 @@ def evaluate(
                     overall["mean_abs_error_m"],
                     overall["median_abs_error_m"],
                     overall["signed_bias_m"],
-                    overall["front_curve_auc"]["normalized"],
-                    overall["agreement_curve_auc"]["normalized"],
+                    metric["behind_rate"],
+                    overall["front_auc_log_0p25_20m"],
+                    (
+                        overall["front_curve_auc_linear_legacy"]["normalized"]
+                        if overall.get("front_curve_auc_linear_legacy") is not None
+                        else None
+                    ),
+                    (
+                        overall["agreement_curve_auc_linear_legacy"]["normalized"]
+                        if overall.get("agreement_curve_auc_linear_legacy") is not None
+                        else None
+                    ),
                 ]
             )
         for group_type, groups in grouped.items():
@@ -1917,8 +2238,18 @@ def evaluate(
                             summary["mean_abs_error_m"],
                             summary["median_abs_error_m"],
                             summary["signed_bias_m"],
-                            summary["front_curve_auc"]["normalized"],
-                            summary["agreement_curve_auc"]["normalized"],
+                            metric["behind_rate"],
+                            summary["front_auc_log_0p25_20m"],
+                            (
+                                summary["front_curve_auc_linear_legacy"]["normalized"]
+                                if summary.get("front_curve_auc_linear_legacy") is not None
+                                else None
+                            ),
+                            (
+                                summary["agreement_curve_auc_linear_legacy"]["normalized"]
+                                if summary.get("agreement_curve_auc_linear_legacy") is not None
+                                else None
+                            ),
                         ]
                     )
     masses: Dict[str, Dict[str, np.ndarray]] = {}
@@ -1931,10 +2262,11 @@ def evaluate(
     evaluated_splits = {metadata["split"].strip().lower() for _, _, metadata, _ in cached_paths.values()}
     if evaluated_splits != FORMAL_SPLIT_LABELS:
         raise ValueError(
-            "Formal responsibility evaluation requires actual train, guard, and test reference/model views; "
+            "Formal metric evaluation requires actual train, guard, and test reference/model views; "
             f"observed={sorted(evaluated_splits)}. A test-only reference must first be extended from the same bound mesh."
         )
-    for image_name, (ref_path, model_path, metadata, expected_shape) in cached_paths.items():
+    responsibility_items = () if metric_only else cached_paths.items()
+    for image_name, (ref_path, model_path, metadata, expected_shape) in responsibility_items:
         split = metadata["split"].strip().lower()
         masses.setdefault(split, {})
         view_mass.setdefault(split, {})
@@ -2054,24 +2386,39 @@ def evaluate(
                 )
 
     responsibility_payload: Dict[str, Any] = {
+        "status": (
+            "not_requested_metric_only"
+            if metric_only
+            else "completed_optional_gaussian_sidecar"
+        ),
         "attribution_semantics": (
-            "front error is attributed only for max-contribution depth; RGB and temperature residuals use "
+            None
+            if metric_only
+            else "front error is attributed only for max-contribution depth; RGB and temperature residuals use "
             "top-1 shared-occupancy assignment approximations with explicit assigned/unassigned residual coverage "
             "(not top-k or exact causal decomposition)"
         ),
-        "signals": {
-            "front_max_contribution": "top contributor and max-contribution depth are the same compositing event",
-            "rgb_abs_top1_occupancy_approx": "diagnostic top-1 shared-occupancy approximation",
-            "temperature_abs_top1_occupancy_approx": (
-                "diagnostic top-1 shared-occupancy approximation; generated only under explicit TSDK/Celsius manifest contract"
-            ),
-        },
+        "signals": (
+            {}
+            if metric_only
+            else {
+                "front_max_contribution": "top contributor and max-contribution depth are the same compositing event",
+                "rgb_abs_top1_occupancy_approx": "diagnostic top-1 shared-occupancy approximation",
+                "temperature_abs_top1_occupancy_approx": (
+                    "diagnostic top-1 shared-occupancy approximation; generated only under explicit TSDK/Celsius manifest contract"
+                ),
+            }
+        ),
         "method_selection_policy": "train/guard only; test is final-report-only",
-        "gaussian_count": int(declared_count),
+        "gaussian_count": int(declared_count) if not metric_only else None,
         "appearance_modality": appearance_modality,
         "rgb_responsibility_status": "available_top1_approximation" if appearance_modality == "rgb" else "not_applicable",
-        "gaussian_count_source": "model_manifest (CLI equality checked when supplied)",
-        "gaussian_index_anchor_sha256": model_index_anchor_sha,
+        "gaussian_count_source": (
+            "model_manifest (CLI equality checked when supplied)"
+            if not metric_only
+            else None
+        ),
+        "gaussian_index_anchor_sha256": model_index_anchor_sha or None,
         "scsp_set": {
             "count": len(scsp_set.indices),
             "path": scsp_set.path,
@@ -2154,8 +2501,10 @@ def evaluate(
         "mean_abs_error_m",
         "median_abs_error_m",
         "signed_bias_m",
-        "front_auc_normalized",
-        "agreement_auc_normalized",
+        "behind_rate",
+        "front_auc_log_0p25_20m",
+        "front_auc_linear_legacy",
+        "agreement_auc_linear_legacy",
     ]
     with (out_dir / "depth_metrics.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
@@ -2175,14 +2524,38 @@ def evaluate(
                 "mean_abs_error_m",
                 "median_abs_error_m",
                 "signed_bias_m",
-                "front_auc_normalized",
-                "agreement_auc_normalized",
+                "behind_rate",
+                "front_auc_log_0p25_20m",
+                "front_auc_linear_legacy",
+                "agreement_auc_linear_legacy",
             ]
         )
         writer.writerows(group_csv_rows)
 
     summary_payload = {
-        "protocol": "formal-multi-depth-definition-and-top1-responsibility-v2",
+        "protocol": (
+            FORMAL_GEOMETRY_PROTOCOL
+            if evaluation_mode == "formal"
+            else "legacy-custom-multi-depth-definition-v1"
+        ),
+        "protocol_sha256": (
+            FORMAL_GEOMETRY_PROTOCOL_SHA256
+            if evaluation_mode == "formal"
+            else None
+        ),
+        "support_policy_sha256": (
+            FORMAL_SUPPORT_POLICY_SHA256
+            if evaluation_mode == "formal"
+            else None
+        ),
+        "formal_geometry_metric_contract": formal_metric_contract,
+        "evaluation_mode": evaluation_mode,
+        "metric_only": bool(metric_only),
+        "support_mode": (
+            "finite_positive_depth_metric_only"
+            if metric_only
+            else "gaussian_accumulated_opacity"
+        ),
         "scene_name": scene_name,
         "thresholds_m": list(thresholds),
         "opacity_threshold": float(opacity_threshold),
@@ -2212,9 +2585,20 @@ def _argparser() -> argparse.ArgumentParser:
     parser.add_argument("--reference_manifest", required=True)
     parser.add_argument("--model_manifest", required=True)
     parser.add_argument("--out_dir", required=True)
+    parser.add_argument(
+        "--evaluation_mode",
+        choices=("formal", "legacy_custom"),
+        default="formal",
+        help="Formal is fail-closed; custom thresholds/linear AUC require legacy_custom.",
+    )
+    parser.add_argument(
+        "--metric_only",
+        action="store_true",
+        help="Evaluate three supplied depth maps without Gaussian responsibility arrays.",
+    )
     parser.add_argument("--thresholds_m", default=",".join(str(x) for x in DEFAULT_THRESHOLDS_M))
-    parser.add_argument("--opacity_threshold", type=float, default=0.5)
-    parser.add_argument("--depth_min", type=float, default=1e-6)
+    parser.add_argument("--opacity_threshold", type=float, default=FORMAL_OPACITY_THRESHOLD)
+    parser.add_argument("--depth_min", type=float, default=FORMAL_DEPTH_MIN_M)
     parser.add_argument("--gaussian_count", type=int, default=None)
     parser.add_argument("--scsp_indices", default="")
     parser.add_argument("--clamp20_indices", default="")
@@ -2249,6 +2633,8 @@ def main() -> None:
             else None
         ),
         cdf_max_points=int(args.cdf_max_points),
+        evaluation_mode=str(args.evaluation_mode),
+        metric_only=bool(args.metric_only),
     )
     print(f"DEPTH_DEFINITION_METRICS {Path(args.out_dir).resolve() / 'metrics_summary.json'}")
     print(f"DEPTH_DEFINITION_COUNT {len(summary['depth_definitions'])}")
