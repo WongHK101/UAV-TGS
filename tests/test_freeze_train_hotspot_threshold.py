@@ -267,6 +267,71 @@ def test_third_scene_is_train_only_deterministic_and_existing_receipt_compatible
         assert threshold == first["threshold_c"]
 
 
+def test_hold8_train_test_only_binding_is_accepted_without_nontrain_payload_reads() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        fixture = _Fixture(Path(temporary))
+
+        # Convert the legacy fixture to the Hold-8 two-partition contract.  The
+        # test payload still does not exist, proving that only train arrays are
+        # resolved/opened.
+        decode_rows = [
+            row
+            for row in (
+                json.loads(line) for line in fixture.decode_manifest.read_text().splitlines()
+            )
+            if row["pair_id"] != "guard0"
+        ]
+        protocol_rows = [
+            row
+            for row in (
+                json.loads(line) for line in fixture.decode_protocol.read_text().splitlines()
+            )
+            if row["pair_id"] != "guard0"
+        ]
+        _write_jsonl(fixture.decode_manifest, decode_rows)
+        _write_jsonl(fixture.decode_protocol, protocol_rows)
+
+        bound = json.loads(fixture.bound_split.read_text())
+        bound["records"] = [row for row in bound["records"] if row["split"] != "guard"]
+        bound["counts"] = {"total": 3, "train": 2, "test": 1}
+        bound["decode_binding"]["decode_manifest_sha256"] = sha256_file(
+            fixture.decode_manifest
+        )
+        bound["decode_binding"]["decode_protocol_sha256"] = sha256_file(
+            fixture.decode_protocol
+        )
+        _write_json(fixture.bound_split, bound)
+
+        support = json.loads(fixture.support_manifest.read_text())
+        support["files"] = [
+            row for row in support["files"] if row["pair_id"] != "guard0"
+        ]
+        _write_json(fixture.support_manifest, support)
+
+        range_payload = json.loads(fixture.range_manifest.read_text())
+        range_payload["source_split_manifest_sha256"] = sha256_file(fixture.bound_split)
+        # A Hold-8 range may omit the now-inapplicable legacy guard-role field.
+        configuration = dict(range_payload["configuration"])
+        configuration.pop("guard_role")
+        range_payload["configuration"] = configuration
+        range_basis = {
+            "scene": range_payload["scene"],
+            "split_hash": range_payload["split_hash"],
+            "configuration": configuration,
+            "Tmin": range_payload["Tmin"],
+            "Tmax": range_payload["Tmax"],
+        }
+        range_payload["range_hash"] = sha256_json(range_basis)
+        _write_json(fixture.range_manifest, range_payload)
+
+        result = freeze_train_hotspot_threshold(**fixture.kwargs())
+        assert result["source_split"] == "train"
+        assert result["test_statistics_used"] is False
+        assert result["valid_train_pixels"] == 7
+        assert not (fixture.temperature_root / "test0.npy").exists()
+        assert not (fixture.support_root / "valid_support" / "test0.npy").exists()
+
+
 @pytest.mark.parametrize("tamper", ["decode_hash", "support_membership", "range_hash", "train_membership"])
 def test_hash_and_membership_tampering_fails_closed(tamper: str) -> None:
     with tempfile.TemporaryDirectory() as temporary:
@@ -294,4 +359,3 @@ def test_hash_and_membership_tampering_fails_closed(tamper: str) -> None:
 
         with pytest.raises(ValueError, match=match):
             freeze_train_hotspot_threshold(**fixture.kwargs())
-

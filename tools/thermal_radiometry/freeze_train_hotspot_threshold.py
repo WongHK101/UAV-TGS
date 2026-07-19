@@ -4,8 +4,9 @@
 This sidecar deliberately does not depend on the OCT training binding.  It
 authenticates the formal radiometry inputs, reads only train temperature and
 valid-support arrays, and emits the threshold receipt already consumed by the
-formal hotspot evaluators.  Guard/test records are checked as manifest
-identities only; their payload paths are never resolved or opened.
+formal hotspot evaluators.  Non-train records are checked as manifest
+identities only; their payload paths are never resolved or opened.  Both the
+legacy train/guard/test protocol and Hold-8 train/test protocol are accepted.
 """
 
 from __future__ import annotations
@@ -29,6 +30,8 @@ RANGE_SCHEMA = "uav_tgs_train_only_scene_temperature_range"
 SUPPORT_SCHEMA = "uav-tgs-undistorted-temperature-v1"
 PROTOCOL_SCHEMA = "uav-tgs.radiometry-protocol.v1"
 FORMAL_SPLITS = frozenset({"train", "guard", "test"})
+HOLD8_SPLITS = frozenset({"train", "test"})
+SUPPORTED_SPLIT_SETS = frozenset({FORMAL_SPLITS, HOLD8_SPLITS})
 FORMAL_QUANTILE = 0.95
 FORMAL_HISTOGRAM_BINS = 65_536
 FORMAL_PARAMETER_KEYS = frozenset(
@@ -320,11 +323,14 @@ def _validate_inputs(
     split_by_pair = _indexed(records, "bound split")
     pair_ids = list(split_by_pair)
     split_values = [str(row.get("split", "")) for row in records]
-    if set(split_values) != FORMAL_SPLITS:
-        raise ValueError("bound split must contain train/guard/test and no other labels")
+    split_labels = frozenset(split_values)
+    if split_labels not in SUPPORTED_SPLIT_SETS:
+        raise ValueError(
+            "bound split must contain exactly train/test or train/guard/test labels"
+        )
     counts = {
         "total": len(records),
-        **{name: split_values.count(name) for name in sorted(FORMAL_SPLITS)},
+        **{name: split_values.count(name) for name in sorted(split_labels)},
     }
     if bound.get("counts") != counts:
         raise ValueError("bound split counts mismatch")
@@ -396,8 +402,11 @@ def _validate_inputs(
     configuration = range_payload.get("configuration")
     if not isinstance(configuration, Mapping):
         raise ValueError("range manifest lacks configuration")
-    if configuration.get("guard_role") != "not_read":
-        raise ValueError("formal range must not read guard")
+    guard_role = configuration.get("guard_role")
+    if split_labels == FORMAL_SPLITS and guard_role != "not_read":
+        raise ValueError("legacy formal range must not read guard")
+    if split_labels == HOLD8_SPLITS and guard_role not in (None, "not_read"):
+        raise ValueError("Hold-8 range declares an invalid guard role")
     if configuration.get("test_role") != "qa_only_not_used_for_estimation":
         raise ValueError("formal range may use test only for post-estimation QA")
     try:

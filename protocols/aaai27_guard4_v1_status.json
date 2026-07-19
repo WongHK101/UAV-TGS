@@ -1,0 +1,22 @@
+{
+  "completed": {
+    "endpoint_appearance_cost": "18/18",
+    "formal_full_metrics": "5/18",
+    "guard_geometry": "18/18"
+  },
+  "forbidden_uses": [
+    "hold8_main_table_or_macro",
+    "hold8_alias_decision",
+    "hold8_range_canonical_hotspot_or_reference_reuse",
+    "claim_of_complete_six_scene_temperature_or_hotspot_macro"
+  ],
+  "remaining_formal_evaluations_authorized": false,
+  "retained_uses": [
+    "exploratory_internal_appearance_cost_ablation",
+    "exploratory_guard_geometry_ablation",
+    "five_completed_formal_mechanism_checks",
+    "invariants_scsp_counts_and_fixed_qualitative_results"
+  ],
+  "schema": "uav-tgs-aaai27-guard4-status-v1",
+  "status": "exploratory_internal_ablation_only"
+}
