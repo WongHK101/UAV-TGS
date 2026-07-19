@@ -167,7 +167,12 @@ def _split_test_records(payload: Mapping[str, Any], expected_count: int) -> Dict
             f"split manifest counts.test must equal {expected_count}: {counts!r}"
         )
     for name, record in indexed.items():
-        _valid_sha(record.get("hash"), f"split record hash for {name}")
+        # guard4 manifests used ``hash`` while Hold-8 v2 preserves the
+        # authenticated source row as ``source_record_sha256``.  Both fields
+        # identify the immutable split member; accepting the latter changes
+        # no membership or support semantics.
+        digest = record.get("hash") or record.get("source_record_sha256")
+        _valid_sha(digest, f"split record hash for {name}")
     return indexed
 
 
@@ -357,7 +362,8 @@ def combine_formal_support(
                 {
                     "name": job["name"],
                     "split_record_hash": _valid_sha(
-                        job["split_record"].get("hash"),
+                        job["split_record"].get("hash")
+                        or job["split_record"].get("source_record_sha256"),
                         f"split record hash for {job['name']}",
                     ),
                     "shape": job["shape"],

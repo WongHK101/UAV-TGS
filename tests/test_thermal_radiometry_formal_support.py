@@ -199,6 +199,22 @@ class FormalSupportTests(unittest.TestCase):
                 self._combine(fixture, output)
             self.assertFalse(output.exists())
 
+    def test_hold8_source_record_sha_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = self._fixture(root / "sources")
+            split = json.loads(fixture["split_manifest"].read_text(encoding="utf-8"))
+            for record in split["records"]:
+                record["source_record_sha256"] = record.pop("hash")
+            fixture["split_manifest"].write_text(
+                json.dumps(split, sort_keys=True), encoding="utf-8"
+            )
+            self._combine(fixture, root / "output")
+            manifest = json.loads(
+                (root / "output" / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["summary"]["file_count"], 3)
+
     def test_exact_test_names_and_shapes_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
