@@ -10,6 +10,7 @@ import pytest
 
 from tools.baseline_evaluation_receipts import (
     ReceiptContractError,
+    canonical_json_sha256,
     finalize_study_manifest,
     validate_study_manifest,
 )
@@ -29,6 +30,13 @@ PROTOCOL_PATH = REPO_ROOT / "protocols" / "aaai27_final_experiment_protocol_v1.j
 MARKDOWN_PATH = REPO_ROOT / "protocols" / "aaai27_final_experiment_protocol_v1.md"
 INVENTORY_PATH = REPO_ROOT / "protocols" / "aaai27_final_experiment_asset_inventory_v1.json"
 STUDY_PATH = REPO_ROOT / "protocols" / "aaai27_final_study_manifest_v1.json"
+RESOURCE_POLICY_PATH = REPO_ROOT / "protocols" / "aaai27_compute_resource_policy_v1.json"
+RESOURCE_POLICY_MARKDOWN_PATH = (
+    REPO_ROOT / "protocols" / "aaai27_compute_resource_policy_v1.md"
+)
+PHASE0_APPROVAL_PATH = (
+    REPO_ROOT / "protocols" / "receipts" / "phase0_gpt_approval_receipt.json"
+)
 
 
 def _load(path: Path) -> dict:
@@ -37,6 +45,12 @@ def _load(path: Path) -> dict:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _self_hash(payload: dict, field: str) -> str:
+    material = copy.deepcopy(payload)
+    material.pop(field, None)
+    return canonical_json_sha256(material)
 
 
 def test_formal_study_manifest_binds_protocol_matrix_and_geometry() -> None:
@@ -159,15 +173,17 @@ def test_only_nine_review_gates_exist_and_external_completion_is_nonblocking() -
     assert len({gate["gate_id"] for gate in gates}) == 9
     assert all(gate["definition_status"] == "DEFINED" for gate in gates)
     assert all("status" not in gate for gate in gates)
-    assert gates[0]["runtime_status_snapshot"] == "WAITING_GPT"
+    assert gates[0]["runtime_status_snapshot"] == "APPROVED"
+    assert gates[1]["runtime_status_snapshot"] == "READY"
     assert all(
         gate["runtime_status_snapshot"] == "BLOCKED_BY_PREDECESSOR"
-        for gate in gates[1:]
+        for gate in gates[2:]
     )
     review = protocol["review_policy"]
     assert review["mandatory_review_gates_are_static_definitions"] is True
     assert review["runtime_status_authority"] == "hash_bound_gate_receipt"
-    assert review["phase0_runtime_status_snapshot"] == "WAITING_GPT"
+    assert review["phase0_runtime_status_snapshot"] == "APPROVED"
+    assert review["phase1_runtime_status_snapshot"] == "READY"
     assert review["future_gate_runtime_status_snapshot"] == "BLOCKED_BY_PREDECESSOR"
     assert [phase["phase_id"] for phase in protocol["execution_phases"]] == list(range(9))
     external_phases = protocol["execution_phases"][3:8]
@@ -179,6 +195,98 @@ def test_only_nine_review_gates_exist_and_external_completion_is_nonblocking() -
     assert contract["building_approval_required_before_remaining_five"] is True
     assert contract["six_scene_completion_package_requires_waiting_gpt"] is False
     assert protocol["review_policy"]["additional_blocking_gates_forbidden"] is True
+
+
+def test_phase0_approval_receipt_is_self_hashed_and_unlocks_only_phase1() -> None:
+    protocol = _load(PROTOCOL_PATH)
+    receipt = _load(PHASE0_APPROVAL_PATH)
+    assert receipt["protocol_id"] == protocol["protocol_id"]
+    assert receipt["approved_protocol_version"] == protocol["protocol_version"]
+    assert receipt["approved_repository_commit"] == (
+        "6090d1351cd332b9779e6747fa2ace5f94788d1e"
+    )
+    assert receipt["phase0_gate_status"] == "APPROVED"
+    assert receipt["phase1_unlocked"] is True
+    assert receipt["approval_receipt_sha256"] == _self_hash(
+        receipt, "approval_receipt_sha256"
+    )
+    amendments = {row["amendment_id"]: row for row in receipt["required_execution_amendments"]}
+    assert set(amendments) == {
+        "compute_resource_policy_v1",
+        "metric_only_geometry_path_restriction",
+    }
+    assert amendments["compute_resource_policy_v1"]["artifact_sha256"] == _sha256(
+        RESOURCE_POLICY_PATH
+    )
+    approval = protocol["phase0_approval"]
+    assert approval["receipt_sha256"] == _sha256(PHASE0_APPROVAL_PATH)
+    assert approval["approval_receipt_sha256"] == receipt["approval_receipt_sha256"]
+    assert approval["phase0_gate_status"] == "APPROVED"
+    assert approval["phase1_gate_status"] == "READY"
+    assert [gate["runtime_status_snapshot"] for gate in protocol["mandatory_review_gates"][:3]] == [
+        "APPROVED",
+        "READY",
+        "BLOCKED_BY_PREDECESSOR",
+    ]
+
+
+def test_compute_resource_policy_is_hash_bound_and_preserves_formal_protocol() -> None:
+    protocol = _load(PROTOCOL_PATH)
+    policy = _load(RESOURCE_POLICY_PATH)
+    assert policy["policy_markdown_sha256"] == _sha256(RESOURCE_POLICY_MARKDOWN_PATH)
+    assert policy["policy_payload_sha256"] == _self_hash(
+        policy, "policy_payload_sha256"
+    )
+    binding = protocol["compute_resource_policy"]
+    assert binding["sha256"] == _sha256(RESOURCE_POLICY_PATH)
+    assert binding["payload_sha256"] == policy["policy_payload_sha256"]
+    assert binding["markdown_sha256"] == _sha256(RESOURCE_POLICY_MARKDOWN_PATH)
+    assert policy["authoritative_storage"]["host"] == "900"
+    node_901 = policy["temporary_compute_nodes"][0]
+    assert node_901["host"] == "901"
+    assert node_901["isolated_project_root"] == "/root/autodl-tmp/UAV-TGS-901"
+    assert node_901["may_hold_unique_final_assets"] is False
+    assert policy["formal_job_preflight_receipt"]["required_before_start"] is True
+    assert set(policy["formal_job_preflight_receipt"]["required_fields"]) >= {
+        "execution_host",
+        "gpu_model",
+        "gpu_uuid",
+        "driver_version",
+        "cuda_version",
+        "environment_sha256",
+        "code_commit",
+        "input_hashes",
+        "available_disk_bytes",
+        "gpu_idle",
+    }
+    assert all(
+        value is False for value in policy["formal_protocol_invariants"].values()
+    )
+
+
+def test_metric_only_geometry_is_secondary_when_contributions_are_unavailable() -> None:
+    policy = _load(PROTOCOL_PATH)["formal_geometry_support_policy"]
+    assert policy["primary_path"] == "contribution_weighted"
+    assert policy["metric_only_support_definition"] == "finite_positive_depth"
+    assert policy["formal_methods_with_available_contribution_support_must_use_it"] is True
+    assert policy["silent_fallback_to_metric_only_for_adapter_convenience"] is False
+    assert policy["formal_export_priority"]["thermonerf"] == [
+        "ray_weights",
+        "accumulated_opacity",
+    ]
+    assert policy["formal_export_priority"]["selected_gaussian_splatting_methods"] == [
+        "gaussian_contribution",
+        "gaussian_alpha",
+    ]
+    action = policy["unavailable_equivalent_support_action"]
+    assert action["qualification_stage"] == "Building"
+    assert action["technical_reason_required"] is True
+    assert action["formal_geometry_status"] == [
+        "UNSUPPORTED",
+        "secondary_metric_only",
+    ]
+    assert action["include_metric_only_in_primary_contribution_based_paired_macro"] is False
+    assert policy["phase1_internal_gaussian_methods_affected"] is False
 
 
 def test_prohibited_scope_is_explicit() -> None:

@@ -236,6 +236,20 @@ equivalent. A method that cannot expose equivalent weights records the affected
 geometry diagnostics as `UNSUPPORTED`; native depth with another meaning cannot
 be relabelled as a common metric.
 
+The finite-positive-depth `metric-only` support path is retained only for
+adapter development, smoke tests, or a method that genuinely cannot export
+equivalent contribution support. Whenever a method can export alpha,
+accumulated opacity, ray weights, or Gaussian contributions, its formal
+geometry evaluation must use that contribution-weighted path. ThermoNeRF must
+prefer ray weights and accumulated opacity; selected GS methods must prefer
+Gaussian alpha/contribution. An adapter may not silently select `metric-only`
+to reduce implementation work. If equivalent contribution support is truly
+unavailable, the Building qualification records the technical reason and marks
+the affected formal geometry metrics `UNSUPPORTED` or
+`secondary_metric_only`. Such secondary results are excluded from the primary
+contribution-based paired macro. This clarification does not alter the three
+internal Gaussian methods in Phase 1.
+
 All curve CSVs contain the eight unsmoothed sample points. Figures use threshold
 in metres, preferably a logarithmic x-axis, and add no hidden samples or
 interpolation. The scalar geometry summary, when required for Pareto analysis,
@@ -363,10 +377,12 @@ There are exactly nine blocking review gates:
 
 This list is the static gate definition, not an approval receipt. Every listed
 gate has definition state `DEFINED`. Runtime state is authoritative only in a
-hash-bound gate receipt. At this Phase-0 snapshot, the Phase-0 gate is
-`WAITING_GPT`; every later gate is `BLOCKED_BY_PREDECESSOR` and cannot become
-`WAITING_GPT` until its own package is complete and all predecessor approvals
-or locally verified non-blocking completions have been recorded.
+hash-bound gate receipt. GPT approval of Phase 0 is recorded in
+`protocols/receipts/phase0_gpt_approval_receipt.json`; the current snapshots are
+Phase 0 `APPROVED`, Phase 1 `READY`, and every later gate
+`BLOCKED_BY_PREDECESSOR`. A later gate cannot become `WAITING_GPT` until its own
+package is complete and all predecessor approvals or locally verified
+non-blocking completions have been recorded.
 
 At each gate, Codex creates the specified compact review package, verifies its
 manifest, records `WAITING_GPT`, and performs no downstream gated work until an
@@ -457,6 +473,17 @@ final compact review package and enter `WAITING_GPT`. Phase 8 does not include
 paper drafting or claim writing.
 
 ### 5.1 Scheduling, resume, and failure handling
+
+The normative dual-host policy is
+`protocols/aaai27_compute_resource_policy_v1.json` (file SHA-256
+`395848efb1450bd778e26946b24baccd3b16580b139c23fa2cba45138b19424b`;
+canonical payload SHA-256
+`958ae2c8d861b30e7922fd851cd1464fef1e913af2dd50acc3ecfd5802823691`).
+Host 900 is authoritative storage. Host 901 is temporary scratch compute under
+`/root/autodl-tmp/UAV-TGS-901`; formal outputs produced there must return to
+900 and pass count, size, and SHA-256 verification before related 901 data are
+removed. The resource policy changes scheduling only and cannot change formal
+inputs or metrics.
 
 This protocol does not pre-allocate formal work to server 900 or 901. Before
 each downstream phase, the phase plan submitted to GPT identifies the concrete

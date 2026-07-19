@@ -2,7 +2,7 @@
   "schema": "uav-tgs-baseline-study-manifest-v1",
   "protocol": {
     "path": "aaai27_final_experiment_protocol_v1.json",
-    "sha256": "19cfd99edd71ce41debe7e9fca2422644d4604c26ade91f23f5c5b2f58a69ee3",
+    "sha256": "a9e14032cd74a0119ae9d5115f85a1ebde4ee74e588a1c717921d6e39e7dc31d",
     "protocol_id": "uav-tgs-aaai27-final-experiment-v1",
     "protocol_version": "1.0.0",
     "collection_hash": "c6f32a1c44f49a725a62beeb105ffb37f5de265c5b513f5d01bd303439d60832",
@@ -51,5 +51,5 @@
   "adapter_receipts": [],
   "evaluator_receipts": [],
   "alias_receipts": [],
-  "manifest_sha256": "e9ef71eb5b82d069d60a707273dadb9f780a26c43eebb060092de801002ff393"
+  "manifest_sha256": "3eabafeea3b1ddd4f5ba160273df8ef856c9d4ad3c9d1ec8f54290b91ff18554"
 }

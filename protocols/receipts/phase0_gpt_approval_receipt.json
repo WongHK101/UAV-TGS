@@ -1,0 +1,31 @@
+{
+  "schema": "uav-tgs-aaai27-gpt-gate-approval-receipt-v1",
+  "protocol_id": "uav-tgs-aaai27-final-experiment-v1",
+  "approved_protocol_version": "1.0.0",
+  "approved_repository_commit": "6090d1351cd332b9779e6747fa2ace5f94788d1e",
+  "approval_timestamp": "2026-07-19T12:28:33+08:00",
+  "approval_source": "GPT decision forwarded by the project owner",
+  "approved_protocol_identity": {
+    "json_path": "protocols/aaai27_final_experiment_protocol_v1.json",
+    "json_sha256": "19cfd99edd71ce41debe7e9fca2422644d4604c26ade91f23f5c5b2f58a69ee3",
+    "markdown_path": "protocols/aaai27_final_experiment_protocol_v1.md",
+    "markdown_sha256": "281a34ead210282fe850989db9330e63946355867e00503b72abfdeaba0c557f",
+    "collection_hash": "c6f32a1c44f49a725a62beeb105ffb37f5de265c5b513f5d01bd303439d60832"
+  },
+  "phase0_gate_status": "APPROVED",
+  "phase1_unlocked": true,
+  "required_execution_amendments": [
+    {
+      "amendment_id": "compute_resource_policy_v1",
+      "status": "REQUIRED_BEFORE_PHASE1_FORMAL_JOB",
+      "artifact": "protocols/aaai27_compute_resource_policy_v1.json",
+      "artifact_sha256": "395848efb1450bd778e26946b24baccd3b16580b139c23fa2cba45138b19424b"
+    },
+    {
+      "amendment_id": "metric_only_geometry_path_restriction",
+      "status": "REQUIRED_BEFORE_EXTERNAL_BUILDING_QUALIFICATION",
+      "rule": "formal geometry uses contribution-weighted support whenever the method can export it; metric-only finite-positive-depth support is never silently mixed into the primary contribution-based paired macro"
+    }
+  ],
+  "approval_receipt_sha256": "3382f4561e5f9cb0cb70dffac43fae7b5d5c6e2a15b1cc1172f74eba2fbc6514"
+}

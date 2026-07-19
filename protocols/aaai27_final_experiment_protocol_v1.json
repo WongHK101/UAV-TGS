@@ -8,7 +8,21 @@
   "code_commit": "258e3095b428fb56bc2103ad4a2e8a224d97786b",
   "code_commit_role": "implementation commit A frozen before protocol commit B; replace placeholder during two-commit integration",
   "protocol_markdown_path": "protocols/aaai27_final_experiment_protocol_v1.md",
-  "protocol_markdown_sha256": "281a34ead210282fe850989db9330e63946355867e00503b72abfdeaba0c557f",
+  "protocol_markdown_sha256": "7de1b28d38f0d9691b3bf52f4bafb27a6cd629467f0bf3f042a584bb3162fb51",
+  "compute_resource_policy": {
+    "path": "protocols/aaai27_compute_resource_policy_v1.json",
+    "sha256": "395848efb1450bd778e26946b24baccd3b16580b139c23fa2cba45138b19424b",
+    "payload_sha256": "958ae2c8d861b30e7922fd851cd1464fef1e913af2dd50acc3ecfd5802823691",
+    "markdown_path": "protocols/aaai27_compute_resource_policy_v1.md",
+    "markdown_sha256": "38bb40a7a4750b8d3c3c23be3675c39233f2879e0c246c68facbee03ba3ba5f0"
+  },
+  "phase0_approval": {
+    "receipt_path": "protocols/receipts/phase0_gpt_approval_receipt.json",
+    "receipt_sha256": "b85c4899a79cbbb2b243f8629bdf68fef43bc819f253bc3f4a8d7221cf97dbb1",
+    "approval_receipt_sha256": "3382f4561e5f9cb0cb70dffac43fae7b5d5c6e2a15b1cc1172f74eba2fbc6514",
+    "phase0_gate_status": "APPROVED",
+    "phase1_gate_status": "READY"
+  },
   "collection_hash": "c6f32a1c44f49a725a62beeb105ffb37f5de265c5b513f5d01bd303439d60832",
   "collection": {
     "collection_split_hash": "f23259152b46e75db32770c1bea815d0e168d8a5654c5139876bbe7ebcc3041d",
@@ -112,6 +126,28 @@
   },
   "geometry_thresholds_m": [0.25, 0.5, 1, 2, 5, 10, 15, 20],
   "depth_definitions": ["transmittance_median", "alpha_weighted_expected", "maximum_contribution_surface"],
+  "formal_geometry_support_policy": {
+    "primary_path": "contribution_weighted",
+    "metric_only_support_definition": "finite_positive_depth",
+    "metric_only_allowed_contexts": [
+      "adapter_development",
+      "smoke",
+      "method_cannot_export_equivalent_contribution_support"
+    ],
+    "formal_export_priority": {
+      "thermonerf": ["ray_weights", "accumulated_opacity"],
+      "selected_gaussian_splatting_methods": ["gaussian_contribution", "gaussian_alpha"]
+    },
+    "formal_methods_with_available_contribution_support_must_use_it": true,
+    "silent_fallback_to_metric_only_for_adapter_convenience": false,
+    "unavailable_equivalent_support_action": {
+      "qualification_stage": "Building",
+      "technical_reason_required": true,
+      "formal_geometry_status": ["UNSUPPORTED", "secondary_metric_only"],
+      "include_metric_only_in_primary_contribution_based_paired_macro": false
+    },
+    "phase1_internal_gaussian_methods_affected": false
+  },
   "geometry_reporting": {
     "full_curve_required_for_every_depth_definition": true,
     "main_table_selection_source": ["guard"],
@@ -231,8 +267,8 @@
     "external_formal_adapters_and_building_endpoints": "missing"
   },
   "mandatory_review_gates": [
-    {"gate_id": "phase0_protocol_and_assets", "after_phase": 0, "definition_status": "DEFINED", "runtime_status_snapshot": "WAITING_GPT", "approval_required_for": "phase_1"},
-    {"gate_id": "phase1_internal_representative", "after_phase": 1, "definition_status": "DEFINED", "runtime_status_snapshot": "BLOCKED_BY_PREDECESSOR", "approval_required_for": "phase_2"},
+    {"gate_id": "phase0_protocol_and_assets", "after_phase": 0, "definition_status": "DEFINED", "runtime_status_snapshot": "APPROVED", "approval_required_for": "phase_1"},
+    {"gate_id": "phase1_internal_representative", "after_phase": 1, "definition_status": "DEFINED", "runtime_status_snapshot": "READY", "approval_required_for": "phase_2"},
     {"gate_id": "phase2_primary_full11", "after_phase": 2, "definition_status": "DEFINED", "runtime_status_snapshot": "BLOCKED_BY_PREDECESSOR", "approval_required_for": "phase_3"},
     {"gate_id": "thermal3dgs_building_qualification", "within_phase": 3, "definition_status": "DEFINED", "runtime_status_snapshot": "BLOCKED_BY_PREDECESSOR", "approval_required_for": "thermal3dgs_remaining_five"},
     {"gate_id": "thermalgaussian_ommg_building_qualification", "within_phase": 4, "definition_status": "DEFINED", "runtime_status_snapshot": "BLOCKED_BY_PREDECESSOR", "approval_required_for": "thermalgaussian_ommg_remaining_five"},
@@ -246,7 +282,8 @@
     "blocking_gates_only": ["phase_0", "phase_1", "phase_2", "each_external_building_qualification", "phase_8"],
     "mandatory_review_gates_are_static_definitions": true,
     "runtime_status_authority": "hash_bound_gate_receipt",
-    "phase0_runtime_status_snapshot": "WAITING_GPT",
+    "phase0_runtime_status_snapshot": "APPROVED",
+    "phase1_runtime_status_snapshot": "READY",
     "future_gate_runtime_status_snapshot": "BLOCKED_BY_PREDECESSOR",
     "explicit_gpt_approval_receipt_required": true,
     "external_six_scene_package_is_nonblocking": true,

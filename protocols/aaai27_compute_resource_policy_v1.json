@@ -1,0 +1,120 @@
+{
+  "schema": "uav-tgs-aaai27-compute-resource-policy-v1",
+  "policy_id": "uav-tgs-aaai27-compute-resource-policy-v1",
+  "policy_version": "1.0.0",
+  "creation_timestamp": "2026-07-19T12:28:33+08:00",
+  "status": "active",
+  "authoritative_storage": {
+    "host": "900",
+    "role": "final_authoritative_storage",
+    "required_assets": [
+      "formal_endpoints",
+      "metrics",
+      "receipts",
+      "failure_evidence",
+      "critical_logs",
+      "final_archives"
+    ]
+  },
+  "temporary_compute_nodes": [
+    {
+      "host": "901",
+      "role": "temporary_revocable_scratch_compute",
+      "isolated_project_root": "/root/autodl-tmp/UAV-TGS-901",
+      "long_term_data_source": false,
+      "may_hold_unique_final_assets": false
+    }
+  ],
+  "scheduling": {
+    "preassigned_hosts": false,
+    "selection_factors": [
+      "gpu_availability",
+      "available_disk",
+      "existing_assets",
+      "data_transfer_cost",
+      "expected_runtime",
+      "environment_compatibility"
+    ],
+    "paired_internal_scene_configurations_same_host_preferred": true,
+    "same_host_preference_is_hard_constraint": false,
+    "parallel_independent_jobs_allowed": true
+  },
+  "formal_job_preflight_receipt": {
+    "required_before_start": true,
+    "required_fields": [
+      "execution_host",
+      "gpu_model",
+      "gpu_uuid",
+      "driver_version",
+      "cuda_version",
+      "environment_sha256",
+      "code_commit",
+      "input_hashes",
+      "available_disk_bytes",
+      "gpu_idle"
+    ]
+  },
+  "cross_host_reporting": {
+    "performance_metrics_comparable_under_frozen_protocol": true,
+    "training_wall_time_requires_host_receipt": true,
+    "small_cross_host_timing_differences_support_strong_claims": false
+  },
+  "transfer_and_return": {
+    "transferred_assets_require_manifest_and_sha256_before_formal_use": true,
+    "return_901_outputs_to_900_after_scene_or_job": true,
+    "return_scope": [
+      "formal_endpoints",
+      "metrics",
+      "receipts",
+      "failure_evidence",
+      "critical_logs"
+    ],
+    "verification_before_901_cleanup": [
+      "file_count",
+      "size_bytes",
+      "sha256"
+    ],
+    "final_results_only_on_901_forbidden": true
+  },
+  "disk_pressure": {
+    "pause_new_jobs": true,
+    "required_order": [
+      "return_completed_assets_to_900",
+      "verify_on_900",
+      "remove_verified_901_checkpoints_renders_caches",
+      "resume_jobs"
+    ]
+  },
+  "data_boundary": {
+    "all_901_project_files_below_isolated_root": true,
+    "credentials_forbidden": true,
+    "personal_or_unrelated_files_forbidden": true,
+    "sdk_environment_external_source_are_cleanup_scoped_assets": true
+  },
+  "project_closeout": {
+    "required_order": [
+      "return_all_remaining_formal_assets_to_900",
+      "verify_900_completeness",
+      "remove_all_project_files_inside_901_isolated_root",
+      "verify_no_path_outside_901_isolated_root_was_removed",
+      "write_901_cleanup_receipt"
+    ],
+    "cleanup_receipt": "901_cleanup_receipt.json",
+    "cleanup_receipt_fields": [
+      "cleanup_root",
+      "pre_cleanup_file_count",
+      "pre_cleanup_size_bytes",
+      "post_cleanup_check"
+    ]
+  },
+  "formal_protocol_invariants": {
+    "host_availability_may_change_formal_split": false,
+    "host_availability_may_change_recipe": false,
+    "host_availability_may_change_camera": false,
+    "host_availability_may_change_reference": false,
+    "host_availability_may_change_metric_protocol": false
+  },
+  "policy_markdown_path": "protocols/aaai27_compute_resource_policy_v1.md",
+  "policy_markdown_sha256": "38bb40a7a4750b8d3c3c23be3675c39233f2879e0c246c68facbee03ba3ba5f0",
+  "policy_payload_sha256": "958ae2c8d861b30e7922fd851cd1464fef1e913af2dd50acc3ecfd5802823691"
+}
