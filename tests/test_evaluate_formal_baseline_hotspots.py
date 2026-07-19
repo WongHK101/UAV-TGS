@@ -28,6 +28,7 @@ from tools.thermal_radiometry.palette_lut import (
 )
 from tools.thermal_radiometry.build_formal_evaluation_binding import (
     build_formal_evaluation_binding,
+    expected_split_labels,
 )
 from oct_gs.radiance import METHOD_SEMANTICS, TARGET_SEMANTICS
 
@@ -432,6 +433,13 @@ class _Fixture:
 
 
 class FormalBaselineHotspotEvaluatorTests(unittest.TestCase):
+    def test_split_labels_follow_frozen_protocol(self) -> None:
+        self.assertEqual(
+            expected_split_labels({"protocol_id": "uav-tgs-aaai27-hold8-v2"}),
+            {"train", "test"},
+        )
+        self.assertEqual(expected_split_labels({}), {"train", "guard", "test"})
+
     def test_happy_path_has_comparable_global_view_block_and_hash_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = _Fixture(Path(temporary))

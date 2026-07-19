@@ -53,6 +53,12 @@ FORMAL_QUANTILE = 0.95
 FORMAL_THRESHOLD_BINS = 65_536
 HOTSPOT_EVALUATION_BINS = 4_096
 FORMAL_SPLITS = frozenset({"train", "guard", "test"})
+
+
+def _expected_split_labels(split: Mapping[str, Any]) -> set[str]:
+    if split.get("protocol_id") == "uav-tgs-aaai27-hold8-v2":
+        return {"train", "test"}
+    return set(FORMAL_SPLITS)
 EVALUATION_SUPPORT_POLICY = {
     "expression": "valid_support AND (opacity_proxy > opacity_threshold)",
     "opacity_threshold": 0.01,
@@ -465,11 +471,15 @@ def _validate_formal_inputs(args: argparse.Namespace) -> _FormalInputs:
     split_by_pair = _indexed(split_records, "bound split")
     pair_ids = list(split_by_pair)
     split_values = [str(row.get("split", "")) for row in split_records]
-    if set(split_values) != FORMAL_SPLITS:
-        raise ValueError("bound split must contain train/guard/test and no other labels")
+    expected_splits = _expected_split_labels(split)
+    if set(split_values) != expected_splits:
+        raise ValueError(
+            "bound split labels do not match its protocol: "
+            f"expected={sorted(expected_splits)} actual={sorted(set(split_values))}"
+        )
     counts = {
         "total": len(split_records),
-        **{name: split_values.count(name) for name in sorted(FORMAL_SPLITS)},
+        **{name: split_values.count(name) for name in sorted(expected_splits)},
     }
     if split.get("counts") != counts:
         raise ValueError("bound split counts mismatch")

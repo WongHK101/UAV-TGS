@@ -43,6 +43,14 @@ from tools.evaluate_formal_baseline_hotspots import (
 from tools.thermal_radiometry.palette_lut import PALETTE_NAME, lut_sha256
 
 
+def expected_split_labels(split: Mapping[str, Any]) -> set[str]:
+    """Return the exact partition labels allowed by the frozen split protocol."""
+
+    if split.get("protocol_id") == "uav-tgs-aaai27-hold8-v2":
+        return {"train", "test"}
+    return {"train", "guard", "test"}
+
+
 def _input(path: Path) -> dict[str, Any]:
     resolved = Path(path).resolve()
     if not resolved.is_file():
@@ -88,13 +96,15 @@ def build_formal_evaluation_binding(
     split_by_pair = _indexed(records, "bound split")
     pair_ids = list(split_by_pair)
     split_values = [str(row.get("split", "")) for row in records]
-    if set(split_values) != {"train", "guard", "test"}:
-        raise ValueError("bound split must contain train/guard/test and no other labels")
+    expected_splits = expected_split_labels(split)
+    if set(split_values) != expected_splits:
+        raise ValueError(
+            "bound split labels do not match its protocol: "
+            f"expected={sorted(expected_splits)} actual={sorted(set(split_values))}"
+        )
     counts = {
         "total": len(records),
-        "train": split_values.count("train"),
-        "guard": split_values.count("guard"),
-        "test": split_values.count("test"),
+        **{name: split_values.count(name) for name in sorted(expected_splits)},
     }
     if split.get("counts") != counts:
         raise ValueError("bound split counts mismatch")

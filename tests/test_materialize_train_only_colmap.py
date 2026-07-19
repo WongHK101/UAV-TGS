@@ -35,6 +35,16 @@ def _image(
 
 
 class TrainOnlyColmapMaterializerTests(unittest.TestCase):
+    def test_empty_guard_list_is_allowed_only_when_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "guard_list.txt"
+            path.write_text("", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "guard list is empty"):
+                materializer._load_name_list(path, "guard")
+            self.assertEqual(
+                materializer._load_name_list(path, "guard", allow_empty=True), []
+            )
+
     def _fixture(self, root: Path, ext: str = ".bin") -> dict[str, Path]:
         model_root = root / "all_view" / "sparse" / "0"
         image_root = root / "all_view" / "images"
@@ -211,6 +221,25 @@ class TrainOnlyColmapMaterializerTests(unittest.TestCase):
                 manifest["source"]["selected_train_images_bundle_sha256"],
                 manifest["output"]["images_bundle_sha256"],
             )
+
+    def test_hold8_compatibility_binding_accepts_zero_guard_partition(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._fixture(Path(temporary))
+            paths["test"].write_text("0003.JPG\n0004.JPG\n", encoding="utf-8")
+            paths["guard"].write_text("", encoding="utf-8")
+            binding = json.loads(paths["binding"].read_text(encoding="utf-8"))
+            binding["counts"] = {"total": 5, "train": 3, "test": 2, "guard": 0}
+            binding["outputs"]["test_list.txt"]["sha256"] = _sha256(paths["test"])
+            binding["outputs"]["guard_list.txt"]["sha256"] = _sha256(paths["guard"])
+            paths["binding"].write_text(
+                json.dumps(binding, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            manifest = self._run(paths)
+            self.assertEqual(
+                manifest["partition"]["registered"],
+                {"train": 2, "test": 2, "guard": 0},
+            )
+            self.assertEqual(manifest["partition"]["guard_list"]["count"], 0)
 
     def test_preserves_text_model_format(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

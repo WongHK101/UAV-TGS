@@ -135,7 +135,7 @@ def _name_key(raw_name: str) -> str:
     return _portable_name(raw_name).casefold()
 
 
-def _load_name_list(path: Path, label: str) -> list[str]:
+def _load_name_list(path: Path, label: str, *, allow_empty: bool = False) -> list[str]:
     if not path.is_file():
         raise FileNotFoundError(f"{label} list not found: {path}")
     names = [
@@ -143,7 +143,7 @@ def _load_name_list(path: Path, label: str) -> list[str]:
         for line in path.read_text(encoding="utf-8-sig").splitlines()
         if line.strip()
     ]
-    if not names:
+    if not names and not allow_empty:
         raise ValueError(f"{label} list is empty: {path}")
     keys = [_name_key(name) for name in names]
     if len(keys) != len(set(keys)):
@@ -617,7 +617,7 @@ def materialize_train_only_workspace(
 
     train_names = _load_name_list(train_list_path, "train")
     test_names = _load_name_list(test_list_path, "test")
-    guard_names = _load_name_list(guard_list_path, "guard")
+    guard_names = _load_name_list(guard_list_path, "guard", allow_empty=True)
     train, test, guard, model_by_key = _validate_partition(
         images, train_names, test_names, guard_names
     )
