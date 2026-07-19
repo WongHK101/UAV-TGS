@@ -1,0 +1,400 @@
+{
+  "schema": "uav-tgs-aaai27-final-experiment-protocol-v1",
+  "protocol_id": "uav-tgs-aaai27-final-experiment-v1",
+  "version": "1.0.0",
+  "protocol_version": "1.0.0",
+  "creation_timestamp": "2026-07-19T10:15:00+08:00",
+  "status": "preregistered_fail_closed",
+  "code_commit": "258e3095b428fb56bc2103ad4a2e8a224d97786b",
+  "code_commit_role": "implementation commit A frozen before protocol commit B; replace placeholder during two-commit integration",
+  "protocol_markdown_path": "protocols/aaai27_final_experiment_protocol_v1.md",
+  "protocol_markdown_sha256": "281a34ead210282fe850989db9330e63946355867e00503b72abfdeaba0c557f",
+  "collection_hash": "c6f32a1c44f49a725a62beeb105ffb37f5de265c5b513f5d01bd303439d60832",
+  "collection": {
+    "collection_split_hash": "f23259152b46e75db32770c1bea815d0e168d8a5654c5139876bbe7ebcc3041d",
+    "formal_rule_hash": "7017ec53e5699504208f6393415c1e97fd768b924a7325d3ab9a83b1e760b82c",
+    "split_seed": "uav-tgs-aaai27-v1",
+    "block_frames": 16,
+    "guard_frames": 4,
+    "counts": {"total": 8232, "train": 6763, "guard": 445, "test": 1024},
+    "scene_count": 11,
+    "scenes": ["Building", "Garden", "InternalRoad", "Orchard", "PVpanel", "Plaza", "Road", "TransmissionTower", "Urban100K", "Urban20K", "Urban50K"],
+    "asset_inventory": {
+      "path": "protocols/aaai27_final_experiment_asset_inventory_v1.json",
+      "sha256": "d2e53587e7cc0f1af95e50f938eebee0b5f7a38039268ed74b11d8f3ad4228c9",
+      "payload_sha256": "9165ecf2aea5151872e1ac1cb19f19cd55a2e965453e246310d70f6a831969b8",
+      "generator": "tools/build_aaai27_final_asset_inventory.py"
+    }
+  },
+  "representative_scenes": ["Building", "InternalRoad", "PVpanel", "TransmissionTower", "Urban20K", "Orchard"],
+  "expansion_scenes": ["Garden", "Plaza", "Road", "Urban50K", "Urban100K"],
+  "data_use_policy": {
+    "train": ["fitting", "calibration", "diagnostic", "hotspot_threshold_selection"],
+    "guard": ["checkpoint_selection", "method_selection", "main_table_threshold_selection"],
+    "test": ["final_reporting_only"],
+    "selection_receipt_required_before_test_aggregation": true,
+    "test_tuning_forbidden": true,
+    "original_data_read_only": true,
+    "derived_outputs_isolated": true
+  },
+  "internal_methods": [
+    {
+      "method_id": "raw_f3",
+      "display_name": "Raw-F3",
+      "role": "fidelity_oriented_internal",
+      "scenes": ["Building", "InternalRoad", "PVpanel", "TransmissionTower", "Urban20K", "Orchard"],
+      "recipe": {
+        "rgb_anchor": "formal_raw_rgb_anchor",
+        "thermal_sh_degree": 3,
+        "thermal_cold_restart": true,
+        "optimizer": "fresh_adam",
+        "trainable_fields": ["f_dc", "f_rest"],
+        "frozen_fields": ["xyz", "scaling", "rotation", "opacity", "topology"],
+        "thermal_scale_clamp": false,
+        "densification": false,
+        "pruning": false
+      }
+    },
+    {
+      "method_id": "scsp_refit_f3",
+      "display_name": "SCSP-Refit+F3",
+      "role": "primary_geometry_stable_inspection_oriented",
+      "scenes": ["Building", "InternalRoad", "PVpanel", "TransmissionTower", "Urban20K", "Orchard", "Garden", "Plaza", "Road", "Urban50K", "Urban100K"],
+      "recipe": {
+        "rgb_anchor": "formal_scsp_anchor",
+        "rgb_refit": "fresh_adam_sh_only_fixed_camera_sequence",
+        "thermal_transfer": "same_strict_f3_as_raw_f3",
+        "exact_invariants": ["xyz", "scaling", "rotation", "opacity", "topology"],
+        "scene_specific_scsp_tuning": false,
+        "zero_modified_gaussians_policy": "explicit_noop_alias_to_raw_f3"
+      }
+    },
+    {
+      "method_id": "legacy_l",
+      "display_name": "Adaptive Opacity + Scale-Clamp",
+      "legacy_alias": "Legacy-L",
+      "role": "adaptive_legacy_baseline",
+      "scenes": ["Building", "InternalRoad", "PVpanel", "TransmissionTower", "Urban20K", "Orchard"],
+      "recipe": {
+        "thermal_opacity_adaptation": true,
+        "legacy_scale_clamp": true,
+        "strict_occupancy_claim": false,
+        "all_adaptation_and_clamp_effects_must_be_reported": true
+      }
+    }
+  ],
+  "external_methods": [
+    {"order": 1, "phase_id": 3, "method_id": "thermal3dgs", "display_name": "Thermal3D-GS"},
+    {"order": 2, "phase_id": 4, "method_id": "thermalgaussian_ommg", "display_name": "ThermalGaussian-OMMG"},
+    {"order": 3, "phase_id": 5, "method_id": "mmone", "display_name": "MMOne"},
+    {"order": 4, "phase_id": 6, "method_id": "thermonerf", "display_name": "ThermoNeRF"},
+    {"order": 5, "phase_id": 7, "method_id": "physir_splat", "display_name": "PhysIR-Splat"}
+  ],
+  "external_method_contract": {
+    "scenes": ["Building", "InternalRoad", "PVpanel", "TransmissionTower", "Urban20K", "Orchard"],
+    "ordered_steps": ["adapter", "building_smoke", "building_formal_full_metrics", "waiting_gpt_building_qualification", "remaining_five_formal", "six_scene_completion_package"],
+    "adapter_must_record": ["official_repository_url", "source_commit", "license", "environment", "input_conversion", "camera_mapping", "split_mapping", "output_conversion", "semantic_limitations"],
+    "adapter_input_contract": ["scene_id", "train_guard_test_lists", "formal_cameras", "canonical_rgb_thermal", "radiometry_range_lut", "method_specific_preprocessing"],
+    "adapter_execution_contract": ["official_recipe", "immutable_compatibility_patch", "command", "seed", "optimizer_scheduler", "iteration_resolution", "environment", "resume_lineage"],
+    "adapter_endpoint_contract": ["checkpoint_model_identity", "supported_render_branches", "alpha_or_ray_support", "contribution_semantics", "native_temperature_radiance_semantics", "completion_failure"],
+    "adapter_evaluation_contract": ["formal_rgb_if_supported", "formal_thermal", "alpha_support_mask", "three_depth_definitions_or_unsupported", "native_temperature_radiance_if_supported", "provenance_and_cost_receipts"],
+    "building_smoke_checks": ["formal_data_load", "camera_split_injection", "forward", "backward", "checkpoint_save", "test_view_render", "finite_outputs", "evaluator_adapter_readability"],
+    "building_smoke_is_formal_result": false,
+    "building_formal_starts_from_scratch": true,
+    "building_qualification_is_performance_gate": false,
+    "adapter_may_modify_method": false,
+    "building_approval_required_before_remaining_five": true,
+    "six_scene_completion_package_requires_waiting_gpt": false,
+    "after_six_scene_package": "proceed_to_next_external_adapter_and_building",
+    "old_protocol_results_allowed": false,
+    "single_scene_failure_policy": "record_failed_or_unsupported_and_continue_independent_scenes",
+    "method_stop_policy": "only_repeated_irreparable_signature_or_fair_adapter_proven_impossible"
+  },
+  "geometry_thresholds_m": [0.25, 0.5, 1, 2, 5, 10, 15, 20],
+  "depth_definitions": ["transmittance_median", "alpha_weighted_expected", "maximum_contribution_surface"],
+  "geometry_reporting": {
+    "full_curve_required_for_every_depth_definition": true,
+    "main_table_selection_source": ["guard"],
+    "main_table_selection_population": "six_representative_scenes_three_internal_methods_guard_only",
+    "main_table_selection_algorithm": {
+      "depth_definition": "transmittance_median",
+      "signals": ["front", "agreement"],
+      "separation_score": "mean over front/agreement of the scene-median pairwise absolute difference among the three internal methods",
+      "local_candidates_m": [0.25, 0.5, 1, 2],
+      "mid_candidates_m": [5, 10],
+      "large_candidates_m": [15, 20],
+      "required_selection": "highest separation local plus highest separation mid",
+      "optional_large_rule": "include highest-separation large threshold only when its score is at least half the maximum selected score and its guard metric vector has abs Pearson correlation below 0.95 with both selected vectors",
+      "ties": "choose_smaller_threshold",
+      "selected_count_range": [2, 3]
+    },
+    "selection_must_precede_test_aggregation": true,
+    "selection_must_precede_external_formal_test": true,
+    "uniform_guard_reference_required_for_single_selected_table_rule": true,
+    "fallback_if_uniform_guard_reference_cannot_complete_m": [1, 5, 10],
+    "guard_completeness_receipt": {
+      "required": true,
+      "scene_scope": ["Building", "InternalRoad", "PVpanel", "TransmissionTower", "Urban20K", "Orchard"],
+      "required_bindings_per_scene": ["guard_split_sha256", "camera_sha256", "reference_manifest_sha256", "reference_backend_sha256", "support_mask_sha256", "expected_guard_view_count", "validated_guard_view_count", "status", "failure_reason_if_incomplete"],
+      "complete_condition": "all_six_scenes_COMPLETE_under_one_registered_reference_protocol",
+      "complete_action": "run_guard_only_selection_algorithm",
+      "incomplete_action": "activate_fixed_fallback_1_5_10m",
+      "freeze_before_test_aggregation": true,
+      "forbidden_inputs": ["train_metrics", "test_metrics", "external_method_results"]
+    },
+    "fallback_may_read_external_test": false,
+    "all_eight_thresholds_remain_supplementary": true
+  },
+  "common_metrics": {
+    "appearance": ["rgb_psnr", "rgb_ssim", "rgb_lpips", "thermal_psnr", "thermal_ssim", "thermal_lpips"],
+    "temperature": ["mae_c", "rmse_c", "signed_bias_c", "p95_abs_error_c", "clipping_ratio", "off_lut_mean", "off_lut_p95"],
+    "geometry": ["missing_rate", "mean_error", "median_error", "signed_bias", "front_curve", "agreement_curve", "behind_curve", "front_auc_log_0p25_20m", "signed_residual_cdf", "per_block", "nadir_oblique"],
+    "hotspot": ["auprc", "iou", "precision", "recall"],
+    "efficiency": ["training_wall_time_and_scope", "peak_vram", "render_time_fps_and_resolution", "gaussian_or_model_size", "failure_cost"],
+    "invariants": ["geometry", "opacity", "topology", "camera_split_and_input_identity"]
+  },
+  "formal_endpoint_output_contract": {
+    "render_once_per_required_modality": true,
+    "reuse_render_bundle_for": ["appearance", "temperature", "hotspot", "qualitative"],
+    "single_depth_contribution_bundle_reused_for_all_thresholds_and_definitions": true,
+    "required_outputs": ["formal_rgb_if_supported", "formal_thermal", "alpha_support_mask", "ray_gaussian_contribution_or_three_depths", "native_temperature_radiance_if_supported", "model_checkpoint_provenance", "training_render_cost_receipt", "completion_failure_receipt"],
+    "hidden_retraining_or_semantically_different_second_render_for_evaluation": false
+  },
+  "provenance_contract": {
+    "training_scope": ["source_and_patch", "environment", "formal_inputs", "recipe", "random_state", "command", "resume_parent", "endpoint", "training_cost"],
+    "evaluation_scope": ["endpoint", "adapter_evaluator_version", "camera_split", "lut_range_support_mask", "reference_backend", "metric_schema", "output_hashes", "valid_counts", "finite_checks"],
+    "endpoint_reuse_scoped_fields": ["training_core", "renderer", "recipe", "optimizer_scheduler", "split_camera_range", "lut_support_mask", "evaluator_reference_protocol", "input_anchor_data"],
+    "irrelevant_changes_do_not_invalidate": ["reports", "zip_tooling", "resplat_code", "matrix_runner", "documentation"],
+    "reuse_receipt_required": true,
+    "alias_receipt_required": true
+  },
+  "aggregation_contract": {
+    "primary": "metric_specific_comparison_group_common_scene_macro",
+    "common_scene_rule": "for each named comparison group and metric use one intersection valid for every method in that group; pair_by_pair_intersections_forbidden",
+    "required_fields": ["comparison_group", "metric", "common_scene_count", "scene_list", "win_tie_loss_on_paired_scenes"],
+    "coverage_fields": ["valid_scene_count", "failed_scene_count", "unsupported_scene_count", "alias_scene_count", "failure_signatures"],
+    "secondary_available_scene_macro": {"allowed": true, "required_fields": ["metric", "n_valid", "scene_list"], "may_support_primary_win_claim": false},
+    "failed_or_unsupported_imputation": false
+  },
+  "efficiency_accounting": {
+    "include": ["post_anchor_method_training", "method_specific_preprocessing", "peak_pytorch_allocated_reserved", "parameter_or_gaussian_count", "model_size", "render_time_fps_with_resolution", "failure_cost", "completed_scene_count"],
+    "exclude_shared": ["CFR", "TSDK_decode", "common_COLMAP", "common_RGB_stage1_anchor", "OpenMVS_reference", "common_evaluation"],
+    "include_if_method_specific": ["VGGT_IR", "independent_thermal_camera_recovery", "proprietary_feature_preprocessing"],
+    "scsp_reported_cost": ["SCSP_projection", "5k_RGB_SH_only_refit", "30k_strict_F3"],
+    "scsp_noop_alias_batch_incremental_cost_may_be_zero": true,
+    "scsp_noop_alias_reported_method_cost": "equal_to_raw_f3_not_zero"
+  },
+  "phase0_asset_status": {
+    "authoritative_detail": "protocols/aaai27_final_experiment_asset_inventory_v1.json",
+    "all_11_formal_split_and_data": "present",
+    "radiometry_complete_scenes": ["Building", "InternalRoad"],
+    "radiometry_decoded_npy_only_scenes": ["Urban20K"],
+    "radiometry_incomplete_scenes": ["Garden", "Orchard", "PVpanel", "Plaza", "Road", "TransmissionTower", "Urban50K", "Urban100K"],
+    "guard_reference_verified_scenes": ["Building", "InternalRoad"],
+    "internal_formal_endpoints": {
+      "Building": ["legacy_l", "raw_f3", "scsp_refit_f3_noop_alias"],
+      "InternalRoad": ["legacy_l", "raw_f3", "scsp_refit_f3"],
+      "remaining_scenes": "missing"
+    },
+    "phase1_new_jobs": {
+      "formula": "12+2R",
+      "expanded_formula": "sum_s(3+2*r_s)=12+2R",
+      "candidate_scenes": ["PVpanel", "TransmissionTower", "Urban20K", "Orchard"],
+      "per_scene_indicator": "r_s=1 iff read-only train-side SCSP manifest modified_gaussian_count>0; otherwise r_s=0",
+      "aggregate_definition": "R=sum_s r_s",
+      "aggregate_range": [0, 4],
+      "noop_branch_jobs": ["formal_raw_rgb_anchor", "raw_f3", "legacy_l"],
+      "modified_branch_jobs": ["formal_raw_rgb_anchor", "raw_f3", "legacy_l", "scsp_rgb_sh_only_refit", "scsp_refit_f3"],
+      "estimated_range": [12, 20]
+    },
+    "phase2_new_jobs": {
+      "formula": "10+M5",
+      "expanded_formula": "sum_s(2+m_s)=10+M5",
+      "candidate_scenes": ["Garden", "Plaza", "Road", "Urban50K", "Urban100K"],
+      "per_scene_indicator": "m_s=1 iff read-only train-side SCSP manifest modified_gaussian_count>0; otherwise m_s=0",
+      "aggregate_definition": "M5=sum_s m_s",
+      "aggregate_range": [0, 5],
+      "noop_branch_jobs": ["formal_raw_rgb_anchor", "raw_f3_exact_noop_alias_source"],
+      "modified_branch_jobs": ["formal_raw_rgb_anchor", "scsp_rgb_sh_only_refit", "scsp_refit_f3"],
+      "estimated_range": [10, 15]
+    },
+    "conditional_job_resolution": {
+      "source": "read_only_train_side_SCSP_manifest",
+      "modified_condition": "modified_gaussian_count>0",
+      "preflight_receipt_required_before_each_scene_training": true,
+      "preflight_receipt_fields": ["scene", "manifest_path", "manifest_sha256", "modified_gaussian_count", "binary_indicator", "selected_job_branch"],
+      "forbidden_inputs": ["guard", "test"],
+      "rule_retuning": false
+    },
+    "phase0_package_must_mark_conditional_items_unresolved": true,
+    "external_source_snapshots": "all_five_available",
+    "external_formal_adapters_and_building_endpoints": "missing"
+  },
+  "mandatory_review_gates": [
+    {"gate_id": "phase0_protocol_and_assets", "after_phase": 0, "definition_status": "DEFINED", "runtime_status_snapshot": "WAITING_GPT", "approval_required_for": "phase_1"},
+    {"gate_id": "phase1_internal_representative", "after_phase": 1, "definition_status": "DEFINED", "runtime_status_snapshot": "BLOCKED_BY_PREDECESSOR", "approval_required_for": "phase_2"},
+    {"gate_id": "phase2_primary_full11", "after_phase": 2, "definition_status": "DEFINED", "runtime_status_snapshot": "BLOCKED_BY_PREDECESSOR", "approval_required_for": "phase_3"},
+    {"gate_id": "thermal3dgs_building_qualification", "within_phase": 3, "definition_status": "DEFINED", "runtime_status_snapshot": "BLOCKED_BY_PREDECESSOR", "approval_required_for": "thermal3dgs_remaining_five"},
+    {"gate_id": "thermalgaussian_ommg_building_qualification", "within_phase": 4, "definition_status": "DEFINED", "runtime_status_snapshot": "BLOCKED_BY_PREDECESSOR", "approval_required_for": "thermalgaussian_ommg_remaining_five"},
+    {"gate_id": "mmone_building_qualification", "within_phase": 5, "definition_status": "DEFINED", "runtime_status_snapshot": "BLOCKED_BY_PREDECESSOR", "approval_required_for": "mmone_remaining_five"},
+    {"gate_id": "thermonerf_building_qualification", "within_phase": 6, "definition_status": "DEFINED", "runtime_status_snapshot": "BLOCKED_BY_PREDECESSOR", "approval_required_for": "thermonerf_remaining_five"},
+    {"gate_id": "physir_splat_building_qualification", "within_phase": 7, "definition_status": "DEFINED", "runtime_status_snapshot": "BLOCKED_BY_PREDECESSOR", "approval_required_for": "physir_splat_remaining_five"},
+    {"gate_id": "phase8_final_audit", "after_phase": 8, "definition_status": "DEFINED", "runtime_status_snapshot": "BLOCKED_BY_PREDECESSOR", "approval_required_for": "external_review_outcome_only"}
+  ],
+  "review_policy": {
+    "blocking_gate_count": 9,
+    "blocking_gates_only": ["phase_0", "phase_1", "phase_2", "each_external_building_qualification", "phase_8"],
+    "mandatory_review_gates_are_static_definitions": true,
+    "runtime_status_authority": "hash_bound_gate_receipt",
+    "phase0_runtime_status_snapshot": "WAITING_GPT",
+    "future_gate_runtime_status_snapshot": "BLOCKED_BY_PREDECESSOR",
+    "explicit_gpt_approval_receipt_required": true,
+    "external_six_scene_package_is_nonblocking": true,
+    "additional_blocking_gates_forbidden": true,
+    "failure_or_missing_assets_must_be_exposed": true
+  },
+  "package_policy": {
+    "phase_packages": ["phase_0", "phase_1", "phase_2", "phase_8"],
+    "per_external_method": ["building_qualification_blocking", "six_scene_completion_nonblocking"],
+    "one_payload_sha_manifest_per_package": true,
+    "exclude": ["checkpoints", "datasets", "SDK", "large_render_dumps"]
+  },
+  "execution_operations": {
+    "device_allocation": "not_preallocated_to_900_or_901",
+    "per_phase_gpt_plan_required": ["concrete_device", "gpu_model_and_configuration", "runtime_stack", "expected_resource_envelope"],
+    "parallel_devices_allowed": true,
+    "parallelism_condition": "frozen_protocol_and_hardware_comparability_unchanged",
+    "device_environment_receipt_required_per_run": true,
+    "cross_device_efficiency_policy": "matched_hardware_runtime_or_mark_non_comparable",
+    "local_cpu_tasks": ["radiometry", "asset_preparation", "packaging", "eligible_evaluation"],
+    "overlap": ["gpu_training_with_cpu_preparation_or_evaluation", "gpu_evaluation_only_if_memory_isolation_is_safe_and_recorded"],
+    "cache_reuse": ["one_thermal_render_per_endpoint", "one_depth_bundle_for_all_eight_thresholds_and_three_depths"],
+    "resume": "matching_training_scoped_hashes_only_no_repeated_completed_training",
+    "failure": "record_cost_signature_last_valid_artifact_and_continue_independent_scenes",
+    "pause_conditions_only": ["data_leakage", "formal_split_CFR_reference_change_required", "multi_scene_systemic_failure", "fair_adaptation_impossible", "resource_materially_exceeds_phase0_budget", "frozen_method_definition_overturned"]
+  },
+  "audit_scope": {
+    "retain": ["scoped_split_data_radiometry_config_code_hashes", "train_guard_test_scope", "schema_index_count", "nan_inf", "frozen_field_invariants", "endpoint_and_evaluation_provenance", "original_data_read_only"],
+    "not_required": ["multiple_unzip_tool_validation", "per_scene_zip", "per_commit_status_report", "cross_platform_duplicate_file_hash", "repeated_full_repository_tests", "stop_on_small_performance_regression"]
+  },
+  "result_products": {
+    "table_1": "SCSP-Refit+F3_all_11_scenes",
+    "table_2": "all_internal_and_external_methods_metric_specific_paired_six_scene_comparison",
+    "table_3": "Raw-F3_SCSP-Refit+F3_Adaptive_Opacity_Plus_Scale-Clamp_internal_six_scene_comparison",
+    "main_geometry_figure": "paired_six_scene_macro_transmittance_median_front_and_agreement_curves",
+    "supplementary_geometry": ["behind_curves", "all_eight_threshold_values", "per_scene_curves", "expected_and_max_contribution_curves", "nadir_oblique_curves"],
+    "every_curve_has_source_csv": true,
+    "result_tree": ["endpoints", "metrics/appearance", "metrics/temperature", "metrics/hotspot", "metrics/geometry/{definition}", "efficiency", "coverage", "tables", "curves", "qualitative", "receipts"]
+  },
+  "execution_phases": [
+    {
+      "phase_id": 0,
+      "name": "protocol_collection_asset_freeze",
+      "formal_training_allowed": false,
+      "scope": ["version_protocol", "build_collection_asset_inventory", "verify_code_data_radiometry_cameras_reference_anchors_external_sources_gpu_storage_outputs"],
+      "required_plans": ["actual_internal_training_matrix", "external_building_and_remaining_five_matrix", "scoped_reuse_alias_matrix", "per_phase_device_and_parallelism_plan", "cpu_gpu_overlap", "gpu_wallclock_disk_estimates", "resume_failure_cleanup", "minimal_new_code", "tasks_not_started"],
+      "completion_gate": "phase0_protocol_and_assets"
+    },
+    {
+      "phase_id": 1,
+      "name": "internal_representative_scene_matrix",
+      "prerequisite_gate": "phase0_protocol_and_assets",
+      "methods": ["raw_f3", "scsp_refit_f3", "legacy_l"],
+      "scenes": ["Building", "InternalRoad", "PVpanel", "TransmissionTower", "Urban20K", "Orchard"],
+      "required_outputs": ["full_metrics", "invariants", "cost", "fixed_qualitative", "explicit_failures", "six_scene_guard_reference_status", "main_table_threshold_selection_or_fallback_receipt"],
+      "threshold_receipt_must_precede_external_formal_test": true,
+      "completion_gate": "phase1_internal_representative"
+    },
+    {
+      "phase_id": 2,
+      "name": "primary_method_expansion_to_all11",
+      "prerequisite_gate": "phase1_internal_representative",
+      "methods": ["scsp_refit_f3"],
+      "scenes": ["Garden", "Plaza", "Road", "Urban50K", "Urban100K"],
+      "required_outputs": ["full_metrics", "all11_primary_aggregate", "explicit_failures"],
+      "completion_gate": "phase2_primary_full11"
+    },
+    {
+      "phase_id": 3,
+      "name": "external_thermal3dgs",
+      "prerequisite_gate": "phase2_primary_full11",
+      "method": "thermal3dgs",
+      "building_gate": "thermal3dgs_building_qualification",
+      "remaining_five_after_approval": ["InternalRoad", "PVpanel", "TransmissionTower", "Urban20K", "Orchard"],
+      "six_scene_package_wait": false
+    },
+    {
+      "phase_id": 4,
+      "name": "external_thermalgaussian_ommg",
+      "prerequisite": "phase_3_six_scene_package_verified_locally",
+      "method": "thermalgaussian_ommg",
+      "building_gate": "thermalgaussian_ommg_building_qualification",
+      "remaining_five_after_approval": ["InternalRoad", "PVpanel", "TransmissionTower", "Urban20K", "Orchard"],
+      "six_scene_package_wait": false
+    },
+    {
+      "phase_id": 5,
+      "name": "external_mmone",
+      "prerequisite": "phase_4_six_scene_package_verified_locally",
+      "method": "mmone",
+      "building_gate": "mmone_building_qualification",
+      "remaining_five_after_approval": ["InternalRoad", "PVpanel", "TransmissionTower", "Urban20K", "Orchard"],
+      "six_scene_package_wait": false
+    },
+    {
+      "phase_id": 6,
+      "name": "external_thermonerf",
+      "prerequisite": "phase_5_six_scene_package_verified_locally",
+      "method": "thermonerf",
+      "building_gate": "thermonerf_building_qualification",
+      "remaining_five_after_approval": ["InternalRoad", "PVpanel", "TransmissionTower", "Urban20K", "Orchard"],
+      "six_scene_package_wait": false
+    },
+    {
+      "phase_id": 7,
+      "name": "external_physir_splat",
+      "prerequisite": "phase_6_six_scene_package_verified_locally",
+      "method": "physir_splat",
+      "building_gate": "physir_splat_building_qualification",
+      "remaining_five_after_approval": ["InternalRoad", "PVpanel", "TransmissionTower", "Urban20K", "Orchard"],
+      "six_scene_package_wait": false
+    },
+    {
+      "phase_id": 8,
+      "name": "final_aggregation_and_audit",
+      "prerequisite": "phase_7_six_scene_package_verified_locally",
+      "scope": ["complete_matrix", "provenance", "fairness", "missing_failure_rows", "metric_domains", "geometry_curves", "cost_scopes", "fixed_qualitative", "package_hashes"],
+      "paper_writing_allowed": false,
+      "completion_gate": "phase8_final_audit"
+    }
+  ],
+  "prohibited_tasks": [
+    "OCT-Scalar",
+    "OCT-Residual",
+    "OCT-GS expansion",
+    "surface-aware Resplat",
+    "any resplat variant",
+    "OGS-v1",
+    "OGS-v2",
+    "any OGS variant",
+    "new heuristics",
+    "adaptive thresholds",
+    "new method variants",
+    "parameter grids",
+    "multi-seed experiments",
+    "seed search",
+    "test-set tuning",
+    "test-based selection or fallback",
+    "MS-Splatting",
+    "paper writing",
+    "rebuttal or manuscript claim writing",
+    "formal split changes",
+    "CFR changes",
+    "radiometry target changes",
+    "camera protocol changes",
+    "reference-depth backend changes",
+    "original data mutation",
+    "unapproved external remaining-five execution",
+    "additional blocking review gates"
+  ]
+}

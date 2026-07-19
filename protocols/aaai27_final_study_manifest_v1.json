@@ -1,0 +1,55 @@
+{
+  "schema": "uav-tgs-baseline-study-manifest-v1",
+  "protocol": {
+    "path": "aaai27_final_experiment_protocol_v1.json",
+    "sha256": "19cfd99edd71ce41debe7e9fca2422644d4604c26ade91f23f5c5b2f58a69ee3",
+    "protocol_id": "uav-tgs-aaai27-final-experiment-v1",
+    "protocol_version": "1.0.0",
+    "collection_hash": "c6f32a1c44f49a725a62beeb105ffb37f5de265c5b513f5d01bd303439d60832",
+    "collection_split_hash": "f23259152b46e75db32770c1bea815d0e168d8a5654c5139876bbe7ebcc3041d",
+    "formal_rule_hash": "7017ec53e5699504208f6393415c1e97fd768b924a7325d3ab9a83b1e760b82c"
+  },
+  "matrix_contract": {
+    "matrix_id": "phase1_internal_representative",
+    "method_ids": ["raw_f3", "scsp_refit_f3", "legacy_l"],
+    "scene_ids": ["Building", "InternalRoad", "PVpanel", "TransmissionTower", "Urban20K", "Orchard"],
+    "complete_cross_product": true,
+    "expected_cell_count": 18
+  },
+  "geometry_contract": {
+    "depth_definitions": ["transmittance_median", "alpha_weighted_expected", "maximum_contribution_surface"],
+    "thresholds_m": [0.25, 0.5, 1, 2, 5, 10, 15, 20]
+  },
+  "required_metric_catalog": {
+    "appearance": ["rgb_psnr", "rgb_ssim", "rgb_lpips", "thermal_psnr", "thermal_ssim", "thermal_lpips"],
+    "temperature": ["mae_c", "rmse_c", "signed_bias_c", "p95_abs_error_c", "clipping_ratio", "off_lut_mean", "off_lut_p95"],
+    "geometry": ["missing_rate", "mean_error", "median_error", "signed_bias", "front_curve", "agreement_curve", "behind_curve", "front_auc_log_0p25_20m", "signed_residual_cdf", "per_block", "nadir_oblique"],
+    "hotspot": ["auprc", "iou", "precision", "recall"],
+    "efficiency": ["training_wall_time_and_scope", "peak_vram", "render_time_fps_and_resolution", "gaussian_or_model_size", "failure_cost"],
+    "invariants": ["geometry", "opacity", "topology", "camera_split_and_input_identity"]
+  },
+  "scenes": ["Building", "InternalRoad", "PVpanel", "TransmissionTower", "Urban20K", "Orchard"],
+  "reported_methods": [
+    {"method_id": "raw_f3", "display_name": "Raw-F3", "expected_scenes": ["Building", "InternalRoad", "PVpanel", "TransmissionTower", "Urban20K", "Orchard"]},
+    {"method_id": "scsp_refit_f3", "display_name": "SCSP-Refit+F3", "expected_scenes": ["Building", "InternalRoad", "PVpanel", "TransmissionTower", "Urban20K", "Orchard"]},
+    {"method_id": "legacy_l", "display_name": "Adaptive Opacity + Scale-Clamp", "expected_scenes": ["Building", "InternalRoad", "PVpanel", "TransmissionTower", "Urban20K", "Orchard"]}
+  ],
+  "metrics": [
+    {"metric_id": "thermal_psnr", "evaluator_id": "formal_appearance_v1", "direction": "max", "metric_definition_id": "thermal-psnr-v1", "unit": "dB", "split": "test", "aggregation": "scene_macro", "macro_aggregation": "mean", "tie_tolerance": 0.000001},
+    {"metric_id": "thermal_ssim", "evaluator_id": "formal_appearance_v1", "direction": "max", "metric_definition_id": "thermal-ssim-v1", "unit": "unitless", "split": "test", "aggregation": "scene_macro", "macro_aggregation": "mean", "tie_tolerance": 0.000001},
+    {"metric_id": "thermal_lpips", "evaluator_id": "formal_appearance_v1", "direction": "min", "metric_definition_id": "thermal-lpips-v1", "unit": "unitless", "split": "test", "aggregation": "scene_macro", "macro_aggregation": "mean", "tie_tolerance": 0.000001},
+    {"metric_id": "mae_c", "evaluator_id": "formal_temperature_v1", "direction": "min", "metric_definition_id": "tsdk-apparent-temperature-mae-v1", "unit": "C", "split": "test", "aggregation": "valid_pixel_macro", "macro_aggregation": "mean", "tie_tolerance": 0.000001},
+    {"metric_id": "rmse_c", "evaluator_id": "formal_temperature_v1", "direction": "min", "metric_definition_id": "tsdk-apparent-temperature-rmse-v1", "unit": "C", "split": "test", "aggregation": "valid_pixel_macro", "macro_aggregation": "mean", "tie_tolerance": 0.000001},
+    {"metric_id": "auprc", "evaluator_id": "formal_hotspot_v1", "direction": "max", "metric_definition_id": "train-threshold-frozen-hotspot-auprc-v1", "unit": "unitless", "split": "test", "aggregation": "valid_pixel_macro", "macro_aggregation": "mean", "tie_tolerance": 0.000001},
+    {"metric_id": "front_auc_log_0p25_20m", "evaluator_id": "formal_geometry_v1", "direction": "min", "metric_definition_id": "transmittance-median-front-log-auc-v1", "unit": "unitless", "split": "test", "aggregation": "scene_macro", "macro_aggregation": "median", "tie_tolerance": 0.000001, "depth_definition": "transmittance_median"},
+    {"metric_id": "median_error", "evaluator_id": "formal_geometry_v1", "direction": "min", "metric_definition_id": "transmittance-median-depth-median-absolute-error-v1", "unit": "m", "split": "test", "aggregation": "valid_pixel_macro", "macro_aggregation": "median", "tie_tolerance": 0.000001, "depth_definition": "transmittance_median"},
+    {"metric_id": "missing_rate", "evaluator_id": "formal_geometry_v1", "direction": "min", "metric_definition_id": "transmittance-median-missing-rate-v1", "unit": "unitless", "split": "test", "aggregation": "valid_pixel_macro", "macro_aggregation": "median", "tie_tolerance": 0.000001, "depth_definition": "transmittance_median"}
+  ],
+  "comparisons": [
+    {"comparison_id": "phase1_internal_all_three", "method_ids": ["raw_f3", "scsp_refit_f3", "legacy_l"], "baseline_method_id": "raw_f3"}
+  ],
+  "adapter_receipts": [],
+  "evaluator_receipts": [],
+  "alias_receipts": [],
+  "manifest_sha256": "e9ef71eb5b82d069d60a707273dadb9f780a26c43eebb060092de801002ff393"
+}

@@ -1,0 +1,301 @@
+{
+  "schema": "uav-tgs-aaai27-final-asset-inventory-v1",
+  "protocol_id": "uav-tgs-aaai27-final-experiment-v1",
+  "protocol_version": "1.0.0",
+  "creation_timestamp": "2026-07-19T10:15:00+08:00",
+  "collection": {
+    "collection_hash": "c6f32a1c44f49a725a62beeb105ffb37f5de265c5b513f5d01bd303439d60832",
+    "collection_split_hash": "f23259152b46e75db32770c1bea815d0e168d8a5654c5139876bbe7ebcc3041d",
+    "formal_rule_hash": "7017ec53e5699504208f6393415c1e97fd768b924a7325d3ab9a83b1e760b82c",
+    "counts": {
+      "total": 8232,
+      "train": 6763,
+      "guard": 445,
+      "test": 1024
+    },
+    "scene_count": 11,
+    "manifest": {
+      "relative_path": "collection_manifest.json",
+      "size_bytes": 27310,
+      "sha256": "3acb3b183179ab360caa19df5cea733851d61363f1e20f783a019fa044adab0c"
+    },
+    "validation_status": "passed"
+  },
+  "scene_inventory": [
+    {
+      "scene": "Building",
+      "role": "representative",
+      "counts": {"total": 614, "train": 498, "guard": 36, "test": 80},
+      "input_records_hash": "6401724ea60e13f07de05edd659de358593c2c4d273361248b8cec9f9d9e7800",
+      "selected_test_blocks_hash": "c7df3f353ba30b0c85c8cad813fe9073b50a87fda152707ec1be3767d546ec04",
+      "split_hash": "98b837fdfd4e6c2e12a1bc321e561f77bbc9804d3d758c1a7681559d5479d3e9",
+      "manifest": {"relative_path": "scenes/Building.split.json", "size_bytes": 792792, "sha256": "b453f3fedd7c48257ea074d941a8f32bb3dff8341af3a0f5f7a72576c1443785"}
+    },
+    {
+      "scene": "Garden",
+      "role": "expansion",
+      "counts": {"total": 656, "train": 540, "guard": 36, "test": 80},
+      "input_records_hash": "a0f8db331a282bab8fc5449788b267789a8f731551927cd29fe7b5a9d16bf4ab",
+      "selected_test_blocks_hash": "dc481113f06807e5d06aeb4d08623aa7a6d9d9511c8f1c083ff440935d3059ee",
+      "split_hash": "ffd05b696cbaf6a3578511c2348f011847c2394aaac38dd2cad1368d924edbbc",
+      "manifest": {"relative_path": "scenes/Garden.split.json", "size_bytes": 841356, "sha256": "694e7af3d67b9edfa2ccd58a27def79f4d48f097de9ed65507fe68c1419b4880"}
+    },
+    {
+      "scene": "InternalRoad",
+      "role": "representative",
+      "counts": {"total": 559, "train": 470, "guard": 25, "test": 64},
+      "input_records_hash": "80f757e40bb267a9f082628c4ad560b69a04d6ff3e3f3ce304e2c3482c9002d8",
+      "selected_test_blocks_hash": "5b59810a0f9ac18033bdf0ee0eecb50289832012dbac2e03980cca767111bf23",
+      "split_hash": "9bbf98bd953ba7fc196b24c734202318ec33733019eb567ca3e480a1ce02b905",
+      "manifest": {"relative_path": "scenes/InternalRoad.split.json", "size_bytes": 731078, "sha256": "bc562bcde5771424331fc31cbaa01fa1f5a8729687eacd82ee2e9c87efb868b0"}
+    },
+    {
+      "scene": "Orchard",
+      "role": "representative",
+      "counts": {"total": 588, "train": 472, "guard": 36, "test": 80},
+      "input_records_hash": "3410d7a436c13cc0e8e9d781c7a403c0c339dfb31cfe0a451530612eee50cc42",
+      "selected_test_blocks_hash": "bad24e0b0543d7c2380a57bae9bebae83bfa36705c9952b0abd41aec00d44b5a",
+      "split_hash": "8d7a3eb0288e68a948eebae36050c271e8205f741cff6d8eb424a5fdacc0dfcb",
+      "manifest": {"relative_path": "scenes/Orchard.split.json", "size_bytes": 759179, "sha256": "8e26e6b73e4a146e7a78f0a2af9731b5f5fe59771512455b4400724e2f78b929"}
+    },
+    {
+      "scene": "PVpanel",
+      "role": "representative",
+      "counts": {"total": 289, "train": 245, "guard": 12, "test": 32},
+      "input_records_hash": "7727e16a3ecc6dccd5c68a528d6885d57ec829cf4f3effa299afaeddbb2922d7",
+      "selected_test_blocks_hash": "7a4e12fa52a298a1d595e0c758b2ad5a6edf75cd343d2415f47e24817eafd2c2",
+      "split_hash": "1240e01a58d562073a89a2bb0ed4c67aebc3a69b94fce4f362edf949f1bc5cfe",
+      "manifest": {"relative_path": "scenes/PVpanel.split.json", "size_bytes": 378676, "sha256": "2ccd59d9a53bae7af0a1661c33f080dea47c4018aae1936efc5a5fc98d88150d"}
+    },
+    {
+      "scene": "Plaza",
+      "role": "expansion",
+      "counts": {"total": 668, "train": 560, "guard": 28, "test": 80},
+      "input_records_hash": "5cb2c9df7f4861f198d326e9f7d6848afedf02ffa64dfbf7a899ae598f52ee28",
+      "selected_test_blocks_hash": "f0e66b89508d35faab0e253ff5a9c1b8e87032ca5b99cea07d6d9e35c15a5ded",
+      "split_hash": "e1c1b4700af158fd38aa62665701415ba8f098a1c0e67857d25cdf56f9e65ca3",
+      "manifest": {"relative_path": "scenes/Plaza.split.json", "size_bytes": 853455, "sha256": "0149b3d48decd857d1e9a2f23a4cfe59019f5c137cb9dab6ac6d9567e4e60d24"}
+    },
+    {
+      "scene": "Road",
+      "role": "expansion",
+      "counts": {"total": 467, "train": 379, "guard": 24, "test": 64},
+      "input_records_hash": "eeac07aae203367ca6f72ff1d56255daae703c28b80c105584f3d4d050fef7bb",
+      "selected_test_blocks_hash": "2c8934c7473dc31e64053fcebbc6f83a132bddd242542912206220b2097d7bcf",
+      "split_hash": "05511d7774c0e7a982ee38567553a1809091038270c69f6a0a420fdf5848a52f",
+      "manifest": {"relative_path": "scenes/Road.split.json", "size_bytes": 598591, "sha256": "7a64158891c90ed8980079d0723e29c7da74582109b7473fbba3e2fdc62355b5"}
+    },
+    {
+      "scene": "TransmissionTower",
+      "role": "representative",
+      "counts": {"total": 673, "train": 553, "guard": 40, "test": 80},
+      "input_records_hash": "56790334765cbd633d1c05ae284fa49fcd4c9e4191993aac6066a5e03626297e",
+      "selected_test_blocks_hash": "43eed0fa097b6b990287aabb3e434e13a46d07a6abee9c8f72cbcff437129b22",
+      "split_hash": "60e372cccd7e47e3bfecbd7f1f0e311de9ba16d8e0b340913f2eb1297bde6b18",
+      "manifest": {"relative_path": "scenes/TransmissionTower.split.json", "size_bytes": 892698, "sha256": "f20dd672f51250f10e39d3689ec61d55f6eadcf39a7789ca764f5c0a86149932"}
+    },
+    {
+      "scene": "Urban100K",
+      "role": "expansion",
+      "counts": {"total": 1671, "train": 1379, "guard": 84, "test": 208},
+      "input_records_hash": "10cbd9ba9117e5d015c7d25821383887698ea4ddc46fb1e7e9242cb0cef83de0",
+      "selected_test_blocks_hash": "3943485494ce9433a33514e34e251d9218191d3d93a93fc6433d57f27b48996e",
+      "split_hash": "bc1902ebf35ebe4af2f64cb54adf009afda0bc0b12a7ee59b4123b4f01a3e655",
+      "manifest": {"relative_path": "scenes/Urban100K.split.json", "size_bytes": 2153710, "sha256": "afddfed470c3d327c749991b880187c2892111a431a964277f31025f7477039c"}
+    },
+    {
+      "scene": "Urban20K",
+      "role": "representative",
+      "counts": {"total": 748, "train": 604, "guard": 48, "test": 96},
+      "input_records_hash": "8dea8426fabbdbed82d5eb3d259807fdcdad0672e4ae9c0a98fbb67d56af752f",
+      "selected_test_blocks_hash": "02af39db16ff39cab9fc0f11f82b08feca59609f0a1406c2c9c38019db0fd42c",
+      "split_hash": "26088133deb30a86d1c86ea076e786e00d531e3852a0961d728645ec48df0f0f",
+      "manifest": {"relative_path": "scenes/Urban20K.split.json", "size_bytes": 965317, "sha256": "781b0f769e30df1a384dda9af12ac7be42ff632ee2e162352e10bc94ac9634f3"}
+    },
+    {
+      "scene": "Urban50K",
+      "role": "expansion",
+      "counts": {"total": 1299, "train": 1063, "guard": 76, "test": 160},
+      "input_records_hash": "c07d25f6704a06952080fd1049060efb23ad5e13f993687ec6bdfc2f2de3a7ad",
+      "selected_test_blocks_hash": "5d1f30d7fdf6453731cf2e61debc4cc6e7f0dfd43920dbaef854448a132c55ac",
+      "split_hash": "478cf0426c948fa873eed831c72c72f5ca6b99a92848bef841c68c4fde85e513",
+      "manifest": {"relative_path": "scenes/Urban50K.split.json", "size_bytes": 1670993, "sha256": "13f87fcd69ff69ed2a25a72a115ac31e2b549e4ccaf1250d3913878f63a667b5"}
+    }
+  ],
+  "phase0_availability_snapshot": {
+    "snapshot_timestamp": "2026-07-19T10:15:00+08:00",
+    "snapshot_semantics": "versioned declaration from the local/900 Phase-0 audit; runtime assets must still be bound by scoped hashes before execution",
+    "source_snapshot_manifest": {
+      "project_relative_path": "staging_archives/repository_manifest.json",
+      "sha256": "53d593a94adc57e114ea442be6ce9ddd4f10c3f2bb12f9e7dea5ccc963adbb3a"
+    },
+    "scene_assets": {
+      "formal_split_and_dataset_present": ["Building", "Garden", "InternalRoad", "Orchard", "PVpanel", "Plaza", "Road", "TransmissionTower", "Urban100K", "Urban20K", "Urban50K"],
+      "radiometry_complete": ["Building", "InternalRoad"],
+      "radiometry_decoded_temperature_npy_only": ["Urban20K"],
+      "radiometry_incomplete": ["Garden", "Orchard", "PVpanel", "Plaza", "Road", "TransmissionTower", "Urban100K", "Urban50K"],
+      "guard_and_reference_verified": ["Building", "InternalRoad"],
+      "guard_and_reference_not_verified": ["Garden", "Orchard", "PVpanel", "Plaza", "Road", "TransmissionTower", "Urban100K", "Urban20K", "Urban50K"]
+    },
+    "internal_formal_endpoints": {
+      "Building": {
+        "raw_f3": "present",
+        "scsp_refit_f3": "present_noop_alias_to_raw_f3",
+        "legacy_l": "present"
+      },
+      "InternalRoad": {
+        "raw_f3": "present",
+        "scsp_refit_f3": "present",
+        "legacy_l": "present"
+      },
+      "missing_scenes": ["Garden", "Orchard", "PVpanel", "Plaza", "Road", "TransmissionTower", "Urban100K", "Urban20K", "Urban50K"]
+    },
+    "planned_new_training_jobs": {
+      "phase_1": {
+        "formula": "12+2R",
+        "expanded_formula": "sum_s(3+2*r_s)=12+2R",
+        "candidate_scenes": ["PVpanel", "TransmissionTower", "Urban20K", "Orchard"],
+        "per_scene_indicator": "r_s=1 iff read-only train-side SCSP manifest modified_gaussian_count>0; otherwise r_s=0",
+        "aggregate_definition": "R=sum_s r_s",
+        "aggregate_range": [0, 4],
+        "noop_branch_jobs": ["formal_raw_rgb_anchor", "raw_f3", "legacy_l"],
+        "modified_branch_jobs": ["formal_raw_rgb_anchor", "raw_f3", "legacy_l", "scsp_rgb_sh_only_refit", "scsp_refit_f3"],
+        "estimated_range": [12, 20],
+        "note": "R is the number of the four missing representative scenes whose read-only train-side SCSP manifest reports modified_gaussian_count>0; R is unresolved in Phase 0 and each indicator is fixed before scene training without reading guard/test data or retuning the rule"
+      },
+      "phase_2": {
+        "formula": "10+M5",
+        "expanded_formula": "sum_s(2+m_s)=10+M5",
+        "candidate_scenes": ["Garden", "Plaza", "Road", "Urban50K", "Urban100K"],
+        "per_scene_indicator": "m_s=1 iff read-only train-side SCSP manifest modified_gaussian_count>0; otherwise m_s=0",
+        "aggregate_definition": "M5=sum_s m_s",
+        "aggregate_range": [0, 5],
+        "noop_branch_jobs": ["formal_raw_rgb_anchor", "raw_f3_exact_noop_alias_source"],
+        "modified_branch_jobs": ["formal_raw_rgb_anchor", "scsp_rgb_sh_only_refit", "scsp_refit_f3"],
+        "estimated_range": [10, 15],
+        "note": "M5 is the number of the five expansion scenes whose read-only train-side SCSP manifest reports modified_gaussian_count>0; M5 is unresolved in Phase 0 and each indicator is fixed before scene training without reading guard/test data or retuning the rule"
+      }
+    },
+    "external_sources": [
+      {
+        "method": "Thermal3D-GS",
+        "official_repository": "https://github.com/mzzcdf/Thermal3DGS",
+        "source_commit": "03366b2a350ac5db6690dfd7fca51a56ba9e89a7",
+        "archive_sha256": "16dcf734912b43c5492fa23bfa6c39066f4e4f7a2dc1596b5e7a395d0e51c68",
+        "declared_environment": "python=3.7.13,pytorch=1.12.1,cudatoolkit=11.6",
+        "dependency_state": "source snapshot materialized",
+        "adapter_risk": "legacy CUDA/PyTorch stack requires an isolated Blackwell compatibility build; formal shared-camera injection and contribution-equivalent depth export remain unimplemented",
+        "source_snapshot_status": "available",
+        "formal_adapter_status": "missing",
+        "formal_building_endpoint_status": "missing"
+      },
+      {
+        "method": "ThermalGaussian-OMMG",
+        "official_repository": "https://github.com/chen-hangyu/Thermal-Gaussian-main",
+        "source_branch": "OMMG",
+        "source_commit": "5d3243ac444ba48215d6ea2391a68163b94267f9",
+        "archive_sha256": "9a9c6d2b723a600c18e85101dd069eb46c620f69f2c5ee04dda4bdeb2ea03af0",
+        "declared_environment": "python=3.7.13,pytorch=1.12.1,cudatoolkit=11.6",
+        "dependency_state": "OMMG rasterizer source materialized; must remain isolated from the API-incompatible main branch",
+        "adapter_risk": "legacy stack and custom rasterizer need an isolated compatibility build; modality-Gaussian contributions must be mapped to the common depth definitions without substituting another branch",
+        "source_snapshot_status": "available",
+        "formal_adapter_status": "missing",
+        "formal_building_endpoint_status": "missing"
+      },
+      {
+        "method": "MMOne",
+        "official_repository": "https://github.com/Neal2020GitHub/MMOne",
+        "source_commit": "f49fc4e7a1fb6d6444ba5a75b176e9b6cbcca901",
+        "archive_sha256": "91b465c2d265b02ebd800179821119ae9f84fe3647361c6293ada7a5c4aeb793",
+        "declared_environment": "python=3.7.16,pytorch=1.12.1,cudatoolkit=11.6",
+        "dependency_state": "repository-owned rasterizers and GLM sources materialized",
+        "adapter_risk": "the official stack predates Blackwell; only mechanical compatibility patches are allowed, and shared versus thermal-density geometry must retain the official decomposition/densification semantics",
+        "source_snapshot_status": "available",
+        "formal_adapter_status": "missing",
+        "formal_building_endpoint_status": "missing"
+      },
+      {
+        "method": "ThermoNeRF",
+        "official_repository": "https://github.com/Schindler-EPFL-Lab/thermo-nerf",
+        "source_commit": "3f163c1454338bdf81af3a629c25c61443f01121",
+        "archive_sha256": "842b6d6387d6ec3888f53b5571cd48c5cec763b03d783e906ebc47a824b027e5",
+        "declared_environment": "python>=3.10,nerfstudio>=1.1.5,mlflow>=2.11.1",
+        "dependency_state": "source snapshot materialized; optional FLIR extractor is absent and is not required for prepared inputs; tiny-cuda-nn v2.0 recursive snapshot is available",
+        "adapter_risk": "formal camera injection must disable camera optimization/test-pose refinement, and ray weights must export equivalent median/expected/maximum-contribution depth",
+        "source_snapshot_status": "available",
+        "formal_adapter_status": "missing",
+        "formal_building_endpoint_status": "missing"
+      },
+      {
+        "method": "PhysIR-Splat",
+        "official_repository": "https://github.com/JingyuanGao0919/physir-splat",
+        "source_commit": "f4d440073cb89ec7bc757909080c7b713089f7cc",
+        "archive_sha256": "6f3d892f04e940b4e242484dd461f30a9cd0b56058009c6df5b05f6a26f9fc8f",
+        "declared_environment": "torch=1.13.1,torchvision=0.14.1 (upstream requirements)",
+        "dependency_state": "missing upstream GLM gitlink completed with g-truc/glm@5c46b9c07008ae65cb81ab79cd677ecc1934b903 and recorded provenance",
+        "adapter_risk": "the full physical renderer and VGGT-IR path must be verified rather than free thermal SH; physical input semantics and method-specific preprocessing cost require explicit receipts",
+        "source_snapshot_status": "available",
+        "formal_adapter_status": "missing",
+        "formal_building_endpoint_status": "missing"
+      }
+    ]
+  },
+  "logical_asset_requirements": [
+    {
+      "asset_class": "formal_split_and_binding",
+      "required_for": ["all_formal_runs"],
+      "required_items_per_scene": ["scene split manifest", "bound_split.json", "binding_manifest.json", "train/guard/test lists and hashes"],
+      "mutation_policy": "immutable"
+    },
+    {
+      "asset_class": "canonical_rgb_thermal_inputs",
+      "required_for": ["all_methods"],
+      "required_items_per_scene": ["CFR RGB observations", "canonical Hot-Iron lossless PNG observations", "float32 Celsius targets", "radiometry protocol/range/LUT identities"],
+      "mutation_policy": "read_only"
+    },
+    {
+      "asset_class": "formal_cameras_and_reference_depth",
+      "required_for": ["all_metrics"],
+      "required_items_per_scene": ["formal camera manifest", "native-camera binding", "reference-depth manifest and valid masks", "expected/median/max-contribution render adapters"],
+      "mutation_policy": "immutable"
+    },
+    {
+      "asset_class": "internal_method_anchors",
+      "required_for": ["phase_1", "phase_2"],
+      "required_items_per_scene": ["formal raw RGB anchor", "SCSP manifest/anchor or no-op alias proof", "fixed RGB-refit camera sequence", "strict F3 recipe and invariant audit", "legacy adaptive opacity/scale-clamp recipe for representative scenes"],
+      "mutation_policy": "inputs_read_only_outputs_isolated"
+    },
+    {
+      "asset_class": "external_method_adapter",
+      "required_for": ["phase_3", "phase_4", "phase_5", "phase_6", "phase_7"],
+      "required_items_per_method": ["official repository URL and exact commit", "license and environment receipt", "adapter source/tests/manifest", "Building smoke receipt", "Building full-metric qualification package"],
+      "mutation_policy": "adapter_only_no_method_retuning"
+    },
+    {
+      "asset_class": "formal_run_outputs",
+      "required_for": ["phase_1_through_phase_8"],
+      "required_items_per_endpoint": ["command and provenance manifest", "completion or failure receipt", "appearance/temperature/geometry/hotspot metrics", "efficiency receipt", "fixed qualitative views"],
+      "mutation_policy": "isolated_append_only"
+    }
+  ],
+  "method_scene_matrix": {
+    "internal": {
+      "Raw-F3": ["Building", "InternalRoad", "PVpanel", "TransmissionTower", "Urban20K", "Orchard"],
+      "SCSP-Refit+F3": ["Building", "InternalRoad", "PVpanel", "TransmissionTower", "Urban20K", "Orchard", "Garden", "Plaza", "Road", "Urban50K", "Urban100K"],
+      "Adaptive Opacity + Scale-Clamp": ["Building", "InternalRoad", "PVpanel", "TransmissionTower", "Urban20K", "Orchard"]
+    },
+    "external": {
+      "Thermal3D-GS": ["Building", "InternalRoad", "PVpanel", "TransmissionTower", "Urban20K", "Orchard"],
+      "ThermalGaussian-OMMG": ["Building", "InternalRoad", "PVpanel", "TransmissionTower", "Urban20K", "Orchard"],
+      "MMOne": ["Building", "InternalRoad", "PVpanel", "TransmissionTower", "Urban20K", "Orchard"],
+      "ThermoNeRF": ["Building", "InternalRoad", "PVpanel", "TransmissionTower", "Urban20K", "Orchard"],
+      "PhysIR-Splat": ["Building", "InternalRoad", "PVpanel", "TransmissionTower", "Urban20K", "Orchard"]
+    }
+  },
+  "path_policy": {
+    "machine_absolute_paths_recorded": false,
+    "manifest_paths_relative_to_collection_root": true,
+    "runtime_inventory_must_bind_absolute_assets_by_sha256": true
+  },
+  "inventory_payload_sha256": "9165ecf2aea5151872e1ac1cb19f19cd55a2e965453e246310d70f6a831969b8"
+}
