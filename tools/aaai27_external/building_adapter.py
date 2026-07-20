@@ -300,7 +300,7 @@ def materialize(
         raise ValueError("Building collection cardinality mismatch")
 
     for name in all_names:
-        if not (rgb_dir / name).is_file():
+        if method != "thermal3dgs" and not (rgb_dir / name).is_file():
             raise FileNotFoundError(rgb_dir / name)
         _thermal_source(thermal_dir, name)
 
