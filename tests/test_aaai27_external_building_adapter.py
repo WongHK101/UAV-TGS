@@ -37,6 +37,25 @@ def test_colmap_pose_is_finite_and_flips_axes() -> None:
     ]
 
 
+def test_compact_colmap_images_preserves_headers_and_drops_points(tmp_path: Path) -> None:
+    source = tmp_path / "images.txt"
+    output = tmp_path / "compact.txt"
+    source.write_text(
+        "# Image list\n"
+        "1 1 0 0 0 0 0 0 1 0001.JPG\n"
+        "10 20 3 30 40 -1\n"
+        "2 1 0 0 0 1 0 0 1 0002.JPG\n"
+        "50 60 4\n",
+        encoding="utf-8",
+    )
+    assert mod._write_compact_colmap_images(source, output) == 2
+    assert output.read_text(encoding="utf-8") == (
+        "# Image list\n"
+        "1 1 0 0 0 0 0 0 1 0001.JPG\n\n"
+        "2 1 0 0 0 1 0 0 1 0002.JPG\n\n"
+    )
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Windows test host has no symlink privilege")
 def test_thermal_alias_preserves_png_bytes(tmp_path: Path) -> None:
     source = tmp_path / "canonical" / "0001.png"

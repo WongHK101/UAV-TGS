@@ -90,6 +90,53 @@ def _link_tree(target: Path, link: Path) -> None:
     link.symlink_to(os.path.relpath(target, start=link.parent), target_is_directory=True)
 
 
+def _write_compact_colmap_images(source: Path, output: Path) -> int:
+    """Drop unused 2D observations while preserving every formal pose record."""
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    count = 0
+    expect_image = True
+    with source.open("r", encoding="utf-8") as reader, output.open(
+        "w", encoding="utf-8", newline="\n"
+    ) as writer:
+        for raw in reader:
+            stripped = raw.strip()
+            if not stripped or stripped.startswith("#"):
+                if stripped.startswith("#"):
+                    writer.write(stripped + "\n")
+                continue
+            if expect_image:
+                fields = stripped.split()
+                if len(fields) < 10:
+                    raise ValueError(f"malformed COLMAP image record: {stripped[:120]}")
+                writer.write(stripped + "\n")
+                count += 1
+                expect_image = False
+            else:
+                # The official GS text loader accepts an empty POINTS2D line.
+                writer.write("\n")
+                expect_image = True
+    if not expect_image:
+        raise ValueError("COLMAP images.txt ended before its POINTS2D record")
+    if count == 0:
+        raise ValueError(f"no COLMAP image records in {source}")
+    return count
+
+
+def _materialize_compact_sparse(source: Path, output: Path) -> dict[str, object]:
+    target = output / "sparse" / "0"
+    target.mkdir(parents=True, exist_ok=True)
+    _relative_symlink(source / "cameras.txt", target / "cameras.txt")
+    _relative_symlink(source / "points3D.ply", target / "points3D.ply")
+    count = _write_compact_colmap_images(source / "images.txt", target / "images.txt")
+    return {
+        "policy": "formal_pose_records_with_points2D_observations_omitted",
+        "image_record_count": count,
+        "compact_images_txt_sha256": sha256_file(target / "images.txt"),
+        "compact_images_txt_size_bytes": (target / "images.txt").stat().st_size,
+    }
+
+
 def _thermal_source(thermal_dir: Path, rgb_name: str) -> Path:
     candidates = (
         thermal_dir / f"{Path(rgb_name).stem}.png",
@@ -267,15 +314,16 @@ def materialize(
         shutil.rmtree(output)
     output.mkdir(parents=True)
 
+    compact_sparse = None
     if method in {"thermalgaussian_ommg", "physir_splat"}:
-        _link_tree(sparse_dir, output / "sparse" / "0")
+        compact_sparse = _materialize_compact_sparse(sparse_dir, output)
         _materialize_split_dirs(output, rgb_dir, thermal_dir, train, test)
     elif method == "thermal3dgs":
-        _link_tree(sparse_dir, output / "sparse" / "0")
+        compact_sparse = _materialize_compact_sparse(sparse_dir, output)
         for name in all_names:
             _relative_symlink(_thermal_source(thermal_dir, name), output / "images" / name)
     elif method == "mmone":
-        _link_tree(sparse_dir, output / "sparse" / "0")
+        compact_sparse = _materialize_compact_sparse(sparse_dir, output)
         for name in all_names:
             _relative_symlink(rgb_dir / name, output / "images" / name)
             thermal_alias = f"{Path(name).stem}.jpg"
@@ -335,6 +383,7 @@ def materialize(
         "train_names": list(train),
         "test_names": list(test),
         "source_hashes": source_hashes,
+        "sparse_adapter": compact_sparse,
     }
     manifest["manifest_sha256"] = canonical_json_sha256(manifest)
     (output / "adapter_manifest.json").write_text(
@@ -366,4 +415,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
