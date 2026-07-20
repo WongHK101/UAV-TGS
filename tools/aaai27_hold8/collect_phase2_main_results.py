@@ -189,16 +189,59 @@ def summarize(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+def validate_scene_record(row: Mapping[str, Any], scene: str) -> dict[str, Any]:
+    """Validate a portable, already-evaluated scene row before aggregation.
+
+    This permits a scratch host to retain its large endpoint while the
+    authoritative host receives only the metrics, receipts and endpoint hash.
+    """
+    if row.get("scene") != scene or row.get("method") != METHOD:
+        raise ValueError(f"portable scene record identity mismatch: {scene}")
+    if set(METRIC_DIRECTIONS).difference(row):
+        missing = sorted(set(METRIC_DIRECTIONS).difference(row))
+        raise ValueError(f"portable scene record missing metrics for {scene}: {missing}")
+    for metric in METRIC_DIRECTIONS:
+        finite(row[metric], f"{scene}/{metric}")
+    for field in (
+        "reported_method_wall_time_s", "batch_execution_wall_time_s", "peak_vram_bytes",
+        "gaussian_count", "model_size_bytes", "render_fps", "scsp_modified_count",
+    ):
+        finite(row[field], f"{scene}/{field}")
+    endpoint_sha = str(row.get("endpoint_sha256", ""))
+    manifest_sha = str(row.get("scsp_manifest_sha256", ""))
+    if len(endpoint_sha) != 64 or len(manifest_sha) != 64:
+        raise ValueError(f"portable scene record hash invalid: {scene}")
+    alias = bool(row.get("alias_raw_f3"))
+    if alias != (int(row["scsp_modified_count"]) == 0):
+        raise ValueError(f"portable scene record alias mismatch: {scene}")
+    return dict(row)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--scene-record-dir", type=Path)
+    parser.add_argument("--export-scene", choices=SCENES)
     args = parser.parse_args()
     output = args.output_root.resolve()
     if output.exists():
         raise FileExistsError(output)
     output.mkdir(parents=True)
-    rows = [collect_scene(args.root.resolve(), scene) for scene in SCENES]
+    if args.export_scene:
+        row = collect_scene(args.root.resolve(), args.export_scene)
+        target = output / f"{args.export_scene}.json"
+        target.write_text(json.dumps(row, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(json.dumps({"status": "complete", "scene": args.export_scene, "output": str(target)}, sort_keys=True))
+        return
+    record_dir = args.scene_record_dir.resolve() if args.scene_record_dir else None
+    rows = []
+    for scene in SCENES:
+        record_path = record_dir / f"{scene}.json" if record_dir else None
+        if record_path is not None and record_path.is_file():
+            rows.append(validate_scene_record(load(record_path), scene))
+        else:
+            rows.append(collect_scene(args.root.resolve(), scene))
     summary = summarize(rows)
     (output / "eleven_scene_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     fields = sorted({key for row in rows for key in row}, key=lambda key: (key not in {"scene", "method"}, key))

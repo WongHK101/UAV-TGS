@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from tools.aaai27_hold8.collect_phase2_main_results import resolve_cost, summarize
+from tools.aaai27_hold8.collect_phase2_main_results import resolve_cost, summarize, validate_scene_record
 
 
 def _write(path: Path, value: dict) -> None:
@@ -38,3 +38,26 @@ def test_phase2_noop_alias_inherits_raw_cost(tmp_path: Path) -> None:
 def test_phase2_summary_requires_all_scenes() -> None:
     with pytest.raises(ValueError, match="completeness"):
         summarize([])
+
+
+def test_portable_scene_record_keeps_endpoint_hash_without_endpoint_file() -> None:
+    row = {
+        "scene": "Plaza",
+        "method": "scsp_refit_f3",
+        "alias_raw_f3": False,
+        "scsp_modified_count": 2,
+        "endpoint_sha256": "a" * 64,
+        "scsp_manifest_sha256": "b" * 64,
+        "reported_method_wall_time_s": 10,
+        "batch_execution_wall_time_s": 10,
+        "peak_vram_bytes": 20,
+        "gaussian_count": 30,
+        "model_size_bytes": 40,
+        "render_fps": 50,
+    }
+    from tools.aaai27_hold8.collect_phase2_main_results import METRIC_DIRECTIONS
+
+    row.update({name: 1.0 for name in METRIC_DIRECTIONS})
+    assert validate_scene_record(row, "Plaza")["endpoint_sha256"] == "a" * 64
+    with pytest.raises(ValueError, match="identity"):
+        validate_scene_record(row, "Urban50K")
