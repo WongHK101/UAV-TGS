@@ -288,6 +288,25 @@ def _camera_intrinsics(camera: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _rescale_intrinsics(
+    intrinsics: dict[str, object], width: int, height: int
+) -> dict[str, object]:
+    result = dict(intrinsics)
+    source_width = int(result["w"])
+    source_height = int(result["h"])
+    if source_width <= 0 or source_height <= 0 or width <= 0 or height <= 0:
+        raise ValueError("camera and image dimensions must be positive")
+    scale_x = width / source_width
+    scale_y = height / source_height
+    for key in ("fl_x", "cx"):
+        result[key] = float(result[key]) * scale_x
+    for key in ("fl_y", "cy"):
+        result[key] = float(result[key]) * scale_y
+    result["w"] = width
+    result["h"] = height
+    return result
+
+
 def _materialize_split_dirs(
     output: Path,
     rgb_dir: Path,
@@ -372,6 +391,11 @@ def materialize(
                 raise KeyError(f"formal COLMAP image missing: {name}")
             record = images[name]
             camera = cameras[int(record["camera_id"])]
+            adapted_width, adapted_height = _write_thermonerf_thermal(
+                _thermal_source(thermal_dir, name),
+                rgb_dir / name,
+                output / "thermal" / f"{Path(name).stem}.png",
+            )
             frame = {
                 "file_path": f"images/{name}",
                 "thermal_file_path": f"thermal/{Path(name).stem}.png",
@@ -379,14 +403,13 @@ def materialize(
                     record["qvec"], record["tvec"]
                 ),
             }
-            frame.update(_camera_intrinsics(camera))
+            frame.update(
+                _rescale_intrinsics(
+                    _camera_intrinsics(camera), adapted_width, adapted_height
+                )
+            )
             frames.append(frame)
             _relative_symlink(rgb_dir / name, output / "images" / name)
-            _write_thermonerf_thermal(
-                _thermal_source(thermal_dir, name),
-                rgb_dir / name,
-                output / "thermal" / f"{Path(name).stem}.png",
-            )
         transforms = {
             "frames": frames,
             "train_filenames": [f"images/{name}" for name in train],

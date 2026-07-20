@@ -37,6 +37,27 @@ def test_colmap_pose_is_finite_and_flips_axes() -> None:
     ]
 
 
+def test_intrinsics_rescale_to_paired_raster() -> None:
+    original = {
+        "fl_x": 100.0,
+        "fl_y": 120.0,
+        "cx": 50.0,
+        "cy": 40.0,
+        "w": 200,
+        "h": 100,
+    }
+    adapted = mod._rescale_intrinsics(original, 400, 300)
+    assert adapted == {
+        "fl_x": 200.0,
+        "fl_y": 360.0,
+        "cx": 100.0,
+        "cy": 120.0,
+        "w": 400,
+        "h": 300,
+    }
+    assert original["w"] == 200
+
+
 def test_compact_colmap_images_preserves_headers_and_drops_points(tmp_path: Path) -> None:
     source = tmp_path / "images.txt"
     output = tmp_path / "compact.txt"
