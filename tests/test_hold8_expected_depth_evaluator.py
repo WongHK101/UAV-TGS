@@ -18,6 +18,7 @@ from tools.hold8_expected_depth_evaluator import (
     evaluate_manifests,
     expected_depth_from_arrays,
     geometry_na_receipt,
+    _validate_authoritative_split,
 )
 
 
@@ -245,6 +246,48 @@ class Hold8ExpectedDepthManifestTests(unittest.TestCase):
             },
         )
         return reference_manifest, model_manifest, collection_manifest, split_manifest
+
+    def test_bound_split_validates_against_frozen_source_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "Building.source.json"
+            payload = {
+                "protocol_id": "uav-tgs-aaai27-hold8-v2",
+                "scene": "Building",
+                "collection_hash": "1" * 64,
+                "split_hash": "3" * 64,
+                "hashes": {"test_list_sha256": hashlib.sha256(b"000\n").hexdigest()},
+                "records": [
+                    {"pair_id": "000", "zero_based_sorted_index": 0, "split": "test"}
+                ],
+            }
+            _write_json(source, payload)
+            collection = root / "collection.json"
+            _write_json(
+                collection,
+                {
+                    "protocol_id": "uav-tgs-aaai27-hold8-v2",
+                    "collection_hash": "1" * 64,
+                    "collection_split_hash": "2" * 64,
+                    "scenes": [
+                        {
+                            "scene": "Building",
+                            "split_hash": "3" * 64,
+                            "manifest_sha256": _sha256(source),
+                        }
+                    ],
+                },
+            )
+            bound = root / "Building.bound.json"
+            _write_json(bound, {**payload, "hold8_source_manifest_sha256": _sha256(source)})
+
+            binding, test_ids = _validate_authoritative_split(
+                collection_manifest_path=collection,
+                scene_split_manifest_path=bound,
+                scene_name="Building",
+            )
+            self.assertEqual(test_ids, ["000"])
+            self.assertEqual(binding["scene_split_manifest_sha256"], _sha256(bound))
 
     def test_end_to_end_is_expected_only_without_auc_or_behind(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

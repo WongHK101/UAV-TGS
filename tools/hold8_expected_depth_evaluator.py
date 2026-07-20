@@ -348,9 +348,22 @@ def _validate_authoritative_split(
         raise ValueError("Collection must contain exactly one matching scene")
     scene_entry = scene_entries[0]
     scene_manifest_sha = _sha256(scene_split_manifest_path)
-    if scene_manifest_sha != _require_sha256(
+    collection_scene_sha = _require_sha256(
         scene_entry.get("manifest_sha256"), "Collection scene manifest_sha256"
-    ):
+    )
+    # Radiometry binding preserves the frozen scene split as provenance while
+    # adding resolved temperature/camera paths to a new bound manifest.  The
+    # collection therefore identifies the frozen source manifest, not the
+    # byte-different bound copy used by evaluators.
+    source_scene_sha = scene_split.get("hold8_source_manifest_sha256")
+    if source_scene_sha is None:
+        source_scene_sha = scene_split.get("formal_source_manifest_sha256")
+    compared_scene_sha = (
+        _require_sha256(source_scene_sha, "Bound scene source manifest SHA-256")
+        if source_scene_sha is not None
+        else scene_manifest_sha
+    )
+    if compared_scene_sha != collection_scene_sha:
         raise ValueError("Collection/scene manifest SHA mismatch")
     if scene_entry.get("split_hash") != scene_split.get("split_hash"):
         raise ValueError("Collection/scene split_hash mismatch")
