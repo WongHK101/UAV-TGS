@@ -120,8 +120,30 @@ if [[ ! -f "$BINDING" ]]; then
     > "$LOG_ROOT/radiometry_binding.log" 2>&1
 fi
 
-RENDERS="$MODEL/test/ours_${ITERATION}/renders"
-test -d "$RENDERS"
+FULLRES_MODEL="$EVAL_ROOT/protocol/full_resolution_render_model"
+FULLRES_PLY="$FULLRES_MODEL/point_cloud/iteration_${ITERATION}/point_cloud.ply"
+if [[ ! -f "$FULLRES_PLY" ]]; then
+  mkdir -p "$(dirname "$FULLRES_PLY")"
+  ln "$MODEL/point_cloud/iteration_${ITERATION}/point_cloud.ply" "$FULLRES_PLY"
+fi
+for metadata in cfg_args cameras.json exposure.json; do
+  if [[ -f "$MODEL/$metadata" && ! -f "$FULLRES_MODEL/$metadata" ]]; then
+    cp -a "$MODEL/$metadata" "$FULLRES_MODEL/$metadata"
+  fi
+done
+test -f "$FULLRES_MODEL/cfg_args"
+FULLRES_RENDERS="$FULLRES_MODEL/test/ours_${ITERATION}/renders"
+if [[ ! -d "$FULLRES_RENDERS" ]]; then
+  "$PY" render.py -s "$THERMAL" --images images -m "$FULLRES_MODEL" -r 1 --eval \
+    --train_list "$RUNTIME/thermal_train_list.txt" --test_list "$RUNTIME/thermal_test_list.txt" \
+    --train_list_sha256 "$(sha "$RUNTIME/thermal_train_list.txt")" \
+    --test_list_sha256 "$(sha "$RUNTIME/thermal_test_list.txt")" \
+    --iteration "$ITERATION" --skip_train --save_by_image_name \
+    > "$LOG_ROOT/full_resolution_thermal_render.log" 2>&1
+fi
+test "$(find "$FULLRES_RENDERS" -maxdepth 1 -type f -name '*.png' | wc -l)" \
+  -eq "$(wc -l < "$RUNTIME/thermal_test_list.txt")"
+RENDERS="$FULLRES_RENDERS"
 "$PY" tools/thermal_radiometry/evaluate_temperature.py \
   --ground-truth-root "$TEMP_UD/temperature_c" --render-root "$RENDERS" \
   --report "$EVAL_ROOT/temperature/test.json" --range-manifest "$RANGE" \
