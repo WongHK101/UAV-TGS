@@ -43,3 +43,26 @@ def test_sequence_binding_and_gt_identity(tmp_path: Path) -> None:
     assert value["raw_gt_verified_pixel_exact"] is True
     assert (tmp_path / "bound" / "test" / "ours_formal" / "renders" / "0001.png").is_symlink()
 
+
+def test_official_pil_default_resize_verification(tmp_path: Path) -> None:
+    formal = tmp_path / "formal.png"
+    raw = tmp_path / "raw.png"
+    image = Image.new("RGB", (7, 5), (20, 40, 60))
+    image.putpixel((3, 2), (200, 100, 10))
+    image.save(formal)
+    image.resize((9, 6)).save(raw)
+    drift, formal_resolution, raw_resolution = mod._verify_raw_gt(
+        raw, formal, "pil-default-resize-to-raw"
+    )
+    assert drift == 0
+    assert formal_resolution == (7, 5)
+    assert raw_resolution == (9, 6)
+
+
+def test_resize_verification_rejects_unrelated_gt(tmp_path: Path) -> None:
+    formal = tmp_path / "formal.png"
+    raw = tmp_path / "raw.png"
+    Image.new("RGB", (7, 5), (20, 40, 60)).save(formal)
+    Image.new("RGB", (9, 6), (21, 40, 60)).save(raw)
+    with pytest.raises(ValueError, match="raw/formal GT mismatch"):
+        mod._verify_raw_gt(raw, formal, "pil-default-resize-to-raw")
