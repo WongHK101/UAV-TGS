@@ -118,3 +118,25 @@ def test_right_half_policy_rejects_nonpaired_width(tmp_path: Path) -> None:
             (3, 2),
             "right-half-to-formal",
         )
+
+
+def test_parser_accepts_method_specific_render_glob() -> None:
+    args = mod.build_parser().parse_args(
+        [
+            "--raw-render-root",
+            "renders",
+            "--raw-render-glob",
+            "thermal_*.jpg",
+            "--formal-gt-root",
+            "gt",
+            "--test-list",
+            "test.txt",
+            "--output-model-root",
+            "normalized",
+            "--method",
+            "ThermoNeRF",
+            "--modality",
+            "thermal",
+        ]
+    )
+    assert args.raw_render_glob == "thermal_*.jpg"

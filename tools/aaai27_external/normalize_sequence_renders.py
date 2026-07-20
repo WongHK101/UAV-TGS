@@ -123,6 +123,7 @@ def _normalize_render(
 def bind(
     *,
     raw_render_root: Path,
+    raw_render_glob: str = "*.png",
     formal_gt_root: Path,
     test_list: Path,
     output_model_root: Path,
@@ -134,7 +135,9 @@ def bind(
     replace: bool = False,
 ) -> dict[str, object]:
     names = read_split(test_list.resolve())
-    raw_renders = sorted(raw_render_root.resolve().glob("*.png"))
+    if not raw_render_glob.strip():
+        raise ValueError("raw render glob must be non-empty")
+    raw_renders = sorted(raw_render_root.resolve().glob(raw_render_glob))
     if len(raw_renders) != len(names):
         raise ValueError(
             f"render/test cardinality mismatch: {len(raw_renders)} != {len(names)}"
@@ -209,6 +212,7 @@ def bind(
         "method": method,
         "modality": modality,
         "mapping_rule": "official_test_iteration_order_to_natural_hold8_test_order",
+        "raw_render_glob": raw_render_glob,
         "test_list_sha256": sha256_file(test_list),
         "test_count": len(names),
         "raw_gt_verified_pixel_exact": raw_gts is not None,
@@ -233,6 +237,7 @@ def bind(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--raw-render-root", type=Path, required=True)
+    parser.add_argument("--raw-render-glob", default="*.png")
     parser.add_argument("--raw-gt-root", type=Path)
     parser.add_argument(
         "--raw-gt-policy", choices=RAW_GT_POLICIES, default="exact"
