@@ -52,7 +52,8 @@ if [[ -e "$EVAL_ROOT" ]]; then
   test -d "$EVAL_ROOT"
   mapfile -t unexpected_eval_entries < <(
     find "$EVAL_ROOT" -mindepth 1 -maxdepth 1 \
-      ! -name appearance ! -name efficiency -print
+      ! -name appearance ! -name efficiency ! -name temperature \
+      ! -name hotspot ! -name geometry ! -name protocol -print
   )
   if [[ ${#unexpected_eval_entries[@]} -ne 0 ]]; then
     printf 'unexpected pre-existing evaluation artifact: %s\n' \
