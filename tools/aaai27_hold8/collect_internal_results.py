@@ -36,6 +36,11 @@ SOURCE_HOST = {
     "PVpanel": "901",
     "TransmissionTower": "901",
     "Orchard": "901",
+    "Garden": "901",
+    "Plaza": "901",
+    "Road": "900",
+    "Urban50K": "901",
+    "Urban100K": "900",
 }
 TRAINING_CODE = (
     "train.py",
@@ -125,14 +130,17 @@ def _training_times(method: str, efficiency: Path) -> tuple[float, float, dict[s
         return stages["thermal"], float(stage["device"]["peak_torch_reserved_bytes"]), stages
     refit = _load(efficiency / "rgb_refit.json")
     f3 = _load(efficiency / "f3_train.json")
+    projection_path = efficiency / "scsp_projection.json"
+    projection = _load(projection_path) if projection_path.is_file() else None
+    projection_time = float(projection["wall_time_s"]) if projection is not None else 0.0
     stages = {
-        "scsp_projection": None,
+        "scsp_projection": projection_time if projection is not None else None,
         "rgb_refit": float(refit["wall_time_s"]),
         "thermal": float(f3["wall_time_s"]),
-        "projection_cost_note": "not independently timed; existing protocol treats it as negligible",
+        "projection_cost_status": "measured" if projection is not None else "not_recorded_phase1",
     }
     return (
-        stages["rgb_refit"] + stages["thermal"],
+        projection_time + stages["rgb_refit"] + stages["thermal"],
         max(
             float(refit["device"]["peak_torch_reserved_bytes"]),
             float(f3["device"]["peak_torch_reserved_bytes"]),

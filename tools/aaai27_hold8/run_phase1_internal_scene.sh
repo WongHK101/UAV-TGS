@@ -24,6 +24,11 @@ case "$SCENE" in
   TransmissionTower) SLUG=transmissiontower; TOTAL=673; TRAIN=588; TEST=85; DECODE_PROTO=aaai27_phase1_formal_v1 ;;
   Urban20K) SLUG=urban20k; TOTAL=748; TRAIN=654; TEST=94; DECODE_PROTO=aaai27_a3_three_scene_v1 ;;
   Orchard) SLUG=orchard; TOTAL=588; TRAIN=514; TEST=74; DECODE_PROTO=aaai27_phase1_formal_v1 ;;
+  Garden) SLUG=garden; TOTAL=656; TRAIN=574; TEST=82; DECODE_PROTO=aaai27_phase2_formal_v1 ;;
+  Plaza) SLUG=plaza; TOTAL=668; TRAIN=584; TEST=84; DECODE_PROTO=aaai27_phase2_formal_v1 ;;
+  Road) SLUG=road; TOTAL=467; TRAIN=408; TEST=59; DECODE_PROTO=aaai27_phase2_formal_v1 ;;
+  Urban50K) SLUG=urban50k; TOTAL=1299; TRAIN=1136; TEST=163; DECODE_PROTO=aaai27_phase2_formal_v1 ;;
+  Urban100K) SLUG=urban100k; TOTAL=1671; TRAIN=1462; TEST=209; DECODE_PROTO=aaai27_phase2_formal_v1 ;;
   *) echo "unsupported scene: $SCENE" >&2; exit 2 ;;
 esac
 
@@ -56,6 +61,8 @@ RGB_CKPT="$RGB_MODEL/chkpnt30000.pth"
 RGB_PLY="$RGB_MODEL/point_cloud/iteration_30000/point_cloud.ply"
 LOG_ROOT="$ROOT/logs/experiments/aaai27_hold8_v2/$SCENE"
 HEAD="$(git -C "$CODE" rev-parse HEAD)"
+COLMAP="$ROOT/tools/colmap-4.1.0-cuda12.8-ceres2.3dev-cudss0.8-sm120/bin/colmap"
+COLMAP_SHA=fd0d5597820afd3212215f61d979313fa7671a34dbdc64ef3d8398d5589cfc63
 
 sha() { sha256sum "$1" | awk '{print $1}'; }
 require_clean_code() {
@@ -98,6 +105,45 @@ verify_binding() {
   test ! -e "$BIND/guard_list.txt" -a ! -e "$BIND/thermal_guard_list.txt"
   test "$(find "$CFR/rgb" -maxdepth 1 -type f | wc -l)" -eq "$TOTAL"
   test "$(find "$TEMP_SOURCE" -maxdepth 1 -type f -name '*.npy' | wc -l)" -eq "$TOTAL"
+}
+
+prepare_shared_sfm() {
+  local source_work="$SOURCE_CANON/workspace"
+  local completion="$source_work/distorted/conversion_completion_manifest.json"
+  if [[ -f "$completion" ]]; then
+    test -f "$source_work/sparse/0/cameras.bin" \
+      -a -f "$source_work/sparse/0/images.bin" \
+      -a -f "$source_work/sparse/0/points3D.bin" \
+      -a -f "$source_work/distorted/sparse_aligned/cameras.bin" \
+      -a -f "$source_work/distorted/sparse_aligned/images.bin" \
+      -a -f "$source_work/distorted/sparse_aligned/points3D.bin"
+    return
+  fi
+  test ! -e "$SOURCE_CANON"
+  test -x "$COLMAP"
+  test "$(sha "$COLMAP")" = "$COLMAP_SHA"
+  mkdir -p "$source_work/input" "$LOG_ROOT"
+  while IFS= read -r image; do
+    ln -s "$image" "$source_work/input/$(basename "$image")"
+  done < <(find "$CFR/rgb" -maxdepth 1 -type f | sort)
+  test "$(find "$source_work/input" -maxdepth 1 -type l | wc -l)" -eq "$TOTAL"
+  cd "$CODE"
+  "$PY" convert_uavfgs.py -s "$source_work" \
+    --colmap_executable "$COLMAP" --exiftool_executable exiftool \
+    --required_colmap_version 4.1.0 --required_colmap_sha256 "$COLMAP_SHA" \
+    --database_policy reset --expected_legacy_database_sha256 "" \
+    --wgs84_code 0 --prior_position_std_m 1.0 --camera SIMPLE_RADIAL \
+    --matching spatial --matcher_args "--SpatialMatching.max_num_neighbors=80 --SpatialMatching.max_distance=500" \
+    --colmap_gpu_index 0 --sfm_mapper global --global_mapper_args "" \
+    --global_mapper_random_seed 0 --mapper_multiple_models 1 --min_model_size "$TOTAL" \
+    --init_min_num_inliers 50 --abs_pose_min_num_inliers 20 \
+    --require_cuda_colmap --require_global_mapper_cudss --use_model_aligner \
+    --model_aligner_args "--ref_is_gps=1 --alignment_type=enu --alignment_max_error=30.0" \
+    2>&1 | tee "$LOG_ROOT/shared_sfm.log"
+  test -f "$completion" \
+    -a -f "$source_work/sparse/0/cameras.bin" \
+    -a -f "$source_work/sparse/0/images.bin" \
+    -a -f "$source_work/sparse/0/points3D.bin"
 }
 
 materialize_runtime_inputs() {
@@ -204,6 +250,7 @@ PY
 
 prepare_scene() {
   verify_binding
+  prepare_shared_sfm
   if [[ -f "$DERIVED/PREPARE_STATUS" ]]; then
     test "$(tr -d '\r\n' < "$DERIVED/PREPARE_STATUS")" = passed
     materialize_runtime_inputs
@@ -354,16 +401,43 @@ run_scsp() {
   if [[ -f "$method_root/STATUS" ]]; then test "$(tr -d '\r\n' < "$method_root/STATUS")" = passed; return; fi
   test ! -e "$method_root"; mkdir -p "$method_root/logs" "$method_root/efficiency" "$method_root/protocol"
   cd "$CODE"
+  local projection_start projection_end
+  projection_start="$(date +%s.%N)"
   "$PY" tools/build_adaptive_scale_anchor.py --scene-name "$SCENE" --method scsp \
     --input-model-dir "$RGB_MODEL" --output-model-dir "$anchor" --anchor-iteration 30000 \
     --sparse-root "$WORK/sparse/0" --support-voxel-size 1.5 --support-max-voxel-radius 2 \
     --expected-checkpoint-sha256 "$(sha "$RGB_CKPT")" --expected-ply-sha256 "$(sha "$RGB_PLY")" \
     --code-commit "$HEAD" > "$method_root/logs/scsp_projection.jsonl"
+  projection_end="$(date +%s.%N)"
+  "$PY" - "$method_root/efficiency/scsp_projection.json" "$projection_start" "$projection_end" \
+    "$anchor/adaptive_scale_manifest.json" <<'PY'
+import hashlib,json,os,sys
+from datetime import datetime,timezone
+from pathlib import Path
+output,start,end,manifest=sys.argv[1:]
+manifest_path=Path(manifest)
+value={
+    'schema':'uav-tgs-scsp-projection-efficiency-v1',
+    'stage':'scsp_projection',
+    'wall_time_s':float(end)-float(start),
+    'started_epoch_s':float(start),
+    'finished_epoch_s':float(end),
+    'created_at_utc':datetime.now(timezone.utc).isoformat(),
+    'manifest_sha256':hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+}
+target=Path(output); temporary=target.with_name(target.name+f'.tmp-{os.getpid()}')
+temporary.write_text(json.dumps(value,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+os.replace(temporary,target)
+PY
   local modified; modified="$($PY -c 'import json,sys;print(json.load(open(sys.argv[1]))["counts"]["modified_gaussians"])' "$anchor/adaptive_scale_manifest.json")"
   if [[ "$modified" -eq 0 ]]; then
+    if [[ ! -f "$EXP/methods/raw_f3/endpoint.json" ]]; then
+      run_raw_or_adaptive raw_f3
+    fi
     test -f "$EXP/methods/raw_f3/endpoint.json"
     write_json_receipt "$method_root/alias_to_raw_f3.json" scsp_noop_alias passed \
-      "scsp_manifest=$anchor/adaptive_scale_manifest.json" "raw_endpoint=$EXP/methods/raw_f3/endpoint.json"
+      "scsp_manifest=$anchor/adaptive_scale_manifest.json" "raw_endpoint=$EXP/methods/raw_f3/endpoint.json" \
+      "projection_efficiency=$method_root/efficiency/scsp_projection.json"
     printf 'passed\n' > "$method_root/STATUS"; return
   fi
   local refit="$method_root/rgb_refit" sequence="$method_root/protocol/camera_sequence.json"
@@ -398,6 +472,7 @@ run_scsp() {
     "checkpoint=$model/chkpnt65000.pth" "ply=$model/point_cloud/iteration_65000/point_cloud.ply" \
     "scsp_manifest=$anchor/adaptive_scale_manifest.json" "refit_audit=$refit/rgb_appearance_refit_freeze_audit.json" \
     "results=$model/results.json" "per_view=$model/per_view.json" "audit=$method_root/endpoint_audit.json" \
+    "projection_efficiency=$method_root/efficiency/scsp_projection.json" \
     "refit_efficiency=$method_root/efficiency/rgb_refit.json" "f3_efficiency=$method_root/efficiency/f3_train.json"
   printf 'passed\n' > "$method_root/STATUS"
 }

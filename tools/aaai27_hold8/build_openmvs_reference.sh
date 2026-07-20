@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # result is evaluation-only and excluded from every method-specific cost.
 
 if [[ $# -ne 1 ]]; then
-  echo "usage: $0 Building|InternalRoad|PVpanel|TransmissionTower|Urban20K|Orchard" >&2
+  echo "usage: $0 Scene" >&2
   exit 2
 fi
 

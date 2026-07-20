@@ -16,6 +16,11 @@ case "$SCENE" in
   TransmissionTower) SLUG=transmissiontower; DECODE_PROTO=aaai27_phase1_formal_v1 ;;
   Urban20K) SLUG=urban20k; DECODE_PROTO=aaai27_a3_three_scene_v1 ;;
   Orchard) SLUG=orchard; DECODE_PROTO=aaai27_phase1_formal_v1 ;;
+  Garden) SLUG=garden; DECODE_PROTO=aaai27_phase2_formal_v1 ;;
+  Plaza) SLUG=plaza; DECODE_PROTO=aaai27_phase2_formal_v1 ;;
+  Road) SLUG=road; DECODE_PROTO=aaai27_phase2_formal_v1 ;;
+  Urban50K) SLUG=urban50k; DECODE_PROTO=aaai27_phase2_formal_v1 ;;
+  Urban100K) SLUG=urban100k; DECODE_PROTO=aaai27_phase2_formal_v1 ;;
   *) echo "unsupported scene: $SCENE" >&2; exit 2 ;;
 esac
 case "$METHOD" in raw_f3|scsp_refit_f3|adaptive_opacity_scale_clamp) ;; *) exit 2 ;; esac
