@@ -168,7 +168,9 @@ RAW_DEPTH="$EVAL_ROOT/geometry/renderer_bundle"
   --train_list_sha256 "$(sha "$RUNTIME/thermal_train_list.txt")" \
   --test_list_sha256 "$(sha "$RUNTIME/thermal_test_list.txt")" \
   --iteration "$ITERATION" --out_dir "$RAW_DEPTH" --split_label test \
-  --scene_name_override "$SCENE" --camera_frame_mode scene_test --depth_diagnostics \
+  --scene_name_override "$SCENE" --camera_frame_mode scene_test_bound \
+  --native_cameras_json "$MODEL/cameras.json" \
+  --formal_split_manifest "$BIND/bound_split.json" --depth_diagnostics \
   --appearance_modality none > "$LOG_ROOT/depth_export.log" 2>&1
 
 BOUND_DEPTH="$EVAL_ROOT/geometry/expected_depth_bundle"

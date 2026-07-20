@@ -208,14 +208,22 @@ def _normalized_stem(value: Any) -> str:
     return Path(str(value).strip().replace("\\", "/")).stem.lower()
 
 
-def _formal_records_by_stem(path: Path) -> tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+def _formal_records_by_stem(
+    path: Path,
+    *,
+    required_labels: set[str] | None = None,
+) -> tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
     payload = load_json(path)
     records = payload.get("records")
     if not isinstance(records, list):
         raise ValueError("Formal split manifest records must be a list")
     labels = {str(record.get("split", "")).strip().lower() for record in records if isinstance(record, dict)}
-    if labels != {"train", "guard", "test"}:
-        raise ValueError(f"Formal split manifest must contain train/guard/test, observed={sorted(labels)}")
+    expected_labels = required_labels or {"train", "guard", "test"}
+    if labels != expected_labels:
+        raise ValueError(
+            f"Formal split manifest labels mismatch: expected={sorted(expected_labels)} "
+            f"observed={sorted(labels)}"
+        )
     mapped: Dict[str, Dict[str, Any]] = {}
     for record in records:
         if not isinstance(record, dict):
@@ -516,39 +524,52 @@ def export_probe_bundle(
     formal_records: Dict[str, Dict[str, Any]] = {}
     formal_split_payload: Dict[str, Any] | None = None
     if depth_diagnostics:
-        if camera_frame_mode != "probe_manifest_native_align":
-            raise ValueError("Formal depth diagnostics require camera_frame_mode=probe_manifest_native_align")
-        if probe_camera_manifest_path is None or formal_split_manifest_path is None:
-            raise ValueError("Formal depth diagnostics require probe_camera_manifest and formal_split_manifest")
+        if camera_frame_mode not in {"probe_manifest_native_align", "scene_test_bound"}:
+            raise ValueError(
+                "Formal depth diagnostics require camera_frame_mode="
+                "probe_manifest_native_align or scene_test_bound"
+            )
+        if formal_split_manifest_path is None:
+            raise ValueError("Formal depth diagnostics require formal_split_manifest")
         if max_views is not None:
             raise ValueError("Formal depth diagnostics forbid max_views; all bound split views are required")
-        formal_records, formal_split_payload = _formal_records_by_stem(formal_split_manifest_path)
-        probe_binding = load_json(probe_camera_manifest_path)
-        if str(probe_binding.get("camera_manifest_type", "")) != "formal_all_split_probe_camera_manifest_v1":
-            raise ValueError("Depth diagnostics require a formal all-split probe-camera manifest")
-        bound_identity = probe_binding.get("bound_split_manifest_identity")
-        if not isinstance(bound_identity, dict) or str(bound_identity.get("sha256", "")).lower() != _sha256_file(formal_split_manifest_path):
-            raise ValueError("Probe-camera/formal-split hash binding mismatch")
+        formal_records, formal_split_payload = _formal_records_by_stem(
+            formal_split_manifest_path,
+            required_labels=(
+                {"train", "test"}
+                if camera_frame_mode == "scene_test_bound"
+                else {"train", "guard", "test"}
+            ),
+        )
         if native_cameras_json_path is None:
             raise ValueError("Formal depth diagnostics require native_cameras_json")
-        _require_file_identity(
-            native_cameras_json_path,
-            probe_binding.get("model_cameras_json_identity"),
-            label="Probe-bound model cameras.json",
-        )
-        for view in probe_binding.get("views", []):
-            if str(view.get("camera_sha256", "")).strip().lower() != _camera_sha256(view):
-                raise ValueError(f"Probe camera hash mismatch for {view.get('image_name', '')!r}")
-            if not np.isclose(float(view["cx"]), float(view["width"]) / 2.0, rtol=0.0, atol=PRINCIPAL_POINT_CENTER_TOLERANCE_PX) or not np.isclose(
-                float(view["cy"]),
-                float(view["height"]) / 2.0,
-                rtol=0.0,
-                atol=PRINCIPAL_POINT_CENTER_TOLERANCE_PX,
-            ):
-                raise ValueError(
-                    "The repository Camera/rasterizer path assumes a centered principal point; "
-                    f"probe camera {view.get('image_name', '')!r} is not centered"
-                )
+        if camera_frame_mode == "probe_manifest_native_align":
+            if probe_camera_manifest_path is None:
+                raise ValueError("probe_manifest_native_align requires probe_camera_manifest")
+            probe_binding = load_json(probe_camera_manifest_path)
+            if str(probe_binding.get("camera_manifest_type", "")) != "formal_all_split_probe_camera_manifest_v1":
+                raise ValueError("Depth diagnostics require a formal all-split probe-camera manifest")
+            bound_identity = probe_binding.get("bound_split_manifest_identity")
+            if not isinstance(bound_identity, dict) or str(bound_identity.get("sha256", "")).lower() != _sha256_file(formal_split_manifest_path):
+                raise ValueError("Probe-camera/formal-split hash binding mismatch")
+            _require_file_identity(
+                native_cameras_json_path,
+                probe_binding.get("model_cameras_json_identity"),
+                label="Probe-bound model cameras.json",
+            )
+            for view in probe_binding.get("views", []):
+                if str(view.get("camera_sha256", "")).strip().lower() != _camera_sha256(view):
+                    raise ValueError(f"Probe camera hash mismatch for {view.get('image_name', '')!r}")
+                if not np.isclose(float(view["cx"]), float(view["width"]) / 2.0, rtol=0.0, atol=PRINCIPAL_POINT_CENTER_TOLERANCE_PX) or not np.isclose(
+                    float(view["cy"]),
+                    float(view["height"]) / 2.0,
+                    rtol=0.0,
+                    atol=PRINCIPAL_POINT_CENTER_TOLERANCE_PX,
+                ):
+                    raise ValueError(
+                        "The repository Camera/rasterizer path assumes a centered principal point; "
+                        f"probe camera {view.get('image_name', '')!r} is not centered"
+                    )
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
@@ -577,7 +598,7 @@ def export_probe_bundle(
 
         strict_to_native_alignment: Dict[str, Any] | None = None
         native_camera_coverage: Dict[str, Any] | None = None
-        if camera_frame_mode == "scene_test":
+        if camera_frame_mode in {"scene_test", "scene_test_bound"}:
             views = scene.getTestCameras()
             if max_views is not None:
                 views = views[: int(max_views)]
@@ -594,8 +615,7 @@ def export_probe_bundle(
                 view_rel = Path("views") / f"{idx:05d}.npz"
                 view_path = out_dir / view_rel
                 np.savez_compressed(view_path, **arrays)
-                manifest_views.append(
-                    {
+                view_entry = {
                         "view_id": f"{idx:05d}",
                         "image_name": str(view.image_name),
                         "width": int(view.image_width),
@@ -610,7 +630,23 @@ def export_probe_bundle(
                         "npz_size_bytes": int(view_path.stat().st_size),
                         "npz_sha256": _sha256_file(view_path),
                     }
-                )
+                if camera_frame_mode == "scene_test_bound":
+                    formal_record = formal_records.get(_normalized_stem(view.image_name))
+                    if formal_record is None or str(formal_record.get("split", "")).lower() != "test":
+                        raise ValueError(
+                            "Scene test camera is absent from the bound Hold-8 test split: "
+                            f"{view.image_name!r}"
+                        )
+                    view_entry.update(
+                        {
+                            "bound_split": "test",
+                            "pair_id": str(formal_record.get("pair_id", "")),
+                            "native_camera_to_world": view_entry["camera_to_world"],
+                        }
+                    )
+                    view_entry["camera_sha256"] = _camera_sha256(view_entry)
+                    view_entry["render_camera_sha256"] = _render_camera_sha256(view_entry)
+                manifest_views.append(view_entry)
         elif camera_frame_mode == "probe_manifest_native_align":
             if probe_camera_manifest_path is None:
                 raise ValueError("probe_camera_manifest_path is required when camera_frame_mode=probe_manifest_native_align")
@@ -785,7 +821,7 @@ def export_probe_bundle(
         else:
             raise ValueError(f"Unsupported camera_frame_mode: {camera_frame_mode!r}")
 
-    if depth_diagnostics:
+    if depth_diagnostics and camera_frame_mode == "probe_manifest_native_align":
         bound_labels = {str(view.get("bound_split", "")).lower() for view in manifest_views}
         if bound_labels != {"train", "guard", "test"}:
             raise ValueError(
@@ -814,6 +850,39 @@ def export_probe_bundle(
             "guard_missing_count": len(by_split["guard"]),
             "guard_silently_reused": False,
             "probe_bound_model_cameras_json_identity_verified": True,
+            "render_camera_set_sha256": _render_camera_set_sha256(manifest_views),
+        }
+    elif depth_diagnostics and camera_frame_mode == "scene_test_bound":
+        if formal_split_payload is None or native_cameras_json_path is None:
+            raise ValueError("Bound scene-test diagnostics lack frozen split/camera inputs")
+        records = formal_split_payload.get("records", [])
+        expected_test = {
+            _normalized_stem(record.get("thermal_camera_name", record.get("pair_id", "")))
+            for record in records
+            if isinstance(record, dict) and str(record.get("split", "")).lower() == "test"
+        }
+        rendered_test = {_normalized_stem(view["image_name"]) for view in manifest_views}
+        if rendered_test != expected_test:
+            raise ValueError(
+                "Scene test cameras do not exactly cover the bound Hold-8 test split: "
+                f"missing={sorted(expected_test-rendered_test)[:8]} "
+                f"extra={sorted(rendered_test-expected_test)[:8]}"
+            )
+        expected_all = {
+            _normalized_stem(record.get("thermal_camera_name", record.get("pair_id", "")))
+            for record in records
+            if isinstance(record, dict)
+        }
+        native_names = set(load_native_camera_entries(native_cameras_json_path))
+        if native_names != expected_all:
+            raise ValueError(
+                "Model cameras.json does not exactly cover the bound Hold-8 train+test cameras"
+            )
+        native_camera_coverage = {
+            "policy": "shared model-native cameras; direct bound Hold-8 test rendering without frame alignment",
+            "counts": {"train": len(expected_all - expected_test), "test": len(expected_test)},
+            "model_cameras_json_count": len(native_names),
+            "status": "passed",
             "render_camera_set_sha256": _render_camera_set_sha256(manifest_views),
         }
 
@@ -895,8 +964,12 @@ def build_argparser() -> tuple[argparse.ArgumentParser, ModelParams, PipelinePar
     parser.add_argument(
         "--camera_frame_mode",
         default="scene_test",
-        choices=["scene_test", "probe_manifest_native_align"],
-        help="scene_test preserves baseline behavior; probe_manifest_native_align uses a strict probe manifest and aligns it into the model's native frame before rendering.",
+        choices=["scene_test", "scene_test_bound", "probe_manifest_native_align"],
+        help=(
+            "scene_test preserves baseline behavior; scene_test_bound validates direct model-native "
+            "test cameras against a no-guard Hold-8 split; probe_manifest_native_align uses an "
+            "all-split formal probe manifest aligned into the model frame."
+        ),
     )
     parser.add_argument("--probe_camera_manifest", default="")
     parser.add_argument("--native_cameras_json", default="")
