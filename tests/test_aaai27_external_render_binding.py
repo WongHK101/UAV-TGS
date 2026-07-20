@@ -66,3 +66,23 @@ def test_resize_verification_rejects_unrelated_gt(tmp_path: Path) -> None:
     Image.new("RGB", (9, 6), (21, 40, 60)).save(raw)
     with pytest.raises(ValueError, match="raw/formal GT mismatch"):
         mod._verify_raw_gt(raw, formal, "pil-default-resize-to-raw")
+
+
+def test_hotiron_gray_inverse_returns_exact_lut_colors(tmp_path: Path) -> None:
+    source = tmp_path / "gray.png"
+    output = tmp_path / "normalized.png"
+    table = mod._hotiron_grayscale_table()
+    Image.fromarray(table[[0, 64, 128, 255]][None, :], mode="L").save(source)
+    mod._normalize_render(
+        source, output, (4, 1), "hotiron-grayscale-inverse-to-formal"
+    )
+    result = mod._rgb(output)[0]
+    lut = mod.hot_iron_lut()
+    assert all(any((pixel == color).all() for color in lut) for pixel in result)
+
+
+def test_exact_render_policy_rejects_shape_mismatch(tmp_path: Path) -> None:
+    source = tmp_path / "render.png"
+    Image.new("RGB", (4, 3), (0, 0, 0)).save(source)
+    with pytest.raises(ValueError, match="render/formal resolution mismatch"):
+        mod._normalize_render(source, tmp_path / "out.png", (5, 3), "exact")

@@ -14,10 +14,16 @@ import numpy as np
 from PIL import Image
 
 from tools.aaai27_external.building_adapter import read_split, sha256_file
+from tools.thermal_radiometry.palette_lut import hot_iron_lut
 
 
 SCHEMA = "uav-tgs-aaai27-external-render-binding-v1"
 RAW_GT_POLICIES = ("exact", "pil-default-resize-to-raw")
+RENDER_POLICIES = (
+    "exact",
+    "pil-default-resize-to-formal",
+    "hotiron-grayscale-inverse-to-formal",
+)
 
 
 def _link(target: Path, link: Path) -> None:
@@ -65,6 +71,43 @@ def _verify_raw_gt(
     )
 
 
+def _hotiron_grayscale_table() -> np.ndarray:
+    """Return the uint8 luma produced by OpenCV's RGB-to-gray coefficients."""
+
+    lut = hot_iron_lut().astype(np.int32)
+    # Integer BT.601 coefficients used by OpenCV's 8-bit RGB-to-gray path.
+    return ((lut[:, 0] * 4899 + lut[:, 1] * 9617 + lut[:, 2] * 1868 + 8192) >> 14).astype(
+        np.uint8
+    )
+
+
+def _normalize_render(
+    source: Path, destination: Path, formal_resolution: tuple[int, int], policy: str
+) -> None:
+    if policy not in RENDER_POLICIES:
+        raise ValueError(f"unknown render policy: {policy}")
+    with Image.open(source) as image:
+        source_resolution = tuple(image.size)
+        if policy == "exact":
+            if source_resolution != formal_resolution:
+                raise ValueError(
+                    f"render/formal resolution mismatch under exact policy: "
+                    f"render={source_resolution}, formal={formal_resolution}"
+                )
+            _link(source, destination)
+            return
+        if policy == "pil-default-resize-to-formal":
+            normalized = image.convert("RGB").resize(formal_resolution)
+        else:
+            gray = np.asarray(image.convert("L").resize(formal_resolution), dtype=np.uint8)
+            table = _hotiron_grayscale_table().astype(np.int16)
+            distance = np.abs(gray[..., None].astype(np.int16) - table)
+            indices = np.argmin(distance, axis=-1)
+            normalized = Image.fromarray(hot_iron_lut()[indices], mode="RGB")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    normalized.save(destination, format="PNG")
+
+
 def bind(
     *,
     raw_render_root: Path,
@@ -75,6 +118,7 @@ def bind(
     modality: str,
     raw_gt_root: Path | None = None,
     raw_gt_policy: str = "exact",
+    render_policy: str = "exact",
     replace: bool = False,
 ) -> dict[str, object]:
     names = read_split(test_list.resolve())
@@ -111,21 +155,27 @@ def bind(
         formal_gt = next((path.resolve() for path in formal_candidates if path.is_file()), None)
         if formal_gt is None:
             raise FileNotFoundError(f"formal GT missing for {name}")
+        with Image.open(formal_gt) as image:
+            formal_resolution = tuple(image.size)
         output_gt = formal_gt
         if raw_gts is not None:
-            drift, formal_resolution, output_resolution = _verify_raw_gt(
+            drift, verified_formal_resolution, raw_resolution = _verify_raw_gt(
                 raw_gts[index], formal_gt, raw_gt_policy
             )
+            if verified_formal_resolution != formal_resolution:
+                raise RuntimeError("formal GT resolution changed during binding")
             max_abs_gt_drift = max(max_abs_gt_drift, drift)
             formal_gt_resolutions.add(formal_resolution)
-            output_gt_resolutions.add(output_resolution)
-            output_gt = raw_gts[index].resolve()
+            if render_policy == "exact":
+                output_gt_resolutions.add(raw_resolution)
+                output_gt = raw_gts[index].resolve()
+            else:
+                output_gt_resolutions.add(formal_resolution)
         else:
-            with Image.open(formal_gt) as image:
-                resolution = tuple(image.size)
-            formal_gt_resolutions.add(resolution)
-            output_gt_resolutions.add(resolution)
-        _link(render_path, render_output / target_name)
+            formal_gt_resolutions.add(formal_resolution)
+            output_gt_resolutions.add(formal_resolution)
+        normalized_render = render_output / target_name
+        _normalize_render(render_path, normalized_render, formal_resolution, render_policy)
         _link(output_gt, gt_output / target_name)
         rows.append(
             {
@@ -133,6 +183,7 @@ def bind(
                 "raw_index": index,
                 "raw_render_name": render_path.name,
                 "raw_render_sha256": sha256_file(render_path),
+                "normalized_render_sha256": sha256_file(normalized_render),
                 "formal_gt_name": formal_gt.name,
                 "formal_gt_sha256": sha256_file(formal_gt),
                 "output_gt_name": output_gt.name,
@@ -150,6 +201,7 @@ def bind(
         "test_count": len(names),
         "raw_gt_verified_pixel_exact": raw_gts is not None,
         "raw_gt_verification_policy": raw_gt_policy if raw_gts is not None else None,
+        "render_normalization_policy": render_policy,
         "raw_gt_max_abs_drift_u8": max_abs_gt_drift if raw_gts is not None else None,
         "formal_gt_resolutions_wh": [list(value) for value in sorted(formal_gt_resolutions)],
         "output_gt_resolutions_wh": [list(value) for value in sorted(output_gt_resolutions)],
@@ -173,6 +225,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--raw-gt-policy", choices=RAW_GT_POLICIES, default="exact"
     )
+    parser.add_argument("--render-policy", choices=RENDER_POLICIES, default="exact")
     parser.add_argument("--formal-gt-root", type=Path, required=True)
     parser.add_argument("--test-list", type=Path, required=True)
     parser.add_argument("--output-model-root", type=Path, required=True)
