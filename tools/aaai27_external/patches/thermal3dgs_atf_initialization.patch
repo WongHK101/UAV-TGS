@@ -1,0 +1,18 @@
+diff --git a/utils/ATF_utils.py b/utils/ATF_utils.py
+--- a/utils/ATF_utils.py
++++ b/utils/ATF_utils.py
+@@ -78,6 +78,14 @@ class ATFNetwork(nn.Module):
+         self.abs = nn.Linear(W, 1)
+         self.d = nn.Linear(W, 1)
+         self.sca = nn.Linear(W, 1)
++
++        # The paper specifies mu_abs=mu_sca=0 and d=1 at initialization.
++        nn.init.zeros_(self.abs.weight)
++        nn.init.zeros_(self.abs.bias)
++        nn.init.zeros_(self.sca.weight)
++        nn.init.zeros_(self.sca.bias)
++        nn.init.zeros_(self.d.weight)
++        nn.init.ones_(self.d.bias)
+ 
+ 
+ 
