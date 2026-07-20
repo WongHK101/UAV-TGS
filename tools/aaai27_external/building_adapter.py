@@ -152,6 +152,28 @@ def _thermal_source(thermal_dir: Path, rgb_name: str) -> Path:
     raise FileNotFoundError(f"canonical thermal image missing for {rgb_name}")
 
 
+def _write_thermonerf_thermal(
+    thermal_source: Path, rgb_source: Path, output: Path
+) -> tuple[int, int]:
+    """Match ThermoNeRF's grayscale loader to the paired RGB raster size."""
+
+    import cv2
+
+    thermal = cv2.imread(str(thermal_source), cv2.IMREAD_GRAYSCALE)
+    rgb = cv2.imread(str(rgb_source), cv2.IMREAD_UNCHANGED)
+    if thermal is None:
+        raise ValueError(f"failed to read thermal image: {thermal_source}")
+    if rgb is None:
+        raise ValueError(f"failed to read RGB image: {rgb_source}")
+    height, width = rgb.shape[:2]
+    if thermal.shape[:2] != (height, width):
+        thermal = cv2.resize(thermal, (width, height), interpolation=cv2.INTER_LINEAR)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(output), thermal):
+        raise OSError(f"failed to write ThermoNeRF thermal adapter image: {output}")
+    return width, height
+
+
 def _parse_colmap_cameras_text(path: Path) -> dict[int, dict[str, object]]:
     result: dict[int, dict[str, object]] = {}
     for raw in path.read_text(encoding="utf-8").splitlines():
@@ -360,8 +382,9 @@ def materialize(
             frame.update(_camera_intrinsics(camera))
             frames.append(frame)
             _relative_symlink(rgb_dir / name, output / "images" / name)
-            _relative_symlink(
+            _write_thermonerf_thermal(
                 _thermal_source(thermal_dir, name),
+                rgb_dir / name,
                 output / "thermal" / f"{Path(name).stem}.png",
             )
         transforms = {
@@ -392,7 +415,11 @@ def materialize(
         "protocol": "aaai27_hold8_v2",
         "method": method,
         "payload_policy": "relative_symlink_only",
-        "thermal_payload": "canonical_hotiron_lossless_png",
+        "thermal_payload": (
+            "canonical_hotiron_cv2_grayscale_then_linear_resize_to_rgb_resolution"
+            if method == "thermonerf"
+            else "canonical_hotiron_lossless_png"
+        ),
         "jpg_alias_payload_note": "legacy JPG suffix may point to unchanged PNG bytes",
         "total_count": len(all_names),
         "train_count": len(train),

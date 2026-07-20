@@ -71,3 +71,16 @@ def test_thermal_alias_preserves_png_bytes(tmp_path: Path) -> None:
     mod._relative_symlink(source, alias)
     assert alias.is_symlink()
     assert alias.read_bytes() == source.read_bytes()
+
+
+def test_thermonerf_thermal_matches_rgb_raster_size(tmp_path: Path) -> None:
+    cv2 = pytest.importorskip("cv2")
+    np = pytest.importorskip("numpy")
+    thermal = tmp_path / "thermal.png"
+    rgb = tmp_path / "rgb.jpg"
+    output = tmp_path / "adapted.png"
+    assert cv2.imwrite(str(thermal), np.arange(12, dtype=np.uint8).reshape(3, 4))
+    assert cv2.imwrite(str(rgb), np.zeros((6, 8, 3), dtype=np.uint8))
+    assert mod._write_thermonerf_thermal(thermal, rgb, output) == (8, 6)
+    adapted = cv2.imread(str(output), cv2.IMREAD_GRAYSCALE)
+    assert adapted is not None and adapted.shape == (6, 8)
