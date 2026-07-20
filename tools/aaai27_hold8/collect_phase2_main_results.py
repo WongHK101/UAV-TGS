@@ -16,6 +16,7 @@ SCENES = (
     "Building", "InternalRoad", "PVpanel", "TransmissionTower", "Urban20K", "Orchard",
     "Garden", "Plaza", "Road", "Urban50K", "Urban100K",
 )
+PHASE1_REUSED_SCENES = frozenset(SCENES[:6])
 METHOD = "scsp_refit_f3"
 METRIC_DIRECTIONS = {
     "rgb_psnr": "max", "rgb_ssim": "max", "rgb_lpips": "min",
@@ -217,6 +218,18 @@ def validate_scene_record(row: Mapping[str, Any], scene: str) -> dict[str, Any]:
     return dict(row)
 
 
+def apply_phase2_batch_scope(row: Mapping[str, Any], scene: str) -> dict[str, Any]:
+    """Separate this batch's execution cost from the endpoint's method cost."""
+    result = dict(row)
+    if scene in PHASE1_REUSED_SCENES:
+        result["batch_execution_wall_time_s"] = 0.0
+        result["batch_execution_status"] = "reused_phase1_endpoint"
+    else:
+        finite(result["batch_execution_wall_time_s"], f"{scene}/batch execution time")
+        result["batch_execution_status"] = "executed_phase2"
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
@@ -239,9 +252,10 @@ def main() -> None:
     for scene in SCENES:
         record_path = record_dir / f"{scene}.json" if record_dir else None
         if record_path is not None and record_path.is_file():
-            rows.append(validate_scene_record(load(record_path), scene))
+            row = validate_scene_record(load(record_path), scene)
         else:
-            rows.append(collect_scene(args.root.resolve(), scene))
+            row = collect_scene(args.root.resolve(), scene)
+        rows.append(apply_phase2_batch_scope(row, scene))
     summary = summarize(rows)
     (output / "eleven_scene_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     fields = sorted({key for row in rows for key in row}, key=lambda key: (key not in {"scene", "method"}, key))

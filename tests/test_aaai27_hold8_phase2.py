@@ -5,7 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from tools.aaai27_hold8.collect_phase2_main_results import resolve_cost, summarize, validate_scene_record
+from tools.aaai27_hold8.collect_phase2_main_results import (
+    apply_phase2_batch_scope,
+    resolve_cost,
+    summarize,
+    validate_scene_record,
+)
 
 
 def _write(path: Path, value: dict) -> None:
@@ -38,6 +43,22 @@ def test_phase2_noop_alias_inherits_raw_cost(tmp_path: Path) -> None:
 def test_phase2_summary_requires_all_scenes() -> None:
     with pytest.raises(ValueError, match="completeness"):
         summarize([])
+
+
+def test_phase2_batch_scope_zeroes_reused_phase1_only() -> None:
+    reused = apply_phase2_batch_scope(
+        {"batch_execution_wall_time_s": 12, "reported_method_wall_time_s": 12},
+        "Building",
+    )
+    executed = apply_phase2_batch_scope(
+        {"batch_execution_wall_time_s": 15, "reported_method_wall_time_s": 15},
+        "Garden",
+    )
+    assert reused["batch_execution_wall_time_s"] == 0
+    assert reused["reported_method_wall_time_s"] == 12
+    assert reused["batch_execution_status"] == "reused_phase1_endpoint"
+    assert executed["batch_execution_wall_time_s"] == 15
+    assert executed["batch_execution_status"] == "executed_phase2"
 
 
 def test_portable_scene_record_keeps_endpoint_hash_without_endpoint_file() -> None:
