@@ -66,6 +66,7 @@ paths = [Path(value).resolve() for value in (source_binding, train, test, guard)
 source_binding, train, test, guard = paths
 def sha(path): return hashlib.sha256(path.read_bytes()).hexdigest()
 def lines(path): return [row.strip() for row in path.read_text(encoding='utf-8-sig').splitlines() if row.strip()]
+def normalized_name(value): return Path(str(value).replace('\\','/')).name.casefold()
 source = json.loads(source_binding.read_text(encoding='utf-8'))
 counts = {'total': len(lines(train)) + len(lines(test)), 'train': len(lines(train)),
           'test': len(lines(test)), 'guard': 0}
@@ -73,8 +74,22 @@ if source.get('protocol_id') != 'uav-tgs-aaai27-hold8-v2' or source.get('scene')
     raise RuntimeError('not the frozen Hold-8 binding')
 if source.get('counts') != {key: counts[key] for key in ('total','train','test')}:
     raise RuntimeError('Hold-8 binding counts mismatch')
-if source.get('list_sha256', {}).get('train') != sha(train) or source.get('list_sha256', {}).get('test') != sha(test):
-    raise RuntimeError('Hold-8 list identities mismatch')
+records = source.get('files')
+if not isinstance(records, list) or len(records) != counts['total']:
+    raise RuntimeError('Hold-8 binding records mismatch')
+expected = {
+    split: [normalized_name(row.get('camera_name', '')) for row in records
+            if isinstance(row, dict) and row.get('split') == split]
+    for split in ('train', 'test')
+}
+runtime = {split: [normalized_name(row) for row in lines(path)]
+           for split, path in (('train', train), ('test', test))}
+if any(not name for names in expected.values() for name in names):
+    raise RuntimeError('Hold-8 binding has an empty camera identity')
+if expected != runtime:
+    raise RuntimeError('Hold-8 runtime list identities/order mismatch')
+if any(len(names) != len(set(names)) for names in runtime.values()):
+    raise RuntimeError('Hold-8 runtime list has duplicate camera identities')
 outputs = {}
 for label, path in (('train',train),('test',test),('guard',guard)):
     outputs[f'{label}_list.txt'] = {'path': str(path), 'sha256': sha(path)}
@@ -85,6 +100,7 @@ compat_core = {
     'collection_hash': source['collection_hash'],
     'collection_split_hash': source['collection_split_hash'],
     'hold8_source_binding_sha256': sha(source_binding),
+    'formal_list_sha256': source.get('list_sha256', {}),
     'compatibility_scope': 'empty guard compatibility for train-only materializer; no guard protocol introduced',
 }
 compat_core['binding_hash'] = hashlib.sha256(json.dumps(compat_core, sort_keys=True, separators=(',',':')).encode()).hexdigest()
