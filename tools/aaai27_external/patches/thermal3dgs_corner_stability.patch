@@ -1,13 +1,33 @@
 diff --git a/utils/loss_utils.py b/utils/loss_utils.py
 --- a/utils/loss_utils.py
 +++ b/utils/loss_utils.py
-@@ -45,8 +45,8 @@ def corners_loss(network_output, gt):
+@@ -16,13 +16,16 @@ def l1_loss(network_output, gt):
+ 
+ # cq:
+ def find_corners(img):
+-    inputs = img.unsqueeze(0)*255
++    # The Harris response is quartic in image gradients, so a finite render
++    # can overflow float32 in this auxiliary weighting path. Float64 keeps
++    # the published response finite without changing its formula.
++    inputs = img.unsqueeze(0).to(torch.float64)*255
+     sobel_x = torch.tensor([[-1, -2, -1],
+                         [0, 0, 0],
+-                        [1, 2, 1]], dtype=torch.float, requires_grad=False).view(1, 1, 3, 3).cuda().repeat(1,3,1,1)
++                        [1, 2, 1]], dtype=torch.float64, requires_grad=False, device=img.device).view(1, 1, 3, 3).repeat(1,3,1,1)
+     sobel_y = torch.tensor([[-1, 0, 1],
+                         [-2, 0, 2],
+-                        [-1, 0, 1]], dtype=torch.float, requires_grad=False).view(1, 1, 3, 3).cuda().repeat(1,3,1,1)
++                        [-1, 0, 1]], dtype=torch.float64, requires_grad=False, device=img.device).view(1, 1, 3, 3).repeat(1,3,1,1)
+     I_x = F.conv2d(inputs, sobel_x, stride=1, padding=1,)
+     I_y = F.conv2d(inputs, sobel_y, stride=1, padding=1,)
+     k = 0.04
+@@ -45,8 +48,8 @@ def corners_loss(network_output, gt):
      R = find_corners(network_output).repeat(1,3,1,1).squeeze(0)
      max_vals = R.max()
      torch.clamp(R, min=0.01*max_vals) 
 -    R_exp = torch.exp(R)
 -    R_exp = R_exp/R_exp.max()
-+    # Algebraically identical to exp(R) / exp(max(R)), without overflow.
++    # Algebraically identical to exp(R) / exp(max(R)), without exp overflow.
 +    R_exp = torch.exp(R - max_vals)
      return (torch.abs((network_output - gt))*(R_exp)).mean()
  
