@@ -57,6 +57,9 @@ def test_compact_colmap_images_preserves_headers_and_drops_points(tmp_path: Path
     second = tmp_path / "compact_second_pass.txt"
     assert mod._write_compact_colmap_images(output, second) == 2
     assert second.read_bytes() == output.read_bytes()
+    parsed = mod._parse_colmap_images_text(output)
+    assert list(parsed) == ["0001.JPG", "0002.JPG"]
+    assert parsed["0002.JPG"]["tvec"] == [1.0, 0.0, 0.0]
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows test host has no symlink privilege")

@@ -177,7 +177,12 @@ def _parse_colmap_images_text(path: Path) -> dict[str, dict[str, object]]:
     expect_image = True
     for raw in lines:
         line = raw.strip()
-        if not line or line.startswith("#"):
+        if line.startswith("#"):
+            continue
+        if not line:
+            # Compact models intentionally replace POINTS2D with an empty line.
+            if not expect_image:
+                expect_image = True
             continue
         if not expect_image:
             expect_image = True
@@ -192,6 +197,8 @@ def _parse_colmap_images_text(path: Path) -> dict[str, dict[str, object]]:
             "camera_id": int(fields[8]),
         }
         expect_image = False
+    if not expect_image:
+        raise ValueError("COLMAP images.txt ended before its POINTS2D record")
     if not result:
         raise ValueError(f"no COLMAP images in {path}")
     return result
