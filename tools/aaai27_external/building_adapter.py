@@ -101,9 +101,13 @@ def _write_compact_colmap_images(source: Path, output: Path) -> int:
     ) as writer:
         for raw in reader:
             stripped = raw.strip()
-            if not stripped or stripped.startswith("#"):
-                if stripped.startswith("#"):
-                    writer.write(stripped + "\n")
+            if stripped.startswith("#"):
+                writer.write(stripped + "\n")
+                continue
+            if not stripped:
+                if not expect_image:
+                    writer.write("\n")
+                    expect_image = True
                 continue
             if expect_image:
                 fields = stripped.split()
@@ -361,6 +365,12 @@ def materialize(
         }
         (output / "transforms.json").write_text(
             json.dumps(transforms, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+    if compact_sparse is not None and compact_sparse["image_record_count"] != len(all_names):
+        raise ValueError(
+            "compact sparse pose count mismatch: "
+            f"{compact_sparse['image_record_count']} != {len(all_names)}"
         )
 
     source_hashes = {
