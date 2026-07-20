@@ -137,7 +137,7 @@ RAW_DEPTH="$EVAL_ROOT/geometry/renderer_bundle"
   --appearance_modality none > "$LOG_ROOT/depth_export.log" 2>&1
 
 BOUND_DEPTH="$EVAL_ROOT/geometry/expected_depth_bundle"
-"$PY" tools/aaai27_hold8/bind_expected_depth_bundle.py --kind model \
+"$PY" -m tools.aaai27_hold8.bind_expected_depth_bundle --kind model \
   --source-manifest "$RAW_DEPTH/split_manifest.json" --collection-manifest "$COLLECTION" \
   --scene-split-manifest "$BIND/bound_split.json" --output-root "$BOUND_DEPTH" \
   --method-name "$METHOD" > "$LOG_ROOT/depth_binding.log" 2>&1

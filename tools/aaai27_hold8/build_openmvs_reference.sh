@@ -151,7 +151,7 @@ cd "$CODE"
     --openmvs_number_views_fuse 3 --openmvs_iterations 4 \
     --openmvs_refine_resolution_level 1 --openmvs_refine_scales 2 --resolution_arg 4
 
-  "$PY" tools/aaai27_hold8/bind_expected_depth_bundle.py --kind reference \
+  "$PY" -m tools.aaai27_hold8.bind_expected_depth_bundle --kind reference \
     --source-manifest "$BASE/reference_depth_manifest.json" \
     --collection-manifest "$COLLECTION" --scene-split-manifest "$BIND/bound_split.json" \
     --output-root "$BOUND"
