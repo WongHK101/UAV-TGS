@@ -63,6 +63,10 @@ LOG_ROOT="$ROOT/logs/experiments/aaai27_hold8_v2/$SCENE"
 HEAD="$(git -C "$CODE" rev-parse HEAD)"
 COLMAP="$ROOT/tools/colmap-4.1.0-cuda12.8-ceres2.3dev-cudss0.8-sm120/bin/colmap"
 COLMAP_SHA=fd0d5597820afd3212215f61d979313fa7671a34dbdc64ef3d8398d5589cfc63
+COLMAP_RUNTIME_LIB="$ROOT/tools/runtime_dependencies/colmap_4.1_cuda/lib"
+if [[ -d "$COLMAP_RUNTIME_LIB" ]]; then
+  export LD_LIBRARY_PATH="$COLMAP_RUNTIME_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 
 sha() { sha256sum "$1" | awk '{print $1}'; }
 require_clean_code() {
