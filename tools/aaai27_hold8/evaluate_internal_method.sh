@@ -48,7 +48,20 @@ if [[ -f "$EVAL_ROOT/STATUS" ]]; then
   echo "$SCENE/$METHOD Hold-8 evaluation already passed"
   exit 0
 fi
-test ! -e "$EVAL_ROOT"
+if [[ -e "$EVAL_ROOT" ]]; then
+  test -d "$EVAL_ROOT"
+  mapfile -t unexpected_eval_entries < <(
+    find "$EVAL_ROOT" -mindepth 1 -maxdepth 1 \
+      ! -name appearance ! -name efficiency -print
+  )
+  if [[ ${#unexpected_eval_entries[@]} -ne 0 ]]; then
+    printf 'unexpected pre-existing evaluation artifact: %s\n' \
+      "${unexpected_eval_entries[@]}" >&2
+    exit 1
+  fi
+else
+  mkdir -p "$EVAL_ROOT"
+fi
 
 if [[ "$METHOD" == scsp_refit_f3 && -f "$METHOD_ROOT/alias_to_raw_f3.json" ]]; then
   RAW="$EXP/evaluation/raw_f3"
