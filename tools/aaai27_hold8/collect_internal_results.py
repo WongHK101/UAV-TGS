@@ -83,7 +83,17 @@ def _scoped_hash(code: Path, names: Sequence[str]) -> str:
         path = code / name
         if not path.is_file():
             raise FileNotFoundError(path)
-        rows.append({"path": name, "sha256": _sha(path), "size_bytes": path.stat().st_size})
+        # Git may materialize the same text blob with LF or CRLF depending on
+        # host checkout settings.  Line endings do not change Python/shell
+        # semantics and must not invalidate otherwise identical endpoints.
+        payload = path.read_bytes().replace(b"\r\n", b"\n")
+        rows.append(
+            {
+                "path": name,
+                "sha256_lf_normalized": hashlib.sha256(payload).hexdigest(),
+                "normalized_size_bytes": len(payload),
+            }
+        )
     return _canonical_sha(rows)
 
 
