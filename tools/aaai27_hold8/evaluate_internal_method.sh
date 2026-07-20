@@ -145,22 +145,26 @@ fi
 test "$(find "$FULLRES_RENDERS" -maxdepth 1 -type f -name '*.png' | wc -l)" \
   -eq "$(wc -l < "$RUNTIME/thermal_test_list.txt")"
 RENDERS="$FULLRES_RENDERS"
-"$PY" tools/thermal_radiometry/evaluate_temperature.py \
-  --ground-truth-root "$TEMP_UD/temperature_c" --render-root "$RENDERS" \
-  --report "$EVAL_ROOT/temperature/test.json" --range-manifest "$RANGE" \
-  --split-manifest "$BIND/bound_split.json" --subset test --mask-root "$SUPPORT/bool" \
-  --alpha-threshold 0 --require-support > "$LOG_ROOT/temperature.log" 2>&1
+if [[ ! -f "$EVAL_ROOT/temperature/test.json" ]]; then
+  "$PY" tools/thermal_radiometry/evaluate_temperature.py \
+    --ground-truth-root "$TEMP_UD/temperature_c" --render-root "$RENDERS" \
+    --report "$EVAL_ROOT/temperature/test.json" --range-manifest "$RANGE" \
+    --split-manifest "$BIND/bound_split.json" --subset test --mask-root "$SUPPORT/bool" \
+    --alpha-threshold 0 --require-support > "$LOG_ROOT/temperature.log" 2>&1
+fi
 
-"$PY" tools/evaluate_formal_baseline_hotspots.py --method-name "$METHOD" --scene-name "$SCENE" \
-  --formal-radiometry-binding-manifest "$BINDING" --bound-split "$BIND/bound_split.json" \
-  --decode-manifest "$DECODE/manifests/decode_manifest.jsonl" \
-  --decode-protocol "$DECODE/manifests/decode_protocol_used_v1.jsonl" \
-  --range-manifest "$RANGE" --canonical-manifest "$CANONICAL" \
-  --optimization-support-manifest "$TEMP_UD/manifest.json" \
-  --evaluation-support-manifest "$SUPPORT/manifest.json" \
-  --hotspot-threshold-manifest "$HOTSPOT_THRESHOLD" --temperature-root "$TEMP_UD/temperature_c" \
-  --evaluation-support-root "$SUPPORT" --render-root "$RENDERS" \
-  --output "$EVAL_ROOT/hotspot/test.json" > "$LOG_ROOT/hotspot.log" 2>&1
+if [[ ! -f "$EVAL_ROOT/hotspot/test.json" ]]; then
+  "$PY" tools/evaluate_formal_baseline_hotspots.py --method-name "$METHOD" --scene-name "$SCENE" \
+    --formal-radiometry-binding-manifest "$BINDING" --bound-split "$BIND/bound_split.json" \
+    --decode-manifest "$DECODE/manifests/decode_manifest.jsonl" \
+    --decode-protocol "$DECODE/manifests/decode_protocol_used_v1.jsonl" \
+    --range-manifest "$RANGE" --canonical-manifest "$CANONICAL" \
+    --optimization-support-manifest "$TEMP_UD/manifest.json" \
+    --evaluation-support-manifest "$SUPPORT/manifest.json" \
+    --hotspot-threshold-manifest "$HOTSPOT_THRESHOLD" --temperature-root "$TEMP_UD/temperature_c" \
+    --evaluation-support-root "$SUPPORT" --render-root "$RENDERS" \
+    --output "$EVAL_ROOT/hotspot/test.json" > "$LOG_ROOT/hotspot.log" 2>&1
+fi
 
 RAW_DEPTH="$EVAL_ROOT/geometry/renderer_bundle"
 "$PY" tools/geometric_repeatability/export_gaussian_probe_bundle.py \
