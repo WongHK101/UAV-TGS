@@ -1,0 +1,27 @@
+diff --git a/train.py b/train.py
+--- a/train.py
++++ b/train.py
+@@ -101,5 +101,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
+             abs, sca, d = ATF.step(gaussians.get_xyz.detach(), time_input + ast_noise)
+             d_rgb = torch.exp((abs + sca) * d)
++            # The legacy rasterizer may consume this freshly produced tensor
++            # from a different CUDA stream on Blackwell.  Complete the ATF
++            # forward before handing its colors to the extension.
++            torch.cuda.synchronize()
+             # cq: end
+ 
+         # Render
+@@ -150,6 +154,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
+         else:
+             loss = (1.0 - opt.lambda_dssim) * (Ll1) + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
++        # Fail closed instead of letting one non-finite step contaminate every
++        # later checkpoint.  Reading the scalar also completes the loss forward.
++        if not bool(torch.isfinite(loss).item()):
++            raise FloatingPointError(f"non-finite loss at iteration {iteration}")
+         loss.backward()
++        # Complete the legacy extension's backward work before optimizer or
++        # topology mutation starts.
++        torch.cuda.synchronize()
+ 
+         iter_end.record()
+ 
