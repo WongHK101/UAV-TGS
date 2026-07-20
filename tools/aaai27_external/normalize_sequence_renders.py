@@ -23,6 +23,7 @@ RENDER_POLICIES = (
     "exact",
     "pil-default-resize-to-formal",
     "hotiron-grayscale-inverse-to-formal",
+    "right-half-to-formal",
 )
 
 
@@ -96,7 +97,18 @@ def _normalize_render(
                 )
             _link(source, destination)
             return
-        if policy == "pil-default-resize-to-formal":
+        if policy == "right-half-to-formal":
+            expected = (formal_resolution[0] * 2, formal_resolution[1])
+            if source_resolution != expected:
+                raise ValueError(
+                    "side-by-side render/formal resolution mismatch under "
+                    f"right-half-to-formal: render={source_resolution}, "
+                    f"expected={expected}"
+                )
+            normalized = image.convert("RGB").crop(
+                (formal_resolution[0], 0, expected[0], expected[1])
+            )
+        elif policy == "pil-default-resize-to-formal":
             normalized = image.convert("RGB").resize(formal_resolution)
         else:
             gray = np.asarray(image.convert("L").resize(formal_resolution), dtype=np.uint8)

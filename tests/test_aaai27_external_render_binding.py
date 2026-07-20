@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 import pytest
+import numpy as np
 from PIL import Image
 
 
@@ -86,3 +87,34 @@ def test_exact_render_policy_rejects_shape_mismatch(tmp_path: Path) -> None:
     Image.new("RGB", (4, 3), (0, 0, 0)).save(source)
     with pytest.raises(ValueError, match="render/formal resolution mismatch"):
         mod._normalize_render(source, tmp_path / "out.png", (5, 3), "exact")
+
+
+def test_right_half_policy_extracts_prediction_panel(tmp_path: Path) -> None:
+    source = tmp_path / "combined.png"
+    destination = tmp_path / "prediction.png"
+    ground_truth = np.full((2, 3, 3), 25, dtype=np.uint8)
+    prediction = np.array(
+        [
+            [[10, 20, 30], [40, 50, 60], [70, 80, 90]],
+            [[90, 80, 70], [60, 50, 40], [30, 20, 10]],
+        ],
+        dtype=np.uint8,
+    )
+    Image.fromarray(np.concatenate([ground_truth, prediction], axis=1)).save(source)
+
+    mod._normalize_render(source, destination, (3, 2), "right-half-to-formal")
+
+    assert np.array_equal(mod._rgb(destination), prediction)
+
+
+def test_right_half_policy_rejects_nonpaired_width(tmp_path: Path) -> None:
+    source = tmp_path / "bad.png"
+    Image.fromarray(np.zeros((2, 5, 3), dtype=np.uint8)).save(source)
+
+    with pytest.raises(ValueError, match="side-by-side"):
+        mod._normalize_render(
+            source,
+            tmp_path / "prediction.png",
+            (3, 2),
+            "right-half-to-formal",
+        )
