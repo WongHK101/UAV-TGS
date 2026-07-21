@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Materialize read-only Building views for the five external baselines.
+"""Materialize read-only formal-scene views for the five external baselines.
 
 The adapter never rewrites the frozen CFR RGB images, canonical thermal PNGs,
 COLMAP model, or split lists.  It creates only relative symlinks and a compact
@@ -325,19 +325,20 @@ def _materialize_split_dirs(
 def materialize(
     *,
     project_root: Path,
+    scene: str = "Building",
     method: str,
     output: Path,
     replace: bool = False,
 ) -> dict[str, object]:
     if method not in METHODS:
         raise ValueError(f"unknown method: {method}")
-    formal = project_root / "derived" / "aaai27_hold8_v2" / "Building"
+    formal = project_root / "derived" / "aaai27_hold8_v2" / scene
     binding = (
         project_root
         / "derived"
         / "thermal_radiometry"
         / "aaai27_hold8_v2"
-        / "Building"
+        / scene
         / "binding"
     )
     rgb_dir = formal / "workspace" / "images"
@@ -348,7 +349,7 @@ def materialize(
     train = read_split(train_file)
     test = read_split(test_file)
     all_names = validate_hold8(train, test)
-    if (len(all_names), len(train), len(test)) != (614, 537, 77):
+    if scene == "Building" and (len(all_names), len(train), len(test)) != (614, 537, 77):
         raise ValueError("Building collection cardinality mismatch")
 
     for name in all_names:
@@ -434,7 +435,7 @@ def materialize(
     }
     manifest: dict[str, object] = {
         "schema": SCHEMA,
-        "scene": "Building",
+        "scene": scene,
         "protocol": "aaai27_hold8_v2",
         "method": method,
         "payload_policy": "relative_symlink_only",
@@ -462,6 +463,7 @@ def materialize(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--project-root", type=Path, required=True)
+    parser.add_argument("--scene", default="Building")
     parser.add_argument("--method", choices=METHODS, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--replace", action="store_true")
@@ -472,6 +474,7 @@ def main() -> int:
     args = build_parser().parse_args()
     manifest = materialize(
         project_root=args.project_root.resolve(),
+        scene=args.scene,
         method=args.method,
         output=args.output,
         replace=args.replace,
