@@ -367,7 +367,27 @@ def materialize(
     if scene == "Building" and (len(all_names), len(train), len(test)) != (614, 537, 77):
         raise ValueError("Building collection cardinality mismatch")
 
-    for name in all_names:
+    camera_records = _parse_colmap_images_text(sparse_dir / "images.txt")
+    camera_by_stem: dict[str, str] = {}
+    for camera_name in camera_records:
+        stem = Path(camera_name).stem
+        if stem in camera_by_stem:
+            raise ValueError(f"duplicate formal camera stem: {stem}")
+        camera_by_stem[stem] = camera_name
+
+    def camera_name(name: str) -> str:
+        stem = Path(name).stem
+        if stem not in camera_by_stem:
+            raise KeyError(f"formal COLMAP image missing for split item: {name}")
+        return camera_by_stem[stem]
+
+    train_camera_names = [camera_name(name) for name in train]
+    test_camera_names = [camera_name(name) for name in test]
+    all_camera_names = train_camera_names + test_camera_names
+    if len(set(all_camera_names)) != len(all_names):
+        raise ValueError("formal split-to-camera mapping is not one-to-one")
+
+    for name in all_camera_names:
         if method != "thermal3dgs":
             _rgb_source(rgb_dir, name)
         _thermal_source(thermal_dir, name)
@@ -385,14 +405,16 @@ def materialize(
     compact_sparse = None
     if method in {"thermalgaussian_ommg", "physir_splat"}:
         compact_sparse = _materialize_compact_sparse(sparse_dir, output)
-        _materialize_split_dirs(output, rgb_dir, thermal_dir, train, test)
+        _materialize_split_dirs(
+            output, rgb_dir, thermal_dir, train_camera_names, test_camera_names
+        )
     elif method == "thermal3dgs":
         compact_sparse = _materialize_compact_sparse(sparse_dir, output)
-        for name in all_names:
+        for name in all_camera_names:
             _relative_symlink(_thermal_source(thermal_dir, name), output / "images" / name)
     elif method == "mmone":
         compact_sparse = _materialize_compact_sparse(sparse_dir, output)
-        for name in all_names:
+        for name in all_camera_names:
             _relative_symlink(_rgb_source(rgb_dir, name), output / "images" / name)
             thermal_alias = f"{Path(name).stem}.jpg"
             _relative_symlink(
@@ -400,11 +422,9 @@ def materialize(
             )
     elif method == "thermonerf":
         cameras = _parse_colmap_cameras_text(sparse_dir / "cameras.txt")
-        images = _parse_colmap_images_text(sparse_dir / "images.txt")
+        images = camera_records
         frames: list[dict[str, object]] = []
-        for name in all_names:
-            if name not in images:
-                raise KeyError(f"formal COLMAP image missing: {name}")
+        for name in all_camera_names:
             record = images[name]
             camera = cameras[int(record["camera_id"])]
             adapted_width, adapted_height = _write_thermonerf_thermal(
@@ -428,9 +448,9 @@ def materialize(
             _relative_symlink(_rgb_source(rgb_dir, name), output / "images" / name)
         transforms = {
             "frames": frames,
-            "train_filenames": [f"images/{name}" for name in train],
-            "val_filenames": [f"images/{name}" for name in test],
-            "test_filenames": [f"images/{name}" for name in test],
+            "train_filenames": [f"images/{name}" for name in train_camera_names],
+            "val_filenames": [f"images/{name}" for name in test_camera_names],
+            "test_filenames": [f"images/{name}" for name in test_camera_names],
         }
         (output / "transforms.json").write_text(
             json.dumps(transforms, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -465,6 +485,8 @@ def materialize(
         "test_count": len(test),
         "train_names": list(train),
         "test_names": list(test),
+        "train_camera_names": train_camera_names,
+        "test_camera_names": test_camera_names,
         "source_hashes": source_hashes,
         "sparse_adapter": compact_sparse,
     }
