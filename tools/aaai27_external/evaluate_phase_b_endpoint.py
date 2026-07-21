@@ -192,9 +192,28 @@ def evaluate(args: argparse.Namespace) -> Path:
 
     formal = root / "derived/aaai27_hold8_v2" / args.scene
     binding_root = root / "derived/thermal_radiometry/aaai27_hold8_v2" / args.scene / "binding"
-    decode = root / "derived/thermal_radiometry/aaai_second_review_v1" / args.scene
     collection = root / "derived/thermal_radiometry/aaai27_hold8_v2/splits/hold8/collection_manifest.json"
     protocol_binding = root / "experiments/aaai27_hold8_v2" / args.scene / "protocol/formal_radiometry_evaluation_binding.json"
+    binding_payload = load_json(protocol_binding)
+    formal_binding = binding_payload.get("formal_binding")
+    tsdk = formal_binding.get("tsdk_target") if isinstance(formal_binding, dict) else None
+    decode_sha = tsdk.get("decode_manifest_sha256") if isinstance(tsdk, dict) else None
+    if not isinstance(decode_sha, str):
+        raise ValueError("formal radiometry binding lacks decode manifest SHA")
+    decode_candidates = sorted(
+        (root / "derived/thermal_radiometry").glob(
+            f"*/{args.scene}/manifests/decode_manifest.jsonl"
+        )
+    )
+    decode_manifests = [
+        path for path in decode_candidates if sha256_file(path) == decode_sha
+    ]
+    if len(decode_manifests) != 1:
+        raise ValueError(
+            f"cannot uniquely resolve frozen decode manifest: {decode_manifests}"
+        )
+    decode_manifest = decode_manifests[0]
+    decode_protocol = decode_manifest.with_name("decode_protocol_used_v1.jsonl")
     temperature_root = formal / "thermal_undistorted/temperature_c"
     support = formal / "formal_support"
     range_manifest = formal / "radiometry/range_manifest.json"
@@ -210,7 +229,7 @@ def evaluate(args: argparse.Namespace) -> Path:
         )
     if not hotspot_report.is_file():
         run_command(
-            [str(python), "tools/evaluate_formal_baseline_hotspots.py", "--method-name", args.method, "--scene-name", args.scene, "--formal-radiometry-binding-manifest", str(protocol_binding), "--bound-split", str(binding_root / "bound_split.json"), "--decode-manifest", str(decode / "manifests/decode_manifest.jsonl"), "--decode-protocol", str(decode / "manifests/decode_protocol_used_v1.jsonl"), "--range-manifest", str(range_manifest), "--canonical-manifest", str(formal / "radiometry/canonical_manifest.json"), "--optimization-support-manifest", str(formal / "thermal_undistorted/manifest.json"), "--evaluation-support-manifest", str(support / "manifest.json"), "--hotspot-threshold-manifest", str(formal / "radiometry/hotspot_threshold_train_q95.json"), "--temperature-root", str(temperature_root), "--evaluation-support-root", str(support), "--render-root", str(thermal_renders), "--output", str(hotspot_report)],
+            [str(python), "tools/evaluate_formal_baseline_hotspots.py", "--method-name", args.method, "--scene-name", args.scene, "--formal-radiometry-binding-manifest", str(protocol_binding), "--bound-split", str(binding_root / "bound_split.json"), "--decode-manifest", str(decode_manifest), "--decode-protocol", str(decode_protocol), "--range-manifest", str(range_manifest), "--canonical-manifest", str(formal / "radiometry/canonical_manifest.json"), "--optimization-support-manifest", str(formal / "thermal_undistorted/manifest.json"), "--evaluation-support-manifest", str(support / "manifest.json"), "--hotspot-threshold-manifest", str(formal / "radiometry/hotspot_threshold_train_q95.json"), "--temperature-root", str(temperature_root), "--evaluation-support-root", str(support), "--render-root", str(thermal_renders), "--output", str(hotspot_report)],
             cwd=code, log_root=logs, label="hotspot",
         )
 
