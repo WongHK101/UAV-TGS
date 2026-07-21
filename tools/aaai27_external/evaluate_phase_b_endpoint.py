@@ -236,6 +236,7 @@ def evaluate(args: argparse.Namespace) -> Path:
     geometry = evaluation / "geometry"
     model_manifest = geometry / "expected_depth/manifest.json"
     geometry.mkdir(parents=True, exist_ok=True)
+    thermonerf_endpoint: Path | None = None
     if not model_manifest.is_file():
         common = [
             "--scene-name", args.scene,
@@ -250,6 +251,7 @@ def evaluate(args: argparse.Namespace) -> Path:
             candidates = [path for path in candidates if path.is_dir()]
             if len(candidates) != 1:
                 raise ValueError(f"expected exactly one ThermoNeRF endpoint, found {candidates}")
+            thermonerf_endpoint = candidates[0]
             command = [str(thermo_python), str(code / "tools/aaai27_external/export_thermonerf_expected_depth.py"), "--method-name", args.method, "--source-repo", str(root / "external_phase_a/sources/thermo-nerf"), "--model-root", str(candidates[0]), "--dataset-path", str(dataset), "--camera-source-path", str(formal / "workspace"), "--train-list", str(binding_root / "train_list.txt"), "--test-list", str(binding_root / "test_list.txt"), "--reference-manifest", str(formal / "reference_openmvs_hold8_v2/bound_expected_depth/manifest.json"), *common]
         else:
             model = run_root / "model"
@@ -257,6 +259,67 @@ def evaluate(args: argparse.Namespace) -> Path:
             if args.method == "MMOne":
                 command[command.index("--camera-source-path"):command.index("--camera-source-path")] = ["--mmone-thermal-checkpoint", str(model / "thermal_chkpnt30000.pth")]
         run_command(command, cwd=code, log_root=logs, label="expected_depth_export")
+
+    if args.method == "ThermoNeRF":
+        if thermonerf_endpoint is None:
+            candidates = sorted(
+                path
+                for path in (run_root / "model" / f"{args.scene}_formal/thermal-nerf").glob("*")
+                if path.is_dir()
+            )
+            if len(candidates) != 1:
+                raise ValueError(
+                    f"expected exactly one ThermoNeRF endpoint, found {candidates}"
+                )
+            thermonerf_endpoint = candidates[0]
+        benchmark_root = evaluation / "efficiency/render_benchmark"
+        benchmark = benchmark_root / "benchmark.json"
+        if not benchmark.is_file():
+            adapter_payload = load_json(dataset / "adapter_manifest.json")
+            camera_names = adapter_payload.get("test_camera_names")
+            if not isinstance(camera_names, list) or not camera_names:
+                raise ValueError("ThermoNeRF adapter lacks test camera names")
+            from PIL import Image
+
+            with Image.open(dataset / "images" / str(camera_names[0])) as image:
+                width, height = image.size
+            run_command(
+                [
+                    str(thermo_python),
+                    str(code / "tools/aaai27_external/benchmark_thermonerf_render.py"),
+                    "--scene-name",
+                    args.scene,
+                    "--source-repo",
+                    str(root / "external_phase_a/sources/thermo-nerf"),
+                    "--model-root",
+                    str(thermonerf_endpoint),
+                    "--dataset-path",
+                    str(dataset),
+                    "--camera-source-path",
+                    str(formal / "workspace"),
+                    "--train-list",
+                    str(binding_root / "train_list.txt"),
+                    "--test-list",
+                    str(binding_root / "test_list.txt"),
+                    "--adapter-manifest",
+                    str(dataset / "adapter_manifest.json"),
+                    "--render-binding-manifest",
+                    str(outputs["thermal"] / "render_binding_manifest.json"),
+                    "--collection-manifest",
+                    str(collection),
+                    "--scene-split-manifest",
+                    str(binding_root / "bound_split.json"),
+                    "--output-root",
+                    str(benchmark_root),
+                    "--width",
+                    str(width),
+                    "--height",
+                    str(height),
+                ],
+                cwd=code,
+                log_root=logs,
+                label="thermonerf_render_benchmark",
+            )
 
     geometry_output = geometry / "evaluation"
     metrics = geometry_output / "geometry_metrics.json"
@@ -272,6 +335,9 @@ def evaluate(args: argparse.Namespace) -> Path:
         "geometry": metrics,
         **{f"appearance_{name}": path / "results.json" for name, path in outputs.items()},
     }
+    benchmark = evaluation / "efficiency/render_benchmark/benchmark.json"
+    if benchmark.is_file():
+        artifacts["render_benchmark"] = benchmark
     receipt = {
         "schema": "uav-tgs-aaai27-external-phase-b-endpoint-evaluation-v1",
         "status": "SUCCEEDED",
