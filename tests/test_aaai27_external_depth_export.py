@@ -12,6 +12,7 @@ from tools.aaai27_external.depth_export_common import (
     validate_render_binding,
     write_view_npz,
 )
+from tools.aaai27_external.benchmark_thermonerf_render import _thermal_u8
 from tools.aaai27_external.export_thermonerf_expected_depth import (
     _rescale_cameras_exact,
 )
@@ -91,3 +92,12 @@ def test_thermonerf_exact_reference_raster_rescales_axes_independently() -> None
     assert int(cameras.height.item()) == 252
     assert cameras.fx.item() == pytest.approx(2000.0 * 314.0 / 1257.0)
     assert cameras.fy.item() == pytest.approx(2100.0 * 252.0 / 1006.0)
+
+
+def test_thermonerf_thermal_u8_is_finite_and_clipped() -> None:
+    value = torch.tensor([[[-0.1], [0.5], [1.2]]], dtype=torch.float32)
+    np.testing.assert_array_equal(
+        _thermal_u8(value), np.array([[0, 128, 255]], dtype=np.uint8)
+    )
+    with pytest.raises(ValueError, match="finite"):
+        _thermal_u8(torch.tensor([[[float("nan")]]]))
