@@ -152,6 +152,21 @@ def _thermal_source(thermal_dir: Path, rgb_name: str) -> Path:
     raise FileNotFoundError(f"canonical thermal image missing for {rgb_name}")
 
 
+def _rgb_source(rgb_dir: Path, name: str) -> Path:
+    stem = Path(name).stem
+    candidates = (
+        rgb_dir / name,
+        rgb_dir / f"{stem}.jpg",
+        rgb_dir / f"{stem}.JPG",
+        rgb_dir / f"{stem}.png",
+        rgb_dir / f"{stem}.PNG",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(f"formal RGB image missing for {name}")
+
+
 def _write_thermonerf_thermal(
     thermal_source: Path, rgb_source: Path, output: Path
 ) -> tuple[int, int]:
@@ -316,7 +331,7 @@ def _materialize_split_dirs(
 ) -> None:
     for split, names in (("train", train), ("test", test)):
         for name in names:
-            _relative_symlink(rgb_dir / name, output / "rgb" / split / name)
+            _relative_symlink(_rgb_source(rgb_dir, name), output / "rgb" / split / name)
             _relative_symlink(
                 _thermal_source(thermal_dir, name), output / "thermal" / split / name
             )
@@ -353,8 +368,8 @@ def materialize(
         raise ValueError("Building collection cardinality mismatch")
 
     for name in all_names:
-        if method != "thermal3dgs" and not (rgb_dir / name).is_file():
-            raise FileNotFoundError(rgb_dir / name)
+        if method != "thermal3dgs":
+            _rgb_source(rgb_dir, name)
         _thermal_source(thermal_dir, name)
 
     if output.exists() or output.is_symlink():
@@ -378,7 +393,7 @@ def materialize(
     elif method == "mmone":
         compact_sparse = _materialize_compact_sparse(sparse_dir, output)
         for name in all_names:
-            _relative_symlink(rgb_dir / name, output / "images" / name)
+            _relative_symlink(_rgb_source(rgb_dir, name), output / "images" / name)
             thermal_alias = f"{Path(name).stem}.jpg"
             _relative_symlink(
                 _thermal_source(thermal_dir, name), output / "thermal" / thermal_alias
@@ -394,7 +409,7 @@ def materialize(
             camera = cameras[int(record["camera_id"])]
             adapted_width, adapted_height = _write_thermonerf_thermal(
                 _thermal_source(thermal_dir, name),
-                rgb_dir / name,
+                _rgb_source(rgb_dir, name),
                 output / "thermal" / f"{Path(name).stem}.png",
             )
             frame = {
@@ -410,7 +425,7 @@ def materialize(
                 )
             )
             frames.append(frame)
-            _relative_symlink(rgb_dir / name, output / "images" / name)
+            _relative_symlink(_rgb_source(rgb_dir, name), output / "images" / name)
         transforms = {
             "frames": frames,
             "train_filenames": [f"images/{name}" for name in train],
