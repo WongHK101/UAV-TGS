@@ -12,7 +12,10 @@ from tools.aaai27_external.depth_export_common import (
     validate_render_binding,
     write_view_npz,
 )
-from tools.aaai27_external.benchmark_thermonerf_render import _thermal_u8
+from tools.aaai27_external.benchmark_thermonerf_render import (
+    _formal_target_resolution,
+    _thermal_u8,
+)
 from tools.aaai27_external.export_thermonerf_expected_depth import (
     _rescale_cameras_exact,
 )
@@ -101,3 +104,11 @@ def test_thermonerf_thermal_u8_is_finite_and_clipped() -> None:
     )
     with pytest.raises(ValueError, match="finite"):
         _thermal_u8(torch.tensor([[[float("nan")]]]))
+
+
+def test_thermonerf_benchmark_accepts_distinct_native_and_formal_rasters() -> None:
+    assert _formal_target_resolution(
+        {"formal_gt_resolutions_wh": [[1256, 1005]]}
+    ) == (1256, 1005)
+    with pytest.raises(ValueError, match="one formal target resolution"):
+        _formal_target_resolution({"formal_gt_resolutions_wh": []})

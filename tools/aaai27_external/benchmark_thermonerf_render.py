@@ -61,6 +61,30 @@ def _thermal_u8(value: torch.Tensor) -> np.ndarray:
     return np.rint(np.clip(array, 0.0, 1.0) * 255.0).astype(np.uint8)
 
 
+def _formal_target_resolution(binding_payload: dict[str, Any]) -> tuple[int, int]:
+    """Return the single frozen evaluation-target resolution.
+
+    ThermoNeRF can have a native training/render raster that differs slightly
+    from the canonical thermal target (for example, RGB-sized paired inputs
+    versus the valid thermal crop).  That difference is handled by the frozen
+    normalization adapter and must not invalidate a native-render timing run.
+    """
+    resolutions = binding_payload.get("formal_gt_resolutions_wh")
+    if (
+        not isinstance(resolutions, list)
+        or len(resolutions) != 1
+        or not isinstance(resolutions[0], list)
+        or len(resolutions[0]) != 2
+    ):
+        raise ValueError(
+            f"render binding requires one formal target resolution: {resolutions}"
+        )
+    width, height = resolutions[0]
+    if not isinstance(width, int) or not isinstance(height, int) or width <= 0 or height <= 0:
+        raise ValueError(f"invalid formal target resolution: {resolutions}")
+    return width, height
+
+
 def benchmark(args: argparse.Namespace) -> Path:
     output_root = args.output_root.resolve()
     if output_root.exists() and any(output_root.iterdir()):
@@ -83,12 +107,7 @@ def benchmark(args: argparse.Namespace) -> Path:
     test_records = formal_test_records(args.scene_split_manifest.resolve())
     binding_rows = validate_render_binding(args.render_binding_manifest.resolve(), test_records)
     binding_payload = load_json(args.render_binding_manifest.resolve())
-    formal_resolutions = binding_payload.get("formal_gt_resolutions_wh")
-    if formal_resolutions != [[int(args.width), int(args.height)]]:
-        raise ValueError(
-            f"formal render resolution mismatch: {formal_resolutions} vs "
-            f"{[[int(args.width), int(args.height)]]}"
-        )
+    formal_width, formal_height = _formal_target_resolution(binding_payload)
 
     model_root = args.model_root.resolve()
     configs = list(model_root.rglob("config.yml"))
@@ -158,6 +177,11 @@ def benchmark(args: argparse.Namespace) -> Path:
         "view_count": len(image_entries),
         "width": int(args.width),
         "height": int(args.height),
+        "native_render_resolution_wh": [int(args.width), int(args.height)],
+        "formal_evaluation_target_resolution_wh": [formal_width, formal_height],
+        "native_raster_matches_formal_target": (
+            (int(args.width), int(args.height)) == (formal_width, formal_height)
+        ),
         "render_wall_time_s": render_wall_time_s,
         "render_test_views_per_s": len(image_entries) / render_wall_time_s,
         "loaded_step": int(loaded_step),
