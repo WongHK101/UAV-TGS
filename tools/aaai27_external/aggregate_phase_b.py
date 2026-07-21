@@ -119,11 +119,32 @@ def flatten_metrics(row: dict[str, Any]) -> dict[str, float]:
         ),
     )
     benchmark = row.get("render_benchmark") or {}
+    render = row.get("render") or {}
     add(
         "render_test_views_per_s",
         benchmark.get(
             "render_test_views_per_s",
-            row.get("render_test_views_per_s", row.get("render_only_test_views_per_s")),
+            render.get(
+                "render_test_views_per_s",
+                row.get("render_test_views_per_s", row.get("render_only_test_views_per_s")),
+            ),
+        ),
+    )
+    add(
+        "render_wall_time_s",
+        benchmark.get(
+            "render_wall_time_s",
+            render.get(
+                "wall_time_s",
+                row.get("render_wall_time_s", row.get("render_only_wall_time_s")),
+            ),
+        ),
+    )
+    add(
+        "render_peak_vram_mib",
+        render.get(
+            "peak_vram_mib",
+            row.get("render_peak_vram_mib", row.get("render_only_peak_vram_mib")),
         ),
     )
     model = row.get("model") or {}

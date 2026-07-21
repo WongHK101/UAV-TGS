@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from tools.aaai27_external.aggregate_phase_b import METHODS, SCENES, aggregate
+from tools.aaai27_external.aggregate_phase_b import (
+    METHODS,
+    SCENES,
+    aggregate,
+    flatten_metrics,
+)
 
 
 def row(scene: str, method: str, status: str, metrics: dict[str, float]):
@@ -41,3 +46,33 @@ def test_missing_endpoint_is_explicit():
     assert len(summary["completion_matrix"]) == len(METHODS) * len(SCENES)
     assert {item["status"] for item in summary["completion_matrix"]} == {"MISSING"}
     assert not summary["all_30_endpoints_complete"]
+
+
+def test_efficiency_uses_native_benchmark_or_official_render_receipt():
+    native = flatten_metrics(
+        {
+            "render_benchmark": {
+                "render_test_views_per_s": 1.5,
+                "render_wall_time_s": 20.0,
+            },
+            "render": {
+                "render_test_views_per_s": 0.5,
+                "wall_time_s": 60.0,
+                "peak_vram_mib": 1234.0,
+            },
+        }
+    )
+    assert native["render_test_views_per_s"] == 1.5
+    assert native["render_wall_time_s"] == 20.0
+    assert native["render_peak_vram_mib"] == 1234.0
+
+    official = flatten_metrics(
+        {
+            "render": {
+                "render_test_views_per_s": 0.5,
+                "wall_time_s": 60.0,
+            }
+        }
+    )
+    assert official["render_test_views_per_s"] == 0.5
+    assert official["render_wall_time_s"] == 60.0

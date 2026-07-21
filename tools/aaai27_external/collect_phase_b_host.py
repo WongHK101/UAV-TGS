@@ -93,10 +93,26 @@ def collect_endpoint(root: Path, scene: str, method: str) -> dict[str, Any]:
         }
     render = optional_json(run_root / "render_receipt.json")
     if render:
+        render_wall_time_s = render.get("wall_time_s")
+        binding = optional_json(run_root / "normalized_thermal/render_binding_manifest.json")
+        binding_rows = binding.get("rows") if binding else None
+        view_count = len(binding_rows) if isinstance(binding_rows, list) else None
         result["render"] = {
             "status": render.get("status"),
-            "wall_time_s": render.get("wall_time_s"),
+            "wall_time_s": render_wall_time_s,
             "peak_vram_mib": render.get("peak_process_vram_mib"),
+            "view_count": view_count,
+            "render_test_views_per_s": (
+                view_count / float(render_wall_time_s)
+                if view_count is not None
+                and render_wall_time_s is not None
+                and float(render_wall_time_s) > 0.0
+                else None
+            ),
+            "timing_scope": (
+                "frozen official test-render command wall time divided by the "
+                "formal test-view count; includes process/model setup"
+            ),
         }
     if status != "SUCCEEDED":
         return result
