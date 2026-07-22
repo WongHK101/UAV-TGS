@@ -141,6 +141,13 @@ LABELS = {
     "render_latency_ms_per_view": "Render latency (ms/view)↓",
     "render_fps": "FPS↑",
     "inference_peak_allocated_gib": "Inference VRAM (GiB)↓",
+    "avg_training_time_per_scene_s": "Avg. training time / scene (s)↓",
+    "post_anchor_training_time_per_scene_s": "Post-anchor training time / scene (s)↓",
+    "avg_peak_training_vram_gib": "Avg. peak training VRAM (GiB)↓",
+    "avg_deployable_model_size_mib": "Avg. deployable model size (MiB)↓",
+    "avg_gaussian_count_m": "Avg. Gaussians (M)↓",
+    "scene_equal_render_latency_ms_per_view": "Scene-equal render latency (ms/view)↓",
+    "avg_peak_inference_vram_gib": "Avg. peak inference VRAM (GiB)↓",
 }
 
 
@@ -159,6 +166,49 @@ def _sha256(path: Path) -> str:
 def _read_csv(path: Path) -> list[dict[str, str]]:
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         return list(csv.DictReader(handle))
+
+
+def _load_model_asset_inventory(path: Path) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[str, Any]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schema") != "uav-tgs-aaai27-deployable-model-assets-v1":
+        raise ValueError(f"unexpected deployable-model inventory schema: {path}")
+    rows = payload.get("rows")
+    if not isinstance(rows, list):
+        raise ValueError("deployable-model inventory rows must be a list")
+    index: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        key = (str(row["scene"]), str(row["method"]))
+        if key in index:
+            raise ValueError(f"duplicate deployable-model inventory row: {key}")
+        assets = row.get("assets")
+        if not isinstance(assets, list) or not assets:
+            raise ValueError(f"deployable-model row has no assets: {key}")
+        sizes = [int(asset["size_bytes"]) for asset in assets]
+        if any(value <= 0 for value in sizes):
+            raise ValueError(f"non-positive deployable-model asset size: {key}")
+        if int(row["model_size_bytes"]) != sum(sizes):
+            raise ValueError(f"deployable-model size sum mismatch: {key}")
+        index[key] = row
+    expected = {
+        *((scene, method) for scene in REPRESENTATIVE_SCENES for method in INTERNAL_METHODS),
+        *((scene, method) for scene in REPRESENTATIVE_SCENES for method in EXTERNAL_METHODS),
+    }
+    if set(index) != expected:
+        raise ValueError(
+            "deployable-model inventory matrix mismatch: "
+            f"missing={sorted(expected - set(index))} extra={sorted(set(index) - expected)}"
+        )
+    return index, payload
+
+
+def _apply_model_sizes(
+    rows: Iterable[dict[str, Any]], inventory: dict[tuple[str, str], dict[str, Any]]
+) -> None:
+    for row in rows:
+        key = (row["scene"], row["method"])
+        asset = inventory.get(key)
+        if asset is not None:
+            row["model_size_bytes"] = float(asset["model_size_bytes"])
 
 
 def _float(value: Any) -> float | None:
@@ -386,19 +436,51 @@ def _enrich_units(value: dict[str, Any], benchmark: dict[str, float] | None = No
     return result
 
 
+def _scene_equal_efficiency(value: dict[str, Any], *, post_anchor: bool) -> dict[str, Any]:
+    """Expose unambiguous headers for six-scene macro efficiency values."""
+    result = dict(value)
+    result["avg_training_time_per_scene_s"] = result.get("reported_method_wall_time_s")
+    result["post_anchor_training_time_per_scene_s"] = (
+        result.get("reported_method_wall_time_s") if post_anchor else None
+    )
+    result["avg_peak_training_vram_gib"] = result.get("train_peak_vram_gib")
+    result["avg_deployable_model_size_mib"] = result.get("model_size_mib")
+    result["avg_gaussian_count_m"] = result.get("gaussian_count_m")
+    result["scene_equal_render_latency_ms_per_view"] = result.get("render_latency_ms_per_view")
+    result["avg_peak_inference_vram_gib"] = result.get("inference_peak_allocated_gib")
+    return result
+
+
 def _format(value: Any, field: str) -> str:
     if value is None:
         return "N/A"
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
     if isinstance(value, str):
         return value
     if field in {"scene_count"}:
         return str(int(value))
     if field in {"rgb_psnr", "thermal_psnr", "render_latency_ms_per_view", "render_fps"}:
         return f"{value:.2f}"
-    if field in {"reported_method_wall_time_s"}:
+    if field in {
+        "reported_method_wall_time_s",
+        "avg_training_time_per_scene_s",
+        "post_anchor_training_time_per_scene_s",
+    }:
         return f"{value:.1f}"
-    if field in {"gaussian_count_m", "model_size_mib", "train_peak_vram_gib", "inference_peak_allocated_gib"}:
+    if field in {
+        "gaussian_count_m",
+        "model_size_mib",
+        "train_peak_vram_gib",
+        "inference_peak_allocated_gib",
+        "avg_peak_training_vram_gib",
+        "avg_deployable_model_size_mib",
+        "avg_gaussian_count_m",
+        "avg_peak_inference_vram_gib",
+    }:
         return f"{value:.3f}"
+    if field == "scene_equal_render_latency_ms_per_view":
+        return f"{value:.2f}"
     if field.startswith("temperature_") or field == "depth_median_abs_error_m":
         return f"{value:.3f}"
     return f"{value:.4f}"
@@ -494,6 +576,11 @@ def aggregate(args: argparse.Namespace) -> Path:
     if len(external) != 30 or any(row["status"] != "SUCCEEDED" for row in external):
         raise ValueError("External Phase B must contain 30 successful rows")
 
+    model_assets, model_asset_payload = _load_model_asset_inventory(args.model_assets)
+    _apply_model_sizes(phase1, model_assets)
+    _apply_model_sizes(external, model_assets)
+    _apply_model_sizes(phase2, model_assets)
+
     benchmark_raw, benchmark_macros = _load_benchmarks(args.benchmark_root)
     benchmark_by_key = {
         (row["result_method"], row["scene"]): row for row in benchmark_raw
@@ -533,6 +620,27 @@ def aggregate(args: argparse.Namespace) -> Path:
         args.output / "merged_per_scene_results.json",
         {"schema": SCHEMA, "created_at": _now(), "rows": merged},
     )
+    model_asset_rows = []
+    for item in model_asset_payload["rows"]:
+        model_asset_rows.append(
+            {
+                "scene": item["scene"],
+                "method": item["method"],
+                "host": item["host"],
+                "asset_count": item["asset_count"],
+                "model_size_bytes": item["model_size_bytes"],
+                "assets": "; ".join(
+                    f"{asset['role']}={asset['path']} ({asset['size_bytes']} B)"
+                    for asset in item["assets"]
+                ),
+            }
+        )
+    _csv(
+        args.output / "deployable_model_asset_inventory.csv",
+        model_asset_rows,
+        ("scene", "method", "host", "asset_count", "model_size_bytes", "assets"),
+    )
+    _atomic_json(args.output / "deployable_model_asset_inventory.json", model_asset_payload)
 
     table1_rows = [_enrich_units(row) for row in phase2]
     table1_macro: dict[str, Any] = {"scene": "Scene-equal macro", "display_name": "SCSP-Refit+F3"}
@@ -571,45 +679,110 @@ def aggregate(args: argparse.Namespace) -> Path:
             else "adaptive_opacity_scale_clamp" if table_method == "ours_adapt"
             else table_method
         )
-        table2_rows.append(_enrich_units(_macro(rows, table_method, display), benchmark_macros[source_method]))
+        table2_rows.append(
+            _scene_equal_efficiency(
+                _enrich_units(_macro(rows, table_method, display), benchmark_macros[source_method]),
+                post_anchor=False,
+            )
+        )
 
     table3_rows: list[dict[str, Any]] = []
     for method in INTERNAL_METHODS:
         rows = [row for row in phase1 if row["method"] == method]
         table3_rows.append(
-            _enrich_units(_macro(rows, method, DISPLAY_NAMES[method]), benchmark_macros[method])
+            _scene_equal_efficiency(
+                _enrich_units(_macro(rows, method, DISPLAY_NAMES[method]), benchmark_macros[method]),
+                post_anchor=True,
+            )
         )
 
-    table1_fields = (
+    table1_full_fields = (
         "scene",
         *PRIMARY_METRICS,
         "reported_method_wall_time_s",
         "train_peak_vram_gib",
         "gaussian_count_m",
     )
-    comparison_fields = (
+    table2_full_fields = (
         "display_name",
         *PRIMARY_METRICS,
-        "reported_method_wall_time_s",
-        "train_peak_vram_gib",
-        "model_size_mib",
-        "gaussian_count_m",
-        "render_latency_ms_per_view",
+        "avg_training_time_per_scene_s",
+        "avg_peak_training_vram_gib",
+        "avg_deployable_model_size_mib",
+        "avg_gaussian_count_m",
+        "scene_equal_render_latency_ms_per_view",
         "render_fps",
-        "inference_peak_allocated_gib",
+        "avg_peak_inference_vram_gib",
     )
-    _write_table(args.output, "table1_scsp_11scene", table1_rows, table1_fields)
-    _write_table(args.output, "table2_external_sixscene_macro", table2_rows, comparison_fields)
-    _write_table(args.output, "table3_internal_ablation_sixscene_macro", table3_rows, comparison_fields)
+    table3_full_fields = tuple(
+        "post_anchor_training_time_per_scene_s"
+        if field == "avg_training_time_per_scene_s"
+        else field
+        for field in table2_full_fields
+    )
+    table1_compact_fields = (
+        "scene",
+        "rgb_psnr",
+        "thermal_psnr",
+        "thermal_lpips",
+        "temperature_mae_c",
+        "hotspot_auprc",
+        "depth_front_1m",
+        "depth_agreement_1m",
+        "depth_median_abs_error_m",
+    )
+    table2_compact_fields = (
+        "display_name",
+        *table1_compact_fields[1:],
+        "avg_training_time_per_scene_s",
+        "render_fps",
+        "avg_peak_inference_vram_gib",
+    )
+    table3_compact_fields = (
+        "display_name",
+        *table1_compact_fields[1:],
+        "post_anchor_training_time_per_scene_s",
+    )
+    _write_table(args.output, "table1_main_11scene_compact", table1_rows, table1_compact_fields)
+    _write_table(args.output, "table2_main_external_sixscene_compact", table2_rows, table2_compact_fields)
+    _write_table(args.output, "table3_main_internal_ablation_compact", table3_rows, table3_compact_fields)
+    _write_table(
+        args.output,
+        "supplementary_table1_scsp_11scene_full_metrics",
+        table1_rows,
+        table1_full_fields,
+    )
+    _write_table(
+        args.output,
+        "supplementary_table2_external_sixscene_full_metrics",
+        table2_rows,
+        table2_full_fields,
+    )
+    _write_table(
+        args.output,
+        "supplementary_table3_internal_ablation_full_metrics",
+        table3_rows,
+        table3_full_fields,
+    )
 
     full_macro_rows: list[dict[str, Any]] = []
     for method in INTERNAL_METHODS:
         rows = [row for row in phase1 if row["method"] == method]
-        full_macro_rows.append(_enrich_units(_macro(rows, method, DISPLAY_NAMES[method]), benchmark_macros[method]))
+        full_macro_rows.append(
+            _scene_equal_efficiency(
+                _enrich_units(_macro(rows, method, DISPLAY_NAMES[method]), benchmark_macros[method]),
+                post_anchor=True,
+            )
+        )
     for method in EXTERNAL_METHODS:
         rows = [row for row in external if row["method"] == method]
-        full_macro_rows.append(_enrich_units(_macro(rows, method, DISPLAY_NAMES[method]), benchmark_macros[method]))
-    supplementary_fields = comparison_fields + SUPPLEMENTARY_METRICS
+        full_macro_rows.append(
+            _scene_equal_efficiency(
+                _enrich_units(_macro(rows, method, DISPLAY_NAMES[method]), benchmark_macros[method]),
+                post_anchor=False,
+            )
+        )
+    supplementary_fields = table2_full_fields + SUPPLEMENTARY_METRICS
     _write_table(
         args.output,
         "supplementary_sixscene_full_metric_macro",
@@ -743,7 +916,13 @@ def aggregate(args: argparse.Namespace) -> Path:
     ]
     _atomic_text(args.output / "BENCHMARK_SCOPE_AND_HARDWARE.md", "\n".join(scope_lines))
 
-    input_files = [args.phase1_metrics, args.phase1_cost, args.phase2_metrics, args.external_metrics]
+    input_files = [
+        args.phase1_metrics,
+        args.phase1_cost,
+        args.phase2_metrics,
+        args.external_metrics,
+        args.model_assets,
+    ]
     provenance = {
         "schema": SCHEMA,
         "created_at": _now(),
@@ -776,6 +955,15 @@ def aggregate(args: argparse.Namespace) -> Path:
             "Table 2 Ours rows use RGB Stage-1 plus the complete variant stage; "
             "Table 1 and Table 3 retain post-anchor incremental method time."
         ),
+        "deployable_model_size_scope": (
+            "Sum of the actual frozen endpoint assets required to produce the formal RGB and "
+            "thermal outputs. Optimizer state, intermediate checkpoints, logs, render caches, "
+            "and small configuration files are excluded; identical physical files are counted once."
+        ),
+        "gaussian_count_scope": (
+            "Count of the unique spatial representation used by the formal thermal renderer; "
+            "separate RGB/thermal appearance endpoints do not double the Gaussian count."
+        ),
     }
     _atomic_json(args.output / "completion_provenance_summary.json", provenance)
 
@@ -786,28 +974,132 @@ def aggregate(args: argparse.Namespace) -> Path:
 - **Internal roles:** SCSP-Refit+F3 is the RGB/geometry-stable main method; Adaptive Opacity+Scale-Clamp is the thermal-fidelity operating point.
 - **Adaptive RGB:** formal RGB Stage-1 anchor metrics are used directly, without rerendering or a special table marker.
 - **Efficiency:** render latency is the unified in-memory render-only benchmark on one RTX PRO 6000. Scene macro latency is the arithmetic mean of six scene medians and macro FPS is its reciprocal.
+- **Scene-equal efficiency headers:** training time, peak training VRAM, deployable model size, Gaussian count, and peak inference VRAM are arithmetic means of the six per-scene values; they are not six-scene totals or cross-scene maxima.
+- **Deployable model size:** sum of actual frozen model assets needed for the row's formal RGB and thermal outputs; optimizer/intermediate state, logs, render caches, and small config files are excluded. Identical physical files are counted once.
+- **Gaussian count:** the unique spatial representation/formal thermal renderer count; two appearance endpoints do not double it.
 - **Interpretation:** OMMG/MMOne can be stronger on temperature/hotspot metrics; no claim is made that one method wins every metric.
 """
     _atomic_text(args.output / "TABLE_NOTES.md", notes)
 
+    def winner(field: str, *, higher: bool) -> str:
+        available = [row for row in table2_rows if row.get(field) is not None]
+        key = (lambda row: row[field]) if higher else (lambda row: -row[field])
+        return max(available, key=key)["method"]
+
+    macro_checks: list[dict[str, Any]] = []
+
+    def check_macro(label: str, source_rows: Sequence[dict[str, Any]], macro_row: dict[str, Any]) -> None:
+        max_difference = 0.0
+        checked = 0
+        for field in PRIMARY_METRICS + EFFICIENCY_FIELDS:
+            values = [
+                float(row[field])
+                for row in source_rows
+                if row.get(field) is not None and math.isfinite(float(row[field]))
+            ]
+            expected = sum(values) / len(values) if values else None
+            observed = macro_row.get(field)
+            if expected is None and observed is None:
+                continue
+            if expected is None or observed is None:
+                raise ValueError(f"macro availability mismatch for {label}/{field}")
+            difference = abs(float(observed) - expected)
+            max_difference = max(max_difference, difference)
+            checked += 1
+        if max_difference > 1e-12:
+            raise ValueError(f"macro recompute mismatch for {label}: {max_difference}")
+        macro_checks.append(
+            {"label": label, "scene_count": len(source_rows), "field_count": checked, "max_abs_diff": max_difference}
+        )
+
+    check_macro("table1_ours_full_11scene", phase2, table1_rows[-1])
+    for (table_method, _, source_rows), macro_row in zip(table2_sources, table2_rows, strict=True):
+        check_macro(f"table2_{table_method}_sixscene", source_rows, macro_row)
+    for method, macro_row in zip(INTERNAL_METHODS, table3_rows, strict=True):
+        check_macro(
+            f"table3_{method}_sixscene",
+            [row for row in phase1 if row["method"] == method],
+            macro_row,
+        )
+
+    expected_winners = {
+        "rgb_psnr": ("ours_full", True),
+        "rgb_ssim": ("ours_full", True),
+        "rgb_lpips": ("ours_full", False),
+        "thermal_psnr": ("ThermalGaussian-OMMG", True),
+        "thermal_ssim": ("MMOne", True),
+        "thermal_lpips": ("ThermalGaussian-OMMG", False),
+        "temperature_mae_c": ("MMOne", False),
+        "temperature_rmse_c": ("MMOne", False),
+        "hotspot_auprc": ("MMOne", True),
+        "depth_front_1m": ("ours_full", False),
+        "depth_front_2m": ("ours_full", False),
+        "depth_front_5m": ("ours_full", False),
+        "depth_agreement_1m": ("ours_full", True),
+        "depth_agreement_2m": ("ours_full", True),
+        "depth_agreement_5m": ("ours_full", True),
+        "depth_median_abs_error_m": ("ours_full", False),
+    }
+    observed_winners = {
+        field: winner(field, higher=higher)
+        for field, (_, higher) in expected_winners.items()
+    }
+    mismatches = {
+        field: {"expected": expected, "observed": observed_winners[field]}
+        for field, (expected, _) in expected_winners.items()
+        if observed_winners[field] != expected
+    }
+    if mismatches:
+        raise ValueError(f"frozen claim ranking mismatch: {mismatches}")
+
+    fastest_external_fps = max(
+        row["render_fps"] for row in table2_rows if row["method"] in EXTERNAL_METHODS
+    )
+    ours_full = next(row for row in table2_rows if row["method"] == "ours_full")
+    speedup = ours_full["render_fps"] / fastest_external_fps
     claim_matrix = [
         {
-            "claim": "SCSP-Refit+F3 is the RGB/geometry-stable main operating point",
-            "evidence": "Table 1 and Tables 2–3",
+            "claim": "Ours-Full has the best six-scene RGB PSNR, SSIM, and LPIPS",
+            "evidence": "Frozen Table 2 scene-equal macro",
             "allowed": True,
         },
         {
-            "claim": "Adaptive Opacity+Scale-Clamp is a thermal-fidelity operating point",
-            "evidence": "Tables 2–3",
+            "claim": "Ours-Full is overall best on unified expected-depth geometry metrics",
+            "evidence": "Frozen Table 2 expected-depth columns",
             "allowed": True,
         },
         {
-            "claim": "OMMG/MMOne may outperform ours on temperature or hotspot metrics",
-            "evidence": "Table 2",
+            "claim": "The three internal configurations occupy the same speed tier",
+            "evidence": "Unified native-resolution FPS; no fine-grained internal ranking is claimed",
             "allowed": True,
         },
         {
-            "claim": "One UAV-TGS configuration is best on all metrics",
+            "claim": f"Ours-Full is about {speedup:.2f}x the FPS of the fastest external method",
+            "evidence": "Unified native-resolution scene-equal render latency/FPS",
+            "allowed": True,
+        },
+        {
+            "claim": "ThermalGaussian-OMMG has the best T-PSNR and T-LPIPS",
+            "evidence": "Frozen Table 2 scene-equal macro",
+            "allowed": True,
+        },
+        {
+            "claim": "MMOne has the best T-SSIM, temperature MAE/RMSE, and hotspot AUPRC",
+            "evidence": "Frozen Table 2 scene-equal macro",
+            "allowed": True,
+        },
+        {
+            "claim": "Adaptive is an internal thermal-fidelity operating point",
+            "evidence": "Frozen Table 3 internal ablation",
+            "allowed": True,
+        },
+        {
+            "claim": "Adaptive is the best thermal method across all compared methods",
+            "evidence": "Contradicted by OMMG/MMOne in Table 2",
+            "allowed": False,
+        },
+        {
+            "claim": "One configuration is best on every reported metric",
             "evidence": "Not supported by the frozen matrix",
             "allowed": False,
         },
@@ -819,6 +1111,25 @@ def aggregate(args: argparse.Namespace) -> Path:
     ]
     _csv(args.output / "claim_matrix.csv", claim_matrix, ("claim", "evidence", "allowed"))
     _atomic_text(args.output / "claim_matrix.md", _markdown(claim_matrix, ("claim", "evidence", "allowed")))
+    _atomic_json(
+        args.output / "directed_aggregation_checks.json",
+        {
+            "schema": "uav-tgs-aaai27-final-directed-aggregation-checks-v1",
+            "status": "passed",
+            "created_at": _now(),
+            "six_scene_macro_scene_count": len(REPRESENTATIVE_SCENES),
+            "table2_method_count": len(table2_rows),
+            "table3_method_count": len(table3_rows),
+            "deployable_model_inventory_row_count": len(model_assets),
+            "ranking_winners": observed_winners,
+            "ours_full_fps": ours_full["render_fps"],
+            "fastest_external_fps": fastest_external_fps,
+            "ours_full_speedup_vs_fastest_external": speedup,
+            "compact_tables_share_in_memory_rows_with_full_tables": True,
+            "macro_policy": "arithmetic mean of six per-scene values",
+            "macro_recompute_checks": macro_checks,
+        },
+    )
 
     final_report = "\n".join(
         [
@@ -828,10 +1139,10 @@ def aggregate(args: argparse.Namespace) -> Path:
             "",
             "## Formal outputs",
             "",
-            "- Table 1: SCSP-Refit+F3 on all 11 scenes plus a scene-equal macro.",
-            "- Table 2: seven-method six-scene external comparison.",
-            "- Table 3: Raw-F3 / SCSP-Refit+F3 / Adaptive internal ablation.",
-            "- Supplement: eight-method six-scene full metrics, both per scene and scene-equal macro.",
+            "- Compact Table 1: Ours-Full on all 11 scenes plus a scene-equal macro.",
+            "- Compact Table 2: seven-method six-scene external comparison.",
+            "- Compact Table 3: Raw-F3 / Ours-Full / Adaptive internal ablation.",
+            "- Supplement: full-metric versions of Tables 1-3 and the eight-method per-scene/macro tables.",
             "",
             "## Unified render-only benchmark",
             "",
@@ -850,6 +1161,8 @@ def aggregate(args: argparse.Namespace) -> Path:
             "- Geometry means OpenMVS-referenced held-out expected-depth consistency, not true-depth accuracy.",
             "- SCSP-Refit+F3 is the RGB/geometry-stable main method; Adaptive is the thermal-fidelity operating point.",
             "- Table 2 Ours training time includes RGB Stage-1 plus the complete variant stage; Table 1 and Table 3 use post-anchor incremental time.",
+            "- Six-scene efficiency columns are scene-equal means, not totals or cross-scene maxima.",
+            "- Deployable model size sums the actual required frozen RGB/thermal assets; Gaussian count remains the unique spatial representation count.",
             "- PhysIR-Splat-SH† is the frozen thermal-SH configuration, not the complete physical renderer or VGGT-IR path.",
             "- No claim is made that one configuration wins every metric.",
             "",
@@ -879,6 +1192,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--phase1-cost", type=Path, required=True)
     parser.add_argument("--phase2-metrics", type=Path, required=True)
     parser.add_argument("--external-metrics", type=Path, required=True)
+    parser.add_argument("--model-assets", type=Path, required=True)
     parser.add_argument("--benchmark-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     return parser

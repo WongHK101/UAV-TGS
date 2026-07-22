@@ -7,8 +7,13 @@ import pytest
 
 from tools.aaai27_final.aggregate_final_tables import (
     BENCHMARK_TO_RESULT,
+    EXTERNAL_METHODS,
+    INTERNAL_METHODS,
     REPRESENTATIVE_SCENES,
+    _apply_model_sizes,
     _load_benchmarks,
+    _load_model_asset_inventory,
+    _scene_equal_efficiency,
     _with_total_training_scope,
 )
 from tools.aaai27_final.benchmark_render_only import _order_views
@@ -92,3 +97,52 @@ def test_external_table_uses_full_internal_training_cost() -> None:
     assert result["reported_method_wall_time_s"] == 30.0
     assert result["train_peak_vram_bytes"] == 200.0
     assert row["reported_method_wall_time_s"] == 10.0
+
+
+def test_deployable_model_inventory_overrides_legacy_size(tmp_path: Path) -> None:
+    rows = []
+    for scene in REPRESENTATIVE_SCENES:
+        for method in (*INTERNAL_METHODS, *EXTERNAL_METHODS):
+            rows.append(
+                {
+                    "scene": scene,
+                    "method": method,
+                    "host": "test",
+                    "assets": [{"role": "endpoint", "path": "/frozen", "size_bytes": 7}],
+                    "asset_count": 1,
+                    "model_size_bytes": 7,
+                }
+            )
+    path = tmp_path / "assets.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "uav-tgs-aaai27-deployable-model-assets-v1",
+                "rows": rows,
+            }
+        ),
+        encoding="utf-8",
+    )
+    inventory, _ = _load_model_asset_inventory(path)
+    result_rows = [{"scene": "Building", "method": "raw_f3", "model_size_bytes": 999.0}]
+    _apply_model_sizes(result_rows, inventory)
+    assert result_rows[0]["model_size_bytes"] == 7.0
+
+
+def test_scene_equal_efficiency_has_unambiguous_fields() -> None:
+    row = {
+        "reported_method_wall_time_s": 12.0,
+        "train_peak_vram_gib": 3.0,
+        "model_size_mib": 4.0,
+        "gaussian_count_m": 5.0,
+        "render_latency_ms_per_view": 6.0,
+        "inference_peak_allocated_gib": 7.0,
+    }
+    result = _scene_equal_efficiency(row, post_anchor=True)
+    assert result["avg_training_time_per_scene_s"] == 12.0
+    assert result["post_anchor_training_time_per_scene_s"] == 12.0
+    assert result["avg_peak_training_vram_gib"] == 3.0
+    assert result["avg_deployable_model_size_mib"] == 4.0
+    assert result["avg_gaussian_count_m"] == 5.0
+    assert result["scene_equal_render_latency_ms_per_view"] == 6.0
+    assert result["avg_peak_inference_vram_gib"] == 7.0
