@@ -477,14 +477,19 @@ def aggregate(args: argparse.Namespace) -> Path:
     benchmark_by_key = {
         (row["result_method"], row["scene"]): row for row in benchmark_raw
     }
-    for row in phase1 + external:
+    for row in phase1 + phase2 + external:
         benchmark = benchmark_by_key.get((row["method"], row["scene"]))
         if benchmark is not None:
             row["render_latency_ms_per_view"] = benchmark["median_ms_per_view"]
             row["render_fps"] = benchmark["views_per_s"]
             row["inference_peak_allocated_bytes"] = benchmark["peak_cuda_allocated_bytes"]
 
-    merged = phase2 + phase1 + external
+    # Phase 2 is the authoritative 11-scene SCSP source.  Do not duplicate its
+    # six representative-scene rows from Phase 1 in the merged evidence table.
+    merged = phase2 + [row for row in phase1 if row["method"] != "scsp_refit_f3"] + external
+    merged_keys = [(row["method"], row["scene"]) for row in merged]
+    if len(merged_keys) != len(set(merged_keys)):
+        raise ValueError("merged per-scene evidence contains duplicate method/scene rows")
     merged_fields = (
         "scene",
         "method",
@@ -712,6 +717,7 @@ def aggregate(args: argparse.Namespace) -> Path:
             "sha256": _sha256(Path(__file__).resolve()),
         },
         "counts": {
+            "merged_per_scene_rows": len(merged),
             "table1_rows_including_macro": len(table1_rows),
             "table2_methods": len(table2_rows),
             "table3_methods": len(table3_rows),
