@@ -188,8 +188,10 @@ def _matrix(project: Path, benchmark: Path) -> list[dict[str, Any]]:
     jobs: list[dict[str, Any]] = []
     uav_python = project / "environments/uav-tgs/bin/python"
     thermo_python = project / "external_phase_a/environments/thermonerf/bin/python"
-    for method in METHODS:
-        for scene, count in SCENES.items():
+    # Scene-major order completes all eight Building correctness checks before
+    # any non-Building timing job starts.
+    for scene, count in SCENES.items():
+        for method in METHODS:
             model_root, iteration = _model_root(project, benchmark, scene, method)
             source = _source_repo(project, method)
             test_list = project / "derived/aaai27_hold8_v2" / scene / "runtime_lists/thermal_test_list.txt"
@@ -286,6 +288,7 @@ def _valid_receipt(path: Path, job: dict[str, Any]) -> bool:
     if not path.is_file():
         return False
     payload = json.loads(path.read_text(encoding="utf-8"))
+    wrapper = Path(__file__).resolve().with_name("benchmark_render_only.py")
     return (
         payload.get("status") == "completed"
         and payload.get("method") == job["method"]
@@ -293,6 +296,7 @@ def _valid_receipt(path: Path, job: dict[str, Any]) -> bool:
         and payload.get("view_count") == job["view_count"]
         and payload.get("output_resolution_wh") == job["formal_resolution_wh"]
         and len(payload.get("passes", [])) == 3
+        and payload.get("benchmark_wrapper", {}).get("sha256") == _sha256(wrapper)
     )
 
 
