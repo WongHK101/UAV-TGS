@@ -1,5 +1,6 @@
 import argparse
 import json
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -67,6 +68,9 @@ class PipelineThermalRecipeTests(unittest.TestCase):
 
     def test_legacy_default_train_tokens_remain_exact(self):
         payload, tokens = self._dry_run()
+        train1_tokens = shlex.split(payload["cmds"]["train1_cmd"])
+        self.assertEqual(self._value(train1_tokens, "-r"), "-1")
+        self.assertEqual(self._value(tokens, "-r"), "-1")
         suffix = tokens[tokens.index("--iterations") :]
         self.assertEqual(
             suffix,
@@ -97,6 +101,10 @@ class PipelineThermalRecipeTests(unittest.TestCase):
         self.assertEqual(protocol["thermal_checkpoint_offsets_configured"], [10000, 20000, 30000])
         self.assertEqual(protocol["thermal_checkpoint_iterations"], [60000])
         self.assertFalse(protocol["thermal_checkpoint_offsets_applied"])
+
+    def test_explicit_legacy_quarter_resolution_remains_available(self):
+        _payload, tokens = self._dry_run("--t_res", "4")
+        self.assertEqual(self._value(tokens, "-r"), "4")
 
     def test_aaai_strict_resolves_and_forwards_complete_protocol(self):
         payload, tokens = self._dry_run("--thermal_recipe", "aaai_strict")

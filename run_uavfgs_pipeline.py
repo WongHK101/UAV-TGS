@@ -1236,7 +1236,16 @@ def main() -> None:
 
     # Stage 1 training defaults (RGB)
     ap.add_argument("--rgb_iter", type=int, default=30000)
-    ap.add_argument("--rgb_res", type=int, default=4)
+    ap.add_argument(
+        "--rgb_res",
+        type=int,
+        default=-1,
+        help=(
+            "RGB training/render resolution argument (default: -1, native input "
+            "resolution with the standard 3DGS 1600-pixel auto cap). Use 4 only "
+            "for explicit legacy quarter-resolution reproduction."
+        ),
+    )
     ap.add_argument("--rgb_densify_from", type=int, default=1500)
     ap.add_argument("--rgb_densify_until", type=int, default=10000)
     ap.add_argument("--rgb_densify_interval", type=int, default=300)
@@ -1345,7 +1354,16 @@ def main() -> None:
 
     # Stage 2 training defaults (Thermal)
     ap.add_argument("--t_iter", type=int, default=60000)
-    ap.add_argument("--t_res", type=int, default=4)
+    ap.add_argument(
+        "--t_res",
+        type=int,
+        default=-1,
+        help=(
+            "Thermal training/render resolution argument (default: -1, native input "
+            "resolution with the standard 3DGS 1600-pixel auto cap). Use 4 only "
+            "for explicit legacy quarter-resolution reproduction."
+        ),
+    )
     ap.add_argument("--t_feature_lr", type=float, default=0.001)
     ap.add_argument("--t_opacity_lr", type=float, default=2e-4,
                     help="Thermal-only opacity lr (default: 2e-4)")

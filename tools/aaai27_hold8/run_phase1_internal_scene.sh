@@ -16,6 +16,11 @@ ROOT="${UAV_TGS_ROOT:-/root/autodl-tmp/UAV-TGS}"
 CODE="$ROOT/code"
 PY="$ROOT/environments/uav-tgs/bin/python"
 PROTOCOL_ID=uav-tgs-aaai27-hold8-v2
+EXPERIMENT_ID="${UAV_TGS_EXPERIMENT_ID:-aaai27_hold8_v2_native}"
+TRAIN_RESOLUTION="${UAV_TGS_TRAIN_RESOLUTION:--1}"
+APPEARANCE_RESOLUTION="${UAV_TGS_APPEARANCE_RESOLUTION:-$TRAIN_RESOLUTION}"
+case "$TRAIN_RESOLUTION" in -1|1|2|4|8) ;; *) echo "unsupported training resolution: $TRAIN_RESOLUTION" >&2; exit 2 ;; esac
+case "$APPEARANCE_RESOLUTION" in -1|1|2|4|8) ;; *) echo "unsupported appearance resolution: $APPEARANCE_RESOLUTION" >&2; exit 2 ;; esac
 
 case "$SCENE" in
   Building) SLUG=building; TOTAL=614; TRAIN=537; TEST=77; DECODE_PROTO=aaai_second_review_v1 ;;
@@ -54,12 +59,12 @@ TEMP_UD="$DERIVED/thermal_undistorted"
 THERMAL="$DERIVED/thermal_benchmark"
 FORMAL_SUPPORT="$DERIVED/formal_support"
 HOTSPOT="$DERIVED/radiometry/hotspot_threshold_train_q95.json"
-EXP="$ROOT/experiments/aaai27_hold8_v2/$SCENE"
+EXP="$ROOT/experiments/$EXPERIMENT_ID/$SCENE"
 RGB_ROOT="$EXP/rgb_anchor"
 RGB_MODEL="$RGB_ROOT/Model_RGB"
 RGB_CKPT="$RGB_MODEL/chkpnt30000.pth"
 RGB_PLY="$RGB_MODEL/point_cloud/iteration_30000/point_cloud.ply"
-LOG_ROOT="$ROOT/logs/experiments/aaai27_hold8_v2/$SCENE"
+LOG_ROOT="$ROOT/logs/experiments/$EXPERIMENT_ID/$SCENE"
 HEAD="$(git -C "$CODE" rev-parse HEAD)"
 COLMAP="$ROOT/tools/colmap-4.1.0-cuda12.8-ceres2.3dev-cudss0.8-sm120/bin/colmap"
 COLMAP_SHA=fd0d5597820afd3212215f61d979313fa7671a34dbdc64ef3d8398d5589cfc63
@@ -276,6 +281,32 @@ prepare_scene() {
 
 run_rgb() {
   prepare_scene
+  mkdir -p "$EXP/protocol"
+  "$PY" - "$EXP/protocol/resolution_policy.json" "$EXPERIMENT_ID" \
+    "$TRAIN_RESOLUTION" "$APPEARANCE_RESOLUTION" "$HEAD" <<'PY'
+import json, os, sys
+from pathlib import Path
+
+output, experiment_id, training_resolution, appearance_resolution, commit = sys.argv[1:]
+value = {
+    "schema": "uav-tgs-internal-resolution-policy-v1",
+    "experiment_id": experiment_id,
+    "training_resolution_argument": int(training_resolution),
+    "appearance_resolution_argument": int(appearance_resolution),
+    "native_auto": int(training_resolution) == -1,
+    "legacy_quarter_resolution": int(training_resolution) == 4,
+    "code_commit": commit,
+}
+target = Path(output)
+if target.is_file():
+    existing = json.loads(target.read_text(encoding="utf-8"))
+    if existing != value:
+        raise RuntimeError(f"resolution policy mismatch: {existing!r} != {value!r}")
+else:
+    temporary = target.with_name(target.name + f".tmp-{os.getpid()}")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, target)
+PY
   if [[ -f "$RGB_ROOT/STATUS" ]]; then test "$(tr -d '\r\n' < "$RGB_ROOT/STATUS")" = passed; return; fi
   test ! -e "$RGB_ROOT"
   mkdir -p "$RGB_ROOT" "$LOG_ROOT"
@@ -283,7 +314,7 @@ run_rgb() {
   "$PY" run_uavfgs_pipeline.py \
     --data_root "$WORK" --out_root "$RGB_ROOT" --rgb_dir "$CFR/rgb" --th_dir "$CFR/thermal" \
     --train_list "$RGB_TRAIN_LIST" --test_list "$RGB_TEST_LIST" \
-    --from_step 5 --to_step 7 --align fit --no_comparison --rgb_iter 30000 --rgb_res 4 \
+    --from_step 5 --to_step 7 --align fit --no_comparison --rgb_iter 30000 --rgb_res "$TRAIN_RESOLUTION" \
     --rgb_densify_from 1500 --rgb_densify_until 10000 --rgb_densify_interval 300 \
     --rgb_densify_grad 0.001 --rgb_lambda_dssim 0.3 \
     --ss_enable_rgb --ss_source colmap_sparse --ss_use_aabb false --ss_voxel_size 1.5 \
@@ -353,7 +384,7 @@ render_thermal() {
   local train_sha test_sha
   train_sha="$(sha "$THERMAL_TRAIN_LIST")"; test_sha="$(sha "$THERMAL_TEST_LIST")"
   cd "$CODE"
-  "$PY" render.py -s "$THERMAL" --images images -m "$model" -r 4 --eval \
+  "$PY" render.py -s "$THERMAL" --images images -m "$model" -r "$APPEARANCE_RESOLUTION" --eval \
     --train_list "$THERMAL_TRAIN_LIST" --test_list "$THERMAL_TEST_LIST" \
     --train_list_sha256 "$train_sha" --test_list_sha256 "$test_sha" --iteration "$iteration" \
     --skip_train --save_by_image_name --benchmark_efficiency --benchmark_warmup_views 10 \
@@ -376,7 +407,7 @@ run_raw_or_adaptive() {
     extra=(--opacity_lr 0.0002 --clamp_scale_max 10.0 --thermal_recipe legacy --thermal_optimizer_state restore --thermal_freeze_mode legacy --thermal_scale_clamp legacy --temperature_loss_mode none)
   fi
   cd "$CODE"
-  "$PY" train.py -s "$THERMAL" --images images -r 4 -m "$model" \
+  "$PY" train.py -s "$THERMAL" --images images -r "$TRAIN_RESOLUTION" -m "$model" \
     --train_list "$THERMAL_TRAIN_LIST" --test_list "$THERMAL_TEST_LIST" \
     --train_list_sha256 "$train_sha" --test_list_sha256 "$test_sha" --start_checkpoint "$RGB_CKPT" \
     --iterations "$iteration" --checkpoint_iterations "$iteration" --save_iterations "$iteration" --test_iterations "$iteration" \
@@ -450,7 +481,7 @@ PY
   anchor_ckpt="$anchor/chkpnt30000.pth"; anchor_ply="$anchor/point_cloud/iteration_30000/point_cloud.ply"
   "$PY" tools/build_fixed_camera_sequence.py --camera-names "$RGB_TRAIN_LIST" --output "$sequence" \
     --seed 0 --steps 5000 --scene "$SCENE" --split-sha256 "$train_sha" --anchor-sha256 "$(sha "$anchor_ckpt")"
-  "$PY" train.py -s "$WORK" --images images -r 4 --eval -m "$refit" \
+  "$PY" train.py -s "$WORK" --images images -r "$TRAIN_RESOLUTION" --eval -m "$refit" \
     --train_list "$RGB_TRAIN_LIST" --test_list "$RGB_TEST_LIST" --train_list_sha256 "$train_sha" --test_list_sha256 "$test_sha" \
     --start_checkpoint "$anchor_ckpt" --iterations 35000 --save_iterations 35000 --checkpoint_iterations 35000 --test_iterations 35000 \
     --position_lr_max_steps 30000 --rgb_continuation_anchor_iteration 30000 --rgb_continuation_scheduler_horizon 30000 \
@@ -460,7 +491,7 @@ PY
     2>&1 | tee "$method_root/logs/rgb_refit.log"
   local model="$method_root/model" refit_ckpt="$refit/chkpnt35000.pth" refit_ply="$refit/point_cloud/iteration_35000/point_cloud.ply"
   local ttrain ttest; ttrain="$(sha "$THERMAL_TRAIN_LIST")"; ttest="$(sha "$THERMAL_TEST_LIST")"
-  "$PY" train.py -s "$THERMAL" --images images -r 4 -m "$model" \
+  "$PY" train.py -s "$THERMAL" --images images -r "$TRAIN_RESOLUTION" -m "$model" \
     --train_list "$THERMAL_TRAIN_LIST" --test_list "$THERMAL_TEST_LIST" --train_list_sha256 "$ttrain" --test_list_sha256 "$ttest" \
     --start_checkpoint "$refit_ckpt" --iterations 65000 --checkpoint_iterations 65000 --save_iterations 65000 --test_iterations 65000 \
     --position_lr_init 0 --position_lr_final 0 --scaling_lr 0 --rotation_lr 0 --opacity_lr 0 --feature_lr 0.001 \

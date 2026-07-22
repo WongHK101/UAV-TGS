@@ -9,6 +9,8 @@ fi
 SCENE="$1"; METHOD="$2"
 ROOT="${UAV_TGS_ROOT:-/root/autodl-tmp/UAV-TGS}"
 CODE="$ROOT/code"; PY="$ROOT/environments/uav-tgs/bin/python"
+EXPERIMENT_ID="${UAV_TGS_EXPERIMENT_ID:-aaai27_hold8_v2_native}"
+RGB_APPEARANCE_RESOLUTION="${UAV_TGS_RGB_APPEARANCE_RESOLUTION:--1}"
 case "$SCENE" in
   Building) SLUG=building; DECODE_PROTO=aaai_second_review_v1 ;;
   InternalRoad) SLUG=internalroad; DECODE_PROTO=aaai_second_review_v1 ;;
@@ -35,12 +37,12 @@ RANGE="$DERIVED/radiometry/range_manifest.json"
 CANONICAL="$DERIVED/radiometry/canonical_manifest.json"
 HOTSPOT_THRESHOLD="$DERIVED/radiometry/hotspot_threshold_train_q95.json"
 RUNTIME="$DERIVED/runtime_lists"
-EXP="$ROOT/experiments/aaai27_hold8_v2/$SCENE"
+EXP="$ROOT/experiments/$EXPERIMENT_ID/$SCENE"
 METHOD_ROOT="$EXP/methods/$METHOD"
 REFERENCE="$DERIVED/reference_openmvs_hold8_v2/bound_expected_depth/manifest.json"
 EVAL_ROOT="$EXP/evaluation/$METHOD"
 BINDING="$EXP/protocol/formal_radiometry_evaluation_binding.json"
-LOG_ROOT="$ROOT/logs/experiments/aaai27_hold8_v2/$SCENE/evaluation/$METHOD"
+LOG_ROOT="$ROOT/logs/experiments/$EXPERIMENT_ID/$SCENE/evaluation/$METHOD"
 RGB_ANCHOR="$EXP/rgb_anchor/Model_RGB"
 
 sha() { sha256sum "$1" | awk '{print $1}'; }
@@ -101,7 +103,7 @@ trap on_error ERR
 
 cd "$CODE"
 if [[ ! -f "$RGB_MODEL/results.json" ]]; then
-  "$PY" render.py -s "$WORK" --images images -m "$RGB_MODEL" -r 4 --eval \
+  "$PY" render.py -s "$WORK" --images images -m "$RGB_MODEL" -r "$RGB_APPEARANCE_RESOLUTION" --eval \
     --train_list "$RUNTIME/train_list.txt" --test_list "$RUNTIME/test_list.txt" \
     --train_list_sha256 "$(sha "$RUNTIME/train_list.txt")" --test_list_sha256 "$(sha "$RUNTIME/test_list.txt")" \
     --iteration "$RGB_ITER" --skip_train --save_by_image_name > "$LOG_ROOT/rgb_render.log" 2>&1
