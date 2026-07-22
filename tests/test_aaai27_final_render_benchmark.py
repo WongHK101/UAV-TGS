@@ -9,6 +9,7 @@ from tools.aaai27_final.aggregate_final_tables import (
     BENCHMARK_TO_RESULT,
     REPRESENTATIVE_SCENES,
     _load_benchmarks,
+    _with_total_training_scope,
 )
 from tools.aaai27_final.benchmark_render_only import _order_views
 
@@ -76,3 +77,18 @@ def test_benchmark_macro_averages_latency_then_inverts(tmp_path: Path) -> None:
 def test_benchmark_matrix_rejects_missing_receipt(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="expected 48"):
         _load_benchmarks(tmp_path)
+
+
+def test_external_table_uses_full_internal_training_cost() -> None:
+    row = {
+        "scene": "Building",
+        "method": "scsp_refit_f3",
+        "reported_method_wall_time_s": 10.0,
+        "train_peak_vram_bytes": 100.0,
+        "total_training_wall_time_s": 30.0,
+        "total_train_peak_vram_bytes": 200.0,
+    }
+    result = _with_total_training_scope(row)
+    assert result["reported_method_wall_time_s"] == 30.0
+    assert result["train_peak_vram_bytes"] == 200.0
+    assert row["reported_method_wall_time_s"] == 10.0

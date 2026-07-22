@@ -144,6 +144,21 @@ def collect_scene(
         metrics[f"depth_agreement_{token}m"] = finite(row["agreement_rate"], "agreement rate")
     render = load(source_root / "efficiency/render_efficiency.json")
     cost = resolve_cost(method_root, raw_root, alias=alias)
+    rgb_stage = load(scene_root / "rgb_anchor/Model_RGB/train_efficiency.json")
+    rgb_time = finite(rgb_stage["wall_time_s"], "RGB Stage-1 time")
+    rgb_peak = finite(
+        rgb_stage["device"]["peak_torch_reserved_bytes"], "RGB Stage-1 peak VRAM"
+    )
+    cost.update(
+        {
+            "shared_rgb_anchor_wall_time_s": rgb_time,
+            "total_training_wall_time_s": rgb_time
+            + float(cost["reported_method_wall_time_s"]),
+            "total_training_peak_vram_bytes": max(
+                rgb_peak, float(cost["peak_vram_bytes"])
+            ),
+        }
+    )
     return {
         "scene": scene,
         "method": METHOD,

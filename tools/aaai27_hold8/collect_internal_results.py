@@ -243,6 +243,16 @@ def _build_training(
             "gaussian_count": gaussian_count,
         }
     )
+    rgb_stage = _load(Path(paths["scene_root"]) / "rgb_anchor/Model_RGB/train_efficiency.json")
+    rgb_time = float(rgb_stage["wall_time_s"])
+    rgb_peak = float(rgb_stage["device"]["peak_torch_reserved_bytes"])
+    breakdown.update(
+        {
+            "shared_rgb_anchor_wall_time_s": rgb_time,
+            "total_training_wall_time_s": rgb_time + method_time,
+            "total_training_peak_vram_bytes": max(rgb_peak, peak_vram),
+        }
+    )
     return training, breakdown
 
 
@@ -341,7 +351,22 @@ def collect(
                 aliases.append(alias)
                 cost_rows.append({"scene": scene, "method": method, "alias": True,
                                   "batch_execution_wall_time_s": 0.0,
-                                  "reported_method_wall_time_s": alias["reported_method_wall_time_s"]})
+                                  "reported_method_wall_time_s": alias["reported_method_wall_time_s"],
+                                  "shared_rgb_anchor_wall_time_s": next(
+                                      row["shared_rgb_anchor_wall_time_s"]
+                                      for row in cost_rows
+                                      if row["scene"] == scene and row["method"] == "raw_f3"
+                                  ),
+                                  "total_training_wall_time_s": next(
+                                      row["total_training_wall_time_s"]
+                                      for row in cost_rows
+                                      if row["scene"] == scene and row["method"] == "raw_f3"
+                                  ),
+                                  "total_training_peak_vram_bytes": next(
+                                      row["total_training_peak_vram_bytes"]
+                                      for row in cost_rows
+                                      if row["scene"] == scene and row["method"] == "raw_f3"
+                                  )})
                 row = {"scene": scene, "method": method,
                        "render_fps": source_evaluation["render_fps"], "alias": True}
                 row.update({name: value.get("value") for name, value in source_evaluation["metrics"].items()})

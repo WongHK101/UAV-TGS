@@ -200,7 +200,10 @@ def _canonical_internal(
     value.update(
         {
             "reported_method_wall_time_s": _float(record.get("reported_method_wall_time_s")),
+            "post_anchor_method_wall_time_s": _float(record.get("reported_method_wall_time_s")),
+            "total_training_wall_time_s": _float(record.get("total_training_wall_time_s")),
             "train_peak_vram_bytes": _float(record.get("peak_vram_bytes")),
+            "total_train_peak_vram_bytes": _float(record.get("total_training_peak_vram_bytes")),
             "model_size_bytes": _float(record.get("model_size_bytes")),
             "gaussian_count": _float(record.get("gaussian_count")),
             "alias": str(row.get("alias", "False")).casefold() == "true",
@@ -222,7 +225,10 @@ def _canonical_phase2(row: dict[str, str]) -> dict[str, Any]:
     value.update(
         {
             "reported_method_wall_time_s": _float(row.get("reported_method_wall_time_s")),
+            "post_anchor_method_wall_time_s": _float(row.get("reported_method_wall_time_s")),
+            "total_training_wall_time_s": _float(row.get("total_training_wall_time_s")),
             "train_peak_vram_bytes": _float(row.get("peak_vram_bytes")),
+            "total_train_peak_vram_bytes": _float(row.get("total_training_peak_vram_bytes")),
             "model_size_bytes": _float(row.get("model_size_bytes")),
             "gaussian_count": _float(row.get("gaussian_count")),
             "alias": str(row.get("alias_raw_f3", "False")).casefold() == "true",
@@ -269,6 +275,21 @@ def _canonical_external(row: dict[str, str]) -> dict[str, Any]:
         }
     )
     return value
+
+
+def _with_total_training_scope(row: dict[str, Any]) -> dict[str, Any]:
+    """Use full RGB Stage-1 + variant cost for the external comparison table."""
+    total_time = row.get("total_training_wall_time_s")
+    total_peak = row.get("total_train_peak_vram_bytes")
+    if total_time is None or total_peak is None:
+        raise ValueError(
+            f"missing total training cost for {row.get('scene')}/{row.get('method')}"
+        )
+    return {
+        **row,
+        "reported_method_wall_time_s": total_time,
+        "train_peak_vram_bytes": total_peak,
+    }
 
 
 def _load_benchmarks(root: Path) -> tuple[list[dict[str, Any]], dict[str, dict[str, float]]]:
@@ -499,6 +520,9 @@ def aggregate(args: argparse.Namespace) -> Path:
         *PRIMARY_METRICS,
         *SUPPLEMENTARY_METRICS,
         *EFFICIENCY_FIELDS,
+        "post_anchor_method_wall_time_s",
+        "total_training_wall_time_s",
+        "total_train_peak_vram_bytes",
         "render_latency_ms_per_view",
         "render_fps",
         "inference_peak_allocated_bytes",
@@ -517,8 +541,24 @@ def aggregate(args: argparse.Namespace) -> Path:
     table1_rows.append(_enrich_units(table1_macro))
 
     table2_sources: list[tuple[str, str, list[dict[str, Any]]]] = [
-        ("ours_full", "Ours-Full", [row for row in phase1 if row["method"] == "scsp_refit_f3"]),
-        ("ours_adapt", "Ours-Adapt", [row for row in phase1 if row["method"] == "adaptive_opacity_scale_clamp"]),
+        (
+            "ours_full",
+            "Ours-Full",
+            [
+                _with_total_training_scope(row)
+                for row in phase1
+                if row["method"] == "scsp_refit_f3"
+            ],
+        ),
+        (
+            "ours_adapt",
+            "Ours-Adapt",
+            [
+                _with_total_training_scope(row)
+                for row in phase1
+                if row["method"] == "adaptive_opacity_scale_clamp"
+            ],
+        ),
     ]
     table2_sources += [
         (method, DISPLAY_NAMES[method], [row for row in external if row["method"] == method])
@@ -732,6 +772,10 @@ def aggregate(args: argparse.Namespace) -> Path:
             "arithmetic mean of six scene median ms/view; FPS = 1000 / macro latency; "
             "per-scene FPS is never averaged"
         ),
+        "training_time_scope": (
+            "Table 2 Ours rows use RGB Stage-1 plus the complete variant stage; "
+            "Table 1 and Table 3 retain post-anchor incremental method time."
+        ),
     }
     _atomic_json(args.output / "completion_provenance_summary.json", provenance)
 
@@ -805,6 +849,7 @@ def aggregate(args: argparse.Namespace) -> Path:
             "",
             "- Geometry means OpenMVS-referenced held-out expected-depth consistency, not true-depth accuracy.",
             "- SCSP-Refit+F3 is the RGB/geometry-stable main method; Adaptive is the thermal-fidelity operating point.",
+            "- Table 2 Ours training time includes RGB Stage-1 plus the complete variant stage; Table 1 and Table 3 use post-anchor incremental time.",
             "- PhysIR-Splat-SH† is the frozen thermal-SH configuration, not the complete physical renderer or VGGT-IR path.",
             "- No claim is made that one configuration wins every metric.",
             "",
