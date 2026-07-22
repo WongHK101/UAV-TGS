@@ -694,12 +694,16 @@ def benchmark(args: argparse.Namespace) -> Path:
     allocated = int(torch.cuda.max_memory_allocated())
     reserved = int(torch.cuda.max_memory_reserved())
     gpu = torch.cuda.get_device_properties(torch.cuda.current_device())
-    source_commit = subprocess.run(
-        ["git", "-C", str(args.source_repo), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    source_commit = args.source_commit
+    if source_commit is None:
+        source_commit = subprocess.run(
+            ["git", "-C", str(args.source_repo), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    if len(source_commit) != 40 or any(value not in "0123456789abcdef" for value in source_commit):
+        raise ValueError(f"invalid source commit: {source_commit}")
     payload: dict[str, Any] = {
         "schema": SCHEMA,
         "status": "completed",
@@ -773,6 +777,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--display-name", required=True)
     parser.add_argument("--scene", required=True)
     parser.add_argument("--source-repo", type=Path, required=True)
+    parser.add_argument("--source-commit")
     parser.add_argument("--model-root", type=Path, required=True)
     parser.add_argument("--dataset-path", type=Path, required=True)
     parser.add_argument("--iteration", type=int, required=True)

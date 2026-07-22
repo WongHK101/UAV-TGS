@@ -52,6 +52,15 @@ ADAPTER_METHOD = {
     "thermonerf": "thermonerf",
     "physir_splat_sh": "physir_splat",
 }
+SOURCE_COMMITS = {
+    # Locked by external_source_inventory_hold8_v2.json.  The extracted
+    # official source archives intentionally do not carry .git directories.
+    "thermalgaussian_ommg": "5d3243ac444ba48215d6ea2391a68163b94267f9",
+    "mmone": "f49fc4e7a1fb6d6444ba5a75b176e9b6cbcca901",
+    "thermal3dgs": "03366b2a350ac5db6690dfd7fca51a56ba9e89a7",
+    "thermonerf": "3f163c1454338bdf81af3a629c25c61443f01121",
+    "physir_splat_sh": "f4d440073cb89ec7bc757909080c7b713089f7cc",
+}
 
 
 def _now() -> str:
@@ -280,6 +289,8 @@ def _matrix(project: Path, benchmark: Path) -> list[dict[str, Any]]:
                 "--output",
                 str(output),
             ]
+            if method in SOURCE_COMMITS:
+                command += ["--source-commit", SOURCE_COMMITS[method]]
             if adapter_manifest is None:
                 command += ["--test-list", str(test_list)]
             else:
