@@ -82,11 +82,17 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
-def _model_root(project: Path, benchmark: Path, scene: str, method: str) -> tuple[Path, int]:
+def _model_root(
+    project: Path,
+    benchmark: Path,
+    scene: str,
+    method: str,
+    internal_experiment_id: str,
+) -> tuple[Path, int]:
     if method in {"raw_f3", "adaptive_opacity_scale_clamp"}:
-        return project / "experiments/aaai27_hold8_v2" / scene / "methods" / method / "model", 60000
+        return project / "experiments" / internal_experiment_id / scene / "methods" / method / "model", 60000
     if method == "scsp_refit_f3":
-        return project / "experiments/aaai27_hold8_v2" / scene / "methods/scsp_refit_f3/model", 65000
+        return project / "experiments" / internal_experiment_id / scene / "methods/scsp_refit_f3/model", 65000
     if scene == "Building":
         base = project / "external_phase_a/experiments/Building"
         mapping = {
@@ -153,13 +159,22 @@ def _runtime_pythonpath(project: Path, method: str) -> list[Path]:
     return mapping.get(method, [])
 
 
-def _building_reference(project: Path, scene: str, method: str, iteration: int, first: str) -> Path | None:
+def _building_reference(
+    project: Path,
+    scene: str,
+    method: str,
+    iteration: int,
+    first: str,
+    internal_experiment_id: str,
+) -> Path | None:
     if scene != "Building":
         return None
     if method in {"raw_f3", "scsp_refit_f3", "adaptive_opacity_scale_clamp"}:
         return (
             project
-            / "experiments/aaai27_hold8_v2/Building/methods"
+            / "experiments"
+            / internal_experiment_id
+            / "Building/methods"
             / method
             / "model/test"
             / f"ours_{iteration}/renders"
@@ -219,7 +234,12 @@ def _prepare_adapters(project: Path, benchmark: Path, python: Path) -> None:
             subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
 
 
-def _matrix(project: Path, benchmark: Path) -> list[dict[str, Any]]:
+def _matrix(
+    project: Path,
+    benchmark: Path,
+    internal_experiment_id: str,
+    internal_resolution: int,
+) -> list[dict[str, Any]]:
     jobs: list[dict[str, Any]] = []
     uav_python = project / "environments/uav-tgs/bin/python"
     thermo_python = project / "external_phase_a/environments/thermonerf/bin/python"
@@ -227,7 +247,9 @@ def _matrix(project: Path, benchmark: Path) -> list[dict[str, Any]]:
     # any non-Building timing job starts.
     for scene, count in SCENES.items():
         for method in METHODS:
-            model_root, iteration = _model_root(project, benchmark, scene, method)
+            model_root, iteration = _model_root(
+                project, benchmark, scene, method, internal_experiment_id
+            )
             source = _source_repo(project, method)
             runtime_pythonpath = _runtime_pythonpath(project, method)
             test_list = project / "derived/aaai27_hold8_v2" / scene / "runtime_lists/thermal_test_list.txt"
@@ -237,18 +259,37 @@ def _matrix(project: Path, benchmark: Path) -> list[dict[str, Any]]:
                 dataset = thermal_root
                 adapter_manifest = None
                 cfg_text = (model_root / "cfg_args").read_text(encoding="utf-8")
-                if "resolution=4" not in cfg_text:
-                    raise ValueError(f"internal formal endpoint is not frozen at resolution=4: {model_root}")
+                expected_resolution = f"resolution={internal_resolution}"
+                if expected_resolution not in cfg_text:
+                    raise ValueError(
+                        "internal formal endpoint resolution mismatch: "
+                        f"expected {expected_resolution}: {model_root}"
+                    )
                 first_gt = next((thermal_root / "images").glob("*"))
                 with Image.open(first_gt) as image:
-                    width, height = round(image.width / 4), round(image.height / 4)
+                    if internal_resolution in {-1, 1}:
+                        width, height = image.size
+                    elif internal_resolution > 1:
+                        width = round(image.width / internal_resolution)
+                        height = round(image.height / internal_resolution)
+                    else:
+                        raise ValueError(
+                            f"unsupported internal resolution: {internal_resolution}"
+                        )
             else:
                 dataset = benchmark / "datasets" / scene / ADAPTER_METHOD[method]
                 adapter_manifest = dataset / "adapter_manifest.json"
                 first_gt = next((thermal_root / "images").glob("*"))
                 with Image.open(first_gt) as image:
                     width, height = image.size
-            reference = _building_reference(project, scene, method, iteration, first)
+            reference = _building_reference(
+                project,
+                scene,
+                method,
+                iteration,
+                first,
+                internal_experiment_id,
+            )
             for required in (model_root, source, dataset, test_list):
                 if not required.exists():
                     raise FileNotFoundError(required)
@@ -377,7 +418,12 @@ def run(args: argparse.Namespace) -> int:
 
     uav_python = project / "environments/uav-tgs/bin/python"
     _prepare_adapters(project, benchmark, uav_python)
-    jobs = _matrix(project, benchmark)
+    jobs = _matrix(
+        project,
+        benchmark,
+        args.internal_experiment_id,
+        args.internal_resolution,
+    )
     if len(jobs) != 48:
         raise ValueError(f"expected 48 jobs, found {len(jobs)}")
     manifest = {
@@ -385,6 +431,8 @@ def run(args: argparse.Namespace) -> int:
         "created_at": _now(),
         "host_policy": "all jobs on host 900, one clean process at a time",
         "gpu_policy": "one RTX PRO 6000; no concurrent GPU jobs",
+        "internal_experiment_id": args.internal_experiment_id,
+        "internal_resolution": args.internal_resolution,
         "wrapper_sha256": _sha256(wrapper_runtime),
         "jobs": jobs,
     }
@@ -447,6 +495,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--benchmark-root",
         type=Path,
         default=Path("/root/autodl-tmp/UAV-TGS/final_results_aggregation_v1"),
+    )
+    parser.add_argument(
+        "--internal-experiment-id",
+        default="aaai27_hold8_v2",
+        help="Internal endpoint experiment directory under <project>/experiments.",
+    )
+    parser.add_argument(
+        "--internal-resolution",
+        type=int,
+        default=4,
+        help="Frozen internal endpoint resolution recorded in cfg_args.",
     )
     parser.add_argument("--prepare-only", action="store_true")
     return parser
