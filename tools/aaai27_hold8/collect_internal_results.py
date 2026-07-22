@@ -48,11 +48,13 @@ TRAINING_CODE = (
     "gaussian_renderer/__init__.py",
     "scene/gaussian_model.py",
     "tools/aaai27_hold8/run_phase1_internal_scene.sh",
+    "tools/aaai27_hold8/run_native_internal_scene.sh",
     "tools/build_adaptive_scale_anchor.py",
     "tools/stage2_endpoint_audit.py",
 )
 EVALUATOR_CODE = (
     "tools/aaai27_hold8/evaluate_internal_method.sh",
+    "tools/aaai27_hold8/evaluate_native_internal_method.sh",
     "tools/aaai27_hold8/bind_expected_depth_bundle.py",
     "tools/hold8_expected_depth_evaluator.py",
     "tools/thermal_radiometry/evaluate_temperature.py",
@@ -149,8 +151,13 @@ def _training_times(method: str, efficiency: Path) -> tuple[float, float, dict[s
     )
 
 
-def _method_paths(root: Path, scene: str, method: str) -> dict[str, Path | int]:
-    base = root / "experiments/aaai27_hold8_v2" / scene
+def _method_paths(
+    root: Path,
+    scene: str,
+    method: str,
+    experiment_id: str = "aaai27_hold8_v2",
+) -> dict[str, Path | int]:
+    base = root / "experiments" / experiment_id / scene
     method_root = base / "methods" / method
     iteration = 65000 if method == "scsp_refit_f3" else 60000
     return {
@@ -167,9 +174,9 @@ def _method_paths(root: Path, scene: str, method: str) -> dict[str, Path | int]:
 
 def _build_training(
     *, root: Path, code: Path, scene: str, method: str, current_commit: str,
-    scoped_code_hash: str,
+    scoped_code_hash: str, experiment_id: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    paths = _method_paths(root, scene, method)
+    paths = _method_paths(root, scene, method, experiment_id)
     endpoint = _load(paths["endpoint"])  # type: ignore[arg-type]
     inputs = endpoint["inputs"]
     ply = Path(paths["ply"])
@@ -221,7 +228,11 @@ def _build_training(
             "lut_sha256": canonical_payload["palette"]["sha256_uint8_rgb"],
             "host": SOURCE_HOST[scene],
             "gpu": _load(Path(paths["efficiency"]) / ("f3_train.json" if method == "scsp_refit_f3" else "train.json"))["device"]["device_name"],
-            "command": f"tools/aaai27_hold8/run_phase1_internal_scene.sh {scene} method {method}",
+            "command": (
+                f"tools/aaai27_hold8/run_native_internal_scene.sh {scene} method {method}"
+                if experiment_id == "aaai27_hold8_v2_native"
+                else f"tools/aaai27_hold8/run_phase1_internal_scene.sh {scene} method {method}"
+            ),
             "endpoint_sha256": _sha(ply),
             "completion_status": SUCCEEDED,
             "failure_reason": None,
@@ -237,9 +248,9 @@ def _build_training(
 
 def _build_evaluation(
     *, root: Path, code: Path, scene: str, method: str,
-    training: Mapping[str, Any], evaluator_hash: str,
+    training: Mapping[str, Any], evaluator_hash: str, experiment_id: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    paths = _method_paths(root, scene, method)
+    paths = _method_paths(root, scene, method, experiment_id)
     evaluation = Path(paths["evaluation"])
     rgb_key, rgb = _single_result(evaluation / "appearance/rgb_results.json")
     thermal_key, thermal = _single_result(evaluation / "appearance/thermal_results.json")
@@ -293,7 +304,12 @@ def _build_evaluation(
     return receipt, eval_config
 
 
-def collect(root: Path, code: Path, output: Path) -> dict[str, Any]:
+def collect(
+    root: Path,
+    code: Path,
+    output: Path,
+    experiment_id: str = "aaai27_hold8_v2",
+) -> dict[str, Any]:
     if output.exists():
         raise FileExistsError(output)
     output.mkdir(parents=True)
@@ -309,7 +325,7 @@ def collect(root: Path, code: Path, output: Path) -> dict[str, Any]:
 
     for scene in FORMAL_SCENES:
         for method in METHODS:
-            paths = _method_paths(root, scene, method)
+            paths = _method_paths(root, scene, method, experiment_id)
             method_root = Path(paths["method_root"])
             alias_path = method_root / "alias_to_raw_f3.json"
             if alias_path.is_file():
@@ -334,10 +350,12 @@ def collect(root: Path, code: Path, output: Path) -> dict[str, Any]:
             training, breakdown = _build_training(
                 root=root, code=code, scene=scene, method=method,
                 current_commit=current_commit, scoped_code_hash=training_hash,
+                experiment_id=experiment_id,
             )
             evaluation, eval_config = _build_evaluation(
                 root=root, code=code, scene=scene, method=method,
                 training=training, evaluator_hash=evaluator_hash,
+                experiment_id=experiment_id,
             )
             target = receipt_root / scene / method
             target.mkdir(parents=True, exist_ok=True)
@@ -369,6 +387,7 @@ def collect(root: Path, code: Path, output: Path) -> dict[str, Any]:
         "training_receipt_count": len(trainings),
         "evaluation_receipt_count": len(evaluations),
         "alias_receipt_count": len(aliases),
+        "experiment_id": experiment_id,
     }
     (output / "provenance.json").write_text(json.dumps(provenance, indent=2, sort_keys=True)+"\n", encoding="utf-8")
     return {"summary": summary, "provenance": provenance}
@@ -379,8 +398,14 @@ def main() -> None:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--code-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--experiment-id", default="aaai27_hold8_v2")
     args = parser.parse_args()
-    result = collect(args.root.resolve(), args.code_root.resolve(), args.output_root.resolve())
+    result = collect(
+        args.root.resolve(),
+        args.code_root.resolve(),
+        args.output_root.resolve(),
+        args.experiment_id,
+    )
     print(json.dumps(result["provenance"], sort_keys=True))
 
 

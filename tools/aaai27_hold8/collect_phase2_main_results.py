@@ -95,8 +95,12 @@ def resolve_cost(method_root: Path, raw_root: Path, *, alias: bool) -> dict[str,
     }
 
 
-def collect_scene(root: Path, scene: str) -> dict[str, Any]:
-    scene_root = root / f"experiments/aaai27_hold8_v2/{scene}"
+def collect_scene(
+    root: Path,
+    scene: str,
+    experiment_id: str = "aaai27_hold8_v2",
+) -> dict[str, Any]:
+    scene_root = root / "experiments" / experiment_id / scene
     method_root = scene_root / f"methods/{METHOD}"
     raw_root = scene_root / "methods/raw_f3"
     manifest_path = method_root / "scsp_anchor/adaptive_scale_manifest.json"
@@ -236,13 +240,14 @@ def main() -> None:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--scene-record-dir", type=Path)
     parser.add_argument("--export-scene", choices=SCENES)
+    parser.add_argument("--experiment-id", default="aaai27_hold8_v2")
     args = parser.parse_args()
     output = args.output_root.resolve()
     if output.exists():
         raise FileExistsError(output)
     output.mkdir(parents=True)
     if args.export_scene:
-        row = collect_scene(args.root.resolve(), args.export_scene)
+        row = collect_scene(args.root.resolve(), args.export_scene, args.experiment_id)
         target = output / f"{args.export_scene}.json"
         target.write_text(json.dumps(row, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         print(json.dumps({"status": "complete", "scene": args.export_scene, "output": str(target)}, sort_keys=True))
@@ -254,7 +259,7 @@ def main() -> None:
         if record_path is not None and record_path.is_file():
             row = validate_scene_record(load(record_path), scene)
         else:
-            row = collect_scene(args.root.resolve(), scene)
+            row = collect_scene(args.root.resolve(), scene, args.experiment_id)
         rows.append(apply_phase2_batch_scope(row, scene))
     summary = summarize(rows)
     (output / "eleven_scene_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
