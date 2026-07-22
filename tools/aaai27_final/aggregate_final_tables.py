@@ -302,6 +302,11 @@ def _load_benchmarks(root: Path) -> tuple[list[dict[str, Any]], dict[str, dict[s
             "output_resolution_wh": payload["output_resolution_wh"],
             "inference_dtype": payload["inference_dtype"],
             "source_commit": payload["source_repository"]["commit"],
+            "gpu_name": payload["gpu"]["name"],
+            "gpu_total_memory_bytes": int(payload["gpu"]["total_memory_bytes"]),
+            "torch_version": payload["gpu"]["torch_version"],
+            "cuda_version": payload["gpu"]["cuda_version"],
+            "wrapper_sha256": payload["benchmark_wrapper"]["sha256"],
             "receipt": str(path.resolve()),
             "receipt_sha256": _sha256(path),
         }
@@ -581,6 +586,11 @@ def aggregate(args: argparse.Namespace) -> Path:
         "output_resolution_wh",
         "inference_dtype",
         "source_commit",
+        "gpu_name",
+        "gpu_total_memory_bytes",
+        "torch_version",
+        "cuda_version",
+        "wrapper_sha256",
         "receipt_sha256",
     )
     _csv(args.output / "render_benchmark_per_scene_raw.csv", benchmark_raw, benchmark_fields)
@@ -605,6 +615,63 @@ def aggregate(args: argparse.Namespace) -> Path:
         "inference_peak_reserved_bytes_scene_mean",
     )
     _write_table(args.output, "render_benchmark_scene_equal_macro", benchmark_macro_rows, benchmark_macro_fields)
+
+    gpu_names = {row["gpu_name"] for row in benchmark_raw}
+    gpu_memory = {row["gpu_total_memory_bytes"] for row in benchmark_raw}
+    wrappers = {row["wrapper_sha256"] for row in benchmark_raw}
+    if len(gpu_names) != 1 or len(gpu_memory) != 1 or len(wrappers) != 1:
+        raise ValueError(
+            f"unified benchmark provenance differs: gpu={gpu_names} memory={gpu_memory} wrappers={wrappers}"
+        )
+    runtime_rows = []
+    for method in BENCHMARK_TO_RESULT.values():
+        values = [row for row in benchmark_raw if row["result_method"] == method]
+        runtime_rows.append(
+            {
+                "method": DISPLAY_NAMES[method],
+                "source_commit": values[0]["source_commit"],
+                "torch_versions": ", ".join(sorted({row["torch_version"] for row in values})),
+                "cuda_versions": ", ".join(sorted({str(row["cuda_version"]) for row in values})),
+                "inference_dtypes": ", ".join(sorted({row["inference_dtype"] for row in values})),
+                "output_resolutions_wh": ", ".join(
+                    sorted({"x".join(map(str, row["output_resolution_wh"])) for row in values})
+                ),
+            }
+        )
+    scope_payload = {
+        "schema": "uav-tgs-aaai27-render-only-scope-hardware-v1",
+        "host": "AutoDL 900",
+        "gpu_name": next(iter(gpu_names)),
+        "gpu_total_memory_bytes": next(iter(gpu_memory)),
+        "clean_process_per_method_scene": True,
+        "batch_size": 1,
+        "warmup_full_test_passes": 1,
+        "timed_full_test_passes": 3,
+        "scene_result": "median of three complete-pass ms/view values",
+        "macro_latency": "arithmetic mean of six scene median ms/view values",
+        "macro_fps": "1000 / macro latency; per-scene FPS is not averaged",
+        "wrapper_sha256": next(iter(wrappers)),
+        "runtime_rows": runtime_rows,
+    }
+    _atomic_json(args.output / "benchmark_scope_hardware.json", scope_payload)
+    scope_lines = [
+        "# Unified render-only benchmark scope and hardware",
+        "",
+        f"- Host: AutoDL 900",
+        f"- GPU: {scope_payload['gpu_name']} ({scope_payload['gpu_total_memory_bytes'] / 1024**3:.2f} GiB)",
+        "- Scope: thermal render-only end-to-end in-memory latency",
+        "- One clean process per method × scene; batch size 1",
+        "- One full-test-list warm-up, followed by three synchronized full passes",
+        "- Scene value: median ms/view; macro latency: arithmetic scene mean; macro FPS: reciprocal of macro latency",
+        "- Excluded: model/data loading, GT reads, file encoding/saving, GPU-to-CPU copy and all metric/depth postprocessing",
+        "",
+        _markdown(
+            runtime_rows,
+            ("method", "source_commit", "torch_versions", "cuda_versions", "inference_dtypes", "output_resolutions_wh"),
+        ).rstrip(),
+        "",
+    ]
+    _atomic_text(args.output / "BENCHMARK_SCOPE_AND_HARDWARE.md", "\n".join(scope_lines))
 
     input_files = [args.phase1_metrics, args.phase1_cost, args.phase2_metrics, args.external_metrics]
     provenance = {

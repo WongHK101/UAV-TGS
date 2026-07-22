@@ -118,6 +118,32 @@ def _source_repo(project: Path, method: str) -> Path:
     return mapping[method]
 
 
+def _runtime_pythonpath(project: Path, method: str) -> list[Path]:
+    """Return the frozen method-specific extension path used by formal runs.
+
+    Several GS baselines expose the same Python module name while requiring
+    different CUDA rasterizer ABIs.  Keeping the path on the clean child
+    process avoids mutating the shared UAV-TGS environment or importing a
+    different method's rasterizer.
+    """
+    base = project / "external_phase_a/sources"
+    mapping = {
+        "thermalgaussian_ommg": [
+            base / "ThermalGaussian-OMMG/submodules/diff-gaussian-rasterization",
+        ],
+        "mmone": [
+            base / "MMOne/submodules/diff-gaussian-rasterization",
+        ],
+        "thermal3dgs": [
+            base / "Thermal3DGS/submodules/depth-diff-gaussian-rasterization",
+        ],
+        "physir_splat_sh": [
+            project / "external_phase_a/environments/physir_default_sh/site",
+        ],
+    }
+    return mapping.get(method, [])
+
+
 def _building_reference(project: Path, scene: str, method: str, iteration: int, first: str) -> Path | None:
     if scene != "Building":
         return None
@@ -194,21 +220,31 @@ def _matrix(project: Path, benchmark: Path) -> list[dict[str, Any]]:
         for method in METHODS:
             model_root, iteration = _model_root(project, benchmark, scene, method)
             source = _source_repo(project, method)
+            runtime_pythonpath = _runtime_pythonpath(project, method)
             test_list = project / "derived/aaai27_hold8_v2" / scene / "runtime_lists/thermal_test_list.txt"
             first = next(line.strip() for line in test_list.read_text(encoding="utf-8").splitlines() if line.strip())
             thermal_root = project / "derived/aaai27_hold8_v2" / scene / "thermal_benchmark"
-            first_gt = next((thermal_root / "images").glob("*"))
-            with Image.open(first_gt) as image:
-                width, height = image.size
             if method in INTERNAL_METHODS:
                 dataset = thermal_root
                 adapter_manifest = None
+                cfg_text = (model_root / "cfg_args").read_text(encoding="utf-8")
+                if "resolution=4" not in cfg_text:
+                    raise ValueError(f"internal formal endpoint is not frozen at resolution=4: {model_root}")
+                first_gt = next((thermal_root / "images").glob("*"))
+                with Image.open(first_gt) as image:
+                    width, height = round(image.width / 4), round(image.height / 4)
             else:
                 dataset = benchmark / "datasets" / scene / ADAPTER_METHOD[method]
                 adapter_manifest = dataset / "adapter_manifest.json"
+                first_gt = next((thermal_root / "images").glob("*"))
+                with Image.open(first_gt) as image:
+                    width, height = image.size
             reference = _building_reference(project, scene, method, iteration, first)
             for required in (model_root, source, dataset, test_list):
                 if not required.exists():
+                    raise FileNotFoundError(required)
+            for required in runtime_pythonpath:
+                if not required.is_dir():
                     raise FileNotFoundError(required)
             if adapter_manifest is not None and not adapter_manifest.is_file():
                 raise FileNotFoundError(adapter_manifest)
@@ -252,6 +288,8 @@ def _matrix(project: Path, benchmark: Path) -> list[dict[str, Any]]:
                 command += ["--correctness-reference", str(reference)]
                 if method == "thermonerf":
                     command += ["--correctness-max-abs-u8", "24", "--correctness-mean-abs-u8", "1.5"]
+                elif method in {"thermalgaussian_ommg", "mmone"}:
+                    command += ["--correctness-max-abs-u8", "12", "--correctness-mean-abs-u8", "0.75"]
                 else:
                     command += ["--correctness-max-abs-u8", "1", "--correctness-mean-abs-u8", "0.01"]
             jobs.append(
@@ -262,6 +300,7 @@ def _matrix(project: Path, benchmark: Path) -> list[dict[str, Any]]:
                     "formal_resolution_wh": [width, height],
                     "model_root": str(model_root),
                     "source_repo": str(source),
+                    "runtime_pythonpath": [str(path) for path in runtime_pythonpath],
                     "dataset": str(dataset),
                     "test_list_sha256": _sha256(test_list),
                     "adapter_manifest_sha256": _sha256(adapter_manifest) if adapter_manifest else None,
@@ -349,12 +388,20 @@ def run(args: argparse.Namespace) -> int:
         print(f"[{index}/48] run {job['scene']} {job['method']}", flush=True)
         started = time.monotonic()
         with log.open("w", encoding="utf-8") as handle:
+            child_env = os.environ.copy()
+            runtime_pythonpath = job.get("runtime_pythonpath", [])
+            if runtime_pythonpath:
+                inherited = child_env.get("PYTHONPATH")
+                child_env["PYTHONPATH"] = os.pathsep.join(
+                    [*runtime_pythonpath, *([inherited] if inherited else [])]
+                )
             result = subprocess.run(
                 job["command"],
                 stdout=handle,
                 stderr=subprocess.STDOUT,
                 text=True,
                 check=False,
+                env=child_env,
             )
         if result.returncode:
             raise RuntimeError(

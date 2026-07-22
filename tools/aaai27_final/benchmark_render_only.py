@@ -162,6 +162,23 @@ def _set_common_endpoint_args(
     return value
 
 
+def _resize_rgb_to_formal(value: torch.Tensor, args: argparse.Namespace) -> torch.Tensor:
+    """GPU equivalent of the frozen RGB PIL-default resize adapter."""
+    target = (int(args.formal_height), int(args.formal_width))
+    if tuple(value.shape[-2:]) == target:
+        return value.clamp(0.0, 1.0)
+    # The formal adapter serializes the native render before PIL resize.  Keep
+    # the same 8-bit boundary while excluding image encoding and CPU I/O.
+    quantized = torch.round(value.clamp(0.0, 1.0) * 255.0) / 255.0
+    return F.interpolate(
+        quantized.unsqueeze(0),
+        size=target,
+        mode="bicubic",
+        align_corners=False,
+        antialias=True,
+    )[0].clamp(0.0, 1.0)
+
+
 def _import_repo(repo: Path) -> None:
     resolved = str(repo.resolve())
     if sys.path[0] != resolved:
@@ -263,7 +280,8 @@ def _load_ommg(args: argparse.Namespace) -> LoadedRenderer:
 
     def render_view(view: Any) -> torch.Tensor:
         # OMMG computes RGB and thermal jointly in one unavoidable call.
-        return render(view, gaussians, pipe, background)["render_thermal"].clamp(0.0, 1.0)
+        value = render(view, gaussians, pipe, background)["render_thermal"]
+        return _resize_rgb_to_formal(value, args)
 
     return LoadedRenderer(
         views,
@@ -305,7 +323,8 @@ def _load_mmone(args: argparse.Namespace) -> LoadedRenderer:
 
     def render_view(view: Any) -> torch.Tensor:
         # The official MMOne path rasterizes RGB and thermal in the same call.
-        return render(view, gaussians, pipe, background, cfg)["thermals"].clamp(0.0, 1.0)
+        value = render(view, gaussians, pipe, background, cfg)["thermals"]
+        return _resize_rgb_to_formal(value, args)
 
     return LoadedRenderer(
         views,
@@ -422,9 +441,15 @@ def _load_thermonerf(args: argparse.Namespace) -> LoadedRenderer:
         # The frozen formal adapter converts official grayscale output to 8-bit,
         # resizes with nearest-neighbour, inverts Hot-Iron luma and emits RGB.
         value = torch.round(value.clamp(0.0, 1.0) * 255.0).to(torch.long)
-        value = F.interpolate(
-            value[None, None].float(), size=formal_size, mode="nearest"
-        )[0, 0].to(torch.long)
+        value = torch.round(
+            F.interpolate(
+                value[None, None].float(),
+                size=formal_size,
+                mode="bicubic",
+                align_corners=False,
+                antialias=True,
+            )[0, 0].clamp(0.0, 255.0)
+        ).to(torch.long)
         indices = inverse_lut[value]
         return rgb_lut[indices].permute(2, 0, 1).contiguous()
 

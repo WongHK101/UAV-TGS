@@ -49,6 +49,13 @@ def test_benchmark_macro_averages_latency_then_inverts(tmp_path: Path) -> None:
                         "output_resolution_wh": [4, 3],
                         "inference_dtype": "torch.float32",
                         "source_repository": {"commit": "a" * 40},
+                        "gpu": {
+                            "name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+                            "total_memory_bytes": 1024 * 1024,
+                            "torch_version": "2.7.1+cu128",
+                            "cuda_version": "12.8",
+                        },
+                        "benchmark_wrapper": {"sha256": "b" * 64},
                         "passes": [
                             {"pass": index, "elapsed_ns": index * 1000, "ms_per_view": latency}
                             for index in (1, 2, 3)
