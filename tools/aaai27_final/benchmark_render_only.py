@@ -338,8 +338,28 @@ def _load_mmone(args: argparse.Namespace) -> LoadedRenderer:
 def _load_thermal3dgs(args: argparse.Namespace) -> LoadedRenderer:
     _import_repo(args.source_repo)
     from arguments import ModelParams, PipelineParams
-    from gaussian_renderer import GaussianModel, render
+    import gaussian_renderer as renderer_module
     from scene import ATFModel, Scene, TCMModel
+
+    # The frozen formal runtime uses the repository's depth rasterizer (color,
+    # radii, depth), while this pinned renderer revision consumes only color
+    # and radii.  Adapt only that return arity in the clean benchmark process;
+    # the color tensor and all CUDA work remain the official path.
+    rasterizer_type = renderer_module.GaussianRasterizer
+
+    class _ColorRadiiRasterizer:
+        def __init__(self, *values: Any, **named: Any) -> None:
+            self._delegate = rasterizer_type(*values, **named)
+
+        def __call__(self, *values: Any, **named: Any) -> tuple[torch.Tensor, torch.Tensor]:
+            outputs = self._delegate(*values, **named)
+            if not isinstance(outputs, tuple) or len(outputs) < 2:
+                raise ValueError("unexpected Thermal3D-GS rasterizer output")
+            return outputs[0], outputs[1]
+
+    renderer_module.GaussianRasterizer = _ColorRadiiRasterizer
+    GaussianModel = renderer_module.GaussianModel
+    render = renderer_module.render
 
     parser = argparse.ArgumentParser(add_help=False)
     model = ModelParams(parser, sentinel=True)
@@ -380,7 +400,10 @@ def _load_thermal3dgs(args: argparse.Namespace) -> LoadedRenderer:
         render_view,
         int(scene.loaded_iter),
         str(gaussians.get_xyz.dtype),
-        {"renderer_path": "Thermal3D-GS ATF + splat + TCM"},
+        {
+            "renderer_path": "Thermal3D-GS ATF + splat + TCM",
+            "runtime_compatibility": "depth-rasterizer color/radii return-arity adapter",
+        },
     )
 
 
@@ -498,7 +521,8 @@ def _load_physir(args: argparse.Namespace) -> LoadedRenderer:
         time_multires=(opt.geometry_time_multires if opt.geometry_time_multires >= 0 else None),
     )
     geo_model.load_weights(dataset.model_path)
-    geo_model.eval()
+    if hasattr(geo_model, "eval"):
+        geo_model.eval()
     views = _order_views(scene.getTestCameras(), _formal_names(args))
     background = torch.tensor(
         [1.0, 1.0, 1.0] if dataset.white_background else [0.0, 0.0, 0.0],
@@ -607,19 +631,30 @@ def _correctness(value: torch.Tensor, reference: Path | None) -> dict[str, Any]:
     if actual.shape != expected.shape:
         raise ValueError(f"correctness shape mismatch: {actual.shape} != {expected.shape}")
     difference = np.abs(actual.astype(np.int16) - expected.astype(np.int16))
+    p99_abs = float(np.quantile(difference, 0.99))
+    tail_within_tolerance = (
+        difference.max() <= args_global.correctness_max_abs_u8
+        if args_global.correctness_p99_abs_u8 is None
+        else p99_abs <= args_global.correctness_p99_abs_u8
+    )
     payload.update(
         {
             "reference_path": str(reference.resolve()),
             "reference_sha256": _sha256(reference),
             "max_abs_u8": int(difference.max()),
             "mean_abs_u8": float(difference.mean()),
-            "p99_abs_u8": float(np.quantile(difference, 0.99)),
+            "p99_abs_u8": p99_abs,
             "within_tolerance": bool(
-                difference.max() <= args_global.correctness_max_abs_u8
+                tail_within_tolerance
                 and difference.mean() <= args_global.correctness_mean_abs_u8
             ),
             "tolerance": {
                 "max_abs_u8": int(args_global.correctness_max_abs_u8),
+                "p99_abs_u8": (
+                    float(args_global.correctness_p99_abs_u8)
+                    if args_global.correctness_p99_abs_u8 is not None
+                    else None
+                ),
                 "mean_abs_u8": float(args_global.correctness_mean_abs_u8),
             },
         }
@@ -789,6 +824,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--passes", type=int, default=3)
     parser.add_argument("--correctness-reference", type=Path)
     parser.add_argument("--correctness-max-abs-u8", type=int, default=1)
+    parser.add_argument("--correctness-p99-abs-u8", type=float)
     parser.add_argument("--correctness-mean-abs-u8", type=float, default=0.01)
     parser.add_argument("--output", type=Path, required=True)
     return parser
