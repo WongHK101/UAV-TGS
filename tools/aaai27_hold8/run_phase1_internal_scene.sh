@@ -259,12 +259,16 @@ PY
 
 prepare_scene() {
   verify_binding
-  prepare_shared_sfm
   if [[ -f "$DERIVED/PREPARE_STATUS" ]]; then
     test "$(tr -d '\r\n' < "$DERIVED/PREPARE_STATUS")" = passed
+    test -f "$RANGE"
+    test -f "$WORK/sparse/0/cameras.bin"
+    test -f "$WORK/sparse/0/images.bin"
+    test -f "$WORK/sparse/0/points3D.bin"
     materialize_runtime_inputs
     return
   fi
+  prepare_shared_sfm
   test ! -e "$WORK" -a ! -e "$RANGE"
   mkdir -p "$DERIVED/radiometry" "$WORK/images" "$WORK/sparse/0" "$WORK/distorted/sparse_aligned" "$EXP/protocol" "$LOG_ROOT"
   "$PY" "$CODE/tools/thermal_radiometry/estimate_scene_range.py" \
