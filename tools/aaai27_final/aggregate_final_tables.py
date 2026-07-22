@@ -354,6 +354,9 @@ def _enrich_units(value: dict[str, Any], benchmark: dict[str, float] | None = No
     result["train_peak_vram_gib"] = vram / 1024**3 if vram is not None else None
     result["model_size_mib"] = size / 1024**2 if size is not None else None
     result["gaussian_count_m"] = count / 1_000_000 if count is not None else None
+    per_scene_inference = result.get("inference_peak_allocated_bytes")
+    if per_scene_inference is not None:
+        result["inference_peak_allocated_gib"] = per_scene_inference / 1024**3
     if benchmark is not None:
         result.update(benchmark)
         result["inference_peak_allocated_gib"] = (
@@ -568,6 +571,28 @@ def aggregate(args: argparse.Namespace) -> Path:
         full_macro_rows,
         supplementary_fields,
     )
+    supplementary_per_scene_rows = [
+        _enrich_units(row) for row in phase1 + external
+    ]
+    supplementary_per_scene_fields = (
+        "scene",
+        "display_name",
+        *PRIMARY_METRICS,
+        *SUPPLEMENTARY_METRICS,
+        "reported_method_wall_time_s",
+        "train_peak_vram_gib",
+        "model_size_mib",
+        "gaussian_count_m",
+        "render_latency_ms_per_view",
+        "render_fps",
+        "inference_peak_allocated_gib",
+    )
+    _write_table(
+        args.output,
+        "supplementary_sixscene_full_metric_per_scene",
+        supplementary_per_scene_rows,
+        supplementary_per_scene_fields,
+    )
 
     benchmark_fields = (
         "result_method",
@@ -682,11 +707,16 @@ def aggregate(args: argparse.Namespace) -> Path:
             {"path": str(path.resolve()), "size_bytes": path.stat().st_size, "sha256": _sha256(path)}
             for path in input_files
         ],
+        "aggregation_script": {
+            "path": str(Path(__file__).resolve()),
+            "sha256": _sha256(Path(__file__).resolve()),
+        },
         "counts": {
             "table1_rows_including_macro": len(table1_rows),
             "table2_methods": len(table2_rows),
             "table3_methods": len(table3_rows),
             "benchmark_receipts": len(benchmark_raw),
+            "supplementary_per_scene_rows": len(supplementary_per_scene_rows),
         },
         "adaptive_rgb_policy": (
             "RGB PSNR/SSIM/LPIPS are the frozen formal RGB Stage-1 anchor metrics; "
@@ -739,6 +769,42 @@ def aggregate(args: argparse.Namespace) -> Path:
     ]
     _csv(args.output / "claim_matrix.csv", claim_matrix, ("claim", "evidence", "allowed"))
     _atomic_text(args.output / "claim_matrix.md", _markdown(claim_matrix, ("claim", "evidence", "allowed")))
+
+    final_report = "\n".join(
+        [
+            "# UAV-TGS AAAI27 final frozen-result aggregation",
+            "",
+            "Status: **completed**. No training, tuning, or endpoint modification is part of this aggregation.",
+            "",
+            "## Formal outputs",
+            "",
+            "- Table 1: SCSP-Refit+F3 on all 11 scenes plus a scene-equal macro.",
+            "- Table 2: seven-method six-scene external comparison.",
+            "- Table 3: Raw-F3 / SCSP-Refit+F3 / Adaptive internal ablation.",
+            "- Supplement: eight-method six-scene full metrics, both per scene and scene-equal macro.",
+            "",
+            "## Unified render-only benchmark",
+            "",
+            f"- Hardware: AutoDL 900, {scope_payload['gpu_name']}.",
+            "- Each method × scene uses a clean process, one full test-list warm-up and three synchronized full passes.",
+            "- The scene result is median ms/view; macro latency is the arithmetic mean of six scene latencies; FPS is its reciprocal.",
+            "- Model/data loading, encoding, saving, CPU copies and metric/depth postprocessing are excluded.",
+            "",
+            _markdown(
+                benchmark_macro_rows,
+                ("display_name", "render_latency_ms_per_view", "render_fps", "inference_peak_allocated_gib"),
+            ).rstrip(),
+            "",
+            "## Interpretation boundary",
+            "",
+            "- Geometry means OpenMVS-referenced held-out expected-depth consistency, not true-depth accuracy.",
+            "- SCSP-Refit+F3 is the RGB/geometry-stable main method; Adaptive is the thermal-fidelity operating point.",
+            "- PhysIR-Splat-SH† is the frozen thermal-SH configuration, not the complete physical renderer or VGGT-IR path.",
+            "- No claim is made that one configuration wins every metric.",
+            "",
+        ]
+    )
+    _atomic_text(args.output / "FINAL_RESULTS_REPORT.md", final_report)
 
     report = {
         "schema": SCHEMA,
