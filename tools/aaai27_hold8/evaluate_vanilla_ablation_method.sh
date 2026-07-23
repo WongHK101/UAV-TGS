@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+if [[ ! "${OMP_NUM_THREADS:-}" =~ ^[1-9][0-9]*$ ]]; then export OMP_NUM_THREADS=16; fi
+if [[ ! "${MKL_NUM_THREADS:-}" =~ ^[1-9][0-9]*$ ]]; then export MKL_NUM_THREADS=16; fi
+
 if [[ $# -ne 2 ]]; then
   echo "usage: $0 Scene t_only_sfm_3dgs|rgb_sfm_t_3dgs|naive_two_pass_3dgs" >&2
   exit 2

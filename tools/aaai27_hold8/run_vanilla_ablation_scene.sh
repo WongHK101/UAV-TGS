@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# AutoDL images currently export OMP_NUM_THREADS/MKL_NUM_THREADS=0, which is
+# invalid for libgomp and makes CPU-side metric aggregation unnecessarily slow.
+if [[ ! "${OMP_NUM_THREADS:-}" =~ ^[1-9][0-9]*$ ]]; then export OMP_NUM_THREADS=16; fi
+if [[ ! "${MKL_NUM_THREADS:-}" =~ ^[1-9][0-9]*$ ]]; then export MKL_NUM_THREADS=16; fi
+
 # Frozen Hold-8 v2 ablation ladder used to isolate three questions:
 #   t_only_sfm_3dgs     : Can thermal imagery recover its own SfM + vanilla 3DGS?
 #   rgb_sfm_t_3dgs      : What is gained by RGB cameras/sparse points alone?
@@ -200,8 +205,6 @@ render_and_measure_appearance() {
     --benchmark_output "$METHOD_ROOT/render_efficiency.json" \
     2>&1 | tee "$LOG_ROOT/render.log"
   "$PY" metrics.py -m "$MODEL" 2>&1 | tee "$LOG_ROOT/metrics.log"
-  "$PY" metrics_plus.py -m "$MODEL" --extra_iqa "" --save_json \
-    2>&1 | tee -a "$LOG_ROOT/metrics.log"
   require_file "$MODEL/results.json"
   require_file "$MODEL/per_view.json"
 }
