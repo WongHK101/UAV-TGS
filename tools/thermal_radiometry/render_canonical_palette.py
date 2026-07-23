@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -93,6 +94,32 @@ def render_temperature_file(
     }
 
 
+def _render_job(
+    job: Tuple[str, str, float, float, bool, str, str, str]
+) -> Dict[str, Any]:
+    (
+        source,
+        destination,
+        tmin_c,
+        tmax_c,
+        overwrite,
+        relative_id,
+        relative_input,
+        relative_output,
+    ) = job
+    record = render_temperature_file(
+        Path(source),
+        Path(destination),
+        tmin_c=tmin_c,
+        tmax_c=tmax_c,
+        overwrite=overwrite,
+    )
+    record["relative_id"] = relative_id
+    record["relative_input"] = relative_input
+    record["relative_output"] = relative_output
+    return record
+
+
 def render_tree(
     temperature_root: Path,
     output_root: Path,
@@ -102,13 +129,16 @@ def render_tree(
     range_provenance: Optional[Dict[str, Any]] = None,
     manifest_path: Optional[Path] = None,
     overwrite: bool = False,
+    workers: int = 1,
 ) -> Dict[str, Any]:
     source_root = Path(temperature_root).resolve()
     destination_root = Path(output_root).resolve()
     if source_root == destination_root or _is_within(destination_root, source_root):
         raise ValueError("Canonical output must be outside the temperature source tree")
     maps = discover_temperature_maps(source_root)
-    records = []
+    if workers < 1:
+        raise ValueError(f"workers must be >= 1, got {workers}")
+    jobs = []
     seen_outputs = set()
     for source in maps:
         relative = source.relative_to(source_root).with_suffix(".png")
@@ -117,17 +147,23 @@ def render_tree(
         if canonical_key in seen_outputs:
             raise RuntimeError(f"Output collision for {relative}")
         seen_outputs.add(canonical_key)
-        record = render_temperature_file(
-            source,
-            destination,
-            tmin_c=tmin_c,
-            tmax_c=tmax_c,
-            overwrite=overwrite,
+        jobs.append(
+            (
+                str(source),
+                str(destination),
+                float(tmin_c),
+                float(tmax_c),
+                bool(overwrite),
+                relative.with_suffix("").as_posix(),
+                source.relative_to(source_root).as_posix(),
+                relative.as_posix(),
+            )
         )
-        record["relative_id"] = relative.with_suffix("").as_posix()
-        record["relative_input"] = source.relative_to(source_root).as_posix()
-        record["relative_output"] = relative.as_posix()
-        records.append(record)
+    if workers == 1:
+        records = [_render_job(job) for job in jobs]
+    else:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+            records = list(executor.map(_render_job, jobs))
     total_pixels = sum(item["pixels"] for item in records)
     clipped = sum(item["clipped_low_pixels"] + item["clipped_high_pixels"] for item in records)
     payload = {
@@ -170,6 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--range-manifest", type=Path)
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--workers", type=int, default=1)
     return parser
 
 
@@ -188,6 +225,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         range_provenance=provenance,
         manifest_path=args.manifest,
         overwrite=args.overwrite,
+        workers=args.workers,
     )
     print(json.dumps({"status": result["status"], "manifest": result["manifest_path"]}, sort_keys=True))
     return 0

@@ -80,6 +80,34 @@ class CanonicalPaletteTests(unittest.TestCase):
             ]
             self.assertLessEqual(observed, half_bin + 1e-5)
 
+    def test_parallel_render_matches_serial_png_bytes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "temperature"
+            serial = root / "serial"
+            parallel = root / "parallel"
+            source.mkdir()
+            for index in range(4):
+                values = np.linspace(
+                    5.0 + index,
+                    35.0 + index,
+                    256,
+                    dtype=np.float32,
+                ).reshape(16, 16)
+                np.save(source / f"{index:04d}.npy", values, allow_pickle=False)
+            render_canonical_palette.render_tree(
+                source, serial, tmin_c=5.0, tmax_c=40.0, workers=1
+            )
+            render_canonical_palette.render_tree(
+                source, parallel, tmin_c=5.0, tmax_c=40.0, workers=2
+            )
+            for source_png in sorted(serial.glob("*.png")):
+                parallel_png = parallel / source_png.name
+                self.assertEqual(
+                    hashlib.sha256(source_png.read_bytes()).digest(),
+                    hashlib.sha256(parallel_png.read_bytes()).digest(),
+                )
+
     def test_evaluator_reports_off_lut_distance_and_uses_float_gt(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
