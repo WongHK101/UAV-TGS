@@ -11,6 +11,7 @@ fi
 SCENE="$1"; METHOD="$2"
 ROOT="${UAV_TGS_ROOT:-/root/autodl-tmp/UAV-TGS}"
 CODE="$ROOT/code"; PY="$ROOT/environments/uav-tgs/bin/python"
+export PYTHONPATH="$CODE${PYTHONPATH:+:$PYTHONPATH}"
 FORMAL_EXPERIMENT=aaai27_hold8_v2_native
 ABLATION_EXPERIMENT=aaai27_hold8_v2_native_vanilla_ablation
 case "$SCENE" in
