@@ -154,8 +154,21 @@ preflight() {
 prepare_t_only_dataset() {
   local source="$METHOD_ROOT/t_only_source" ud="$METHOD_ROOT/t_only_temperature_ud"
   local dataset="$METHOD_ROOT/t_only_dataset"
+  local cache="${UAV_TGS_T_ONLY_CACHE:-}"
   if [[ -f "$dataset/PREPARED" ]]; then
     test "$(tr -d '\r\n' < "$dataset/PREPARED")" = passed
+    printf '%s\n' "$dataset"
+    return
+  fi
+  if [[ -n "$cache" ]]; then
+    test -f "$cache/t_only_dataset/PREPARED"
+    test -f "$cache/t_only_dataset_receipt.json"
+    test -f "$cache/t_only_temperature_ud/manifest.json"
+    ln -s "$cache/t_only_dataset" "$dataset"
+    ln -s "$cache/t_only_temperature_ud" "$ud"
+    ln -s "$cache/t_only_dataset_receipt.json" "$METHOD_ROOT/t_only_dataset_receipt.json"
+    write_receipt "$METHOD_ROOT/t_only_cache_binding.json" t_only_cache_binding passed \
+      "cache_receipt=$cache/t_only_dataset_receipt.json"
     printf '%s\n' "$dataset"
     return
   fi

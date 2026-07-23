@@ -6,21 +6,24 @@
       "definition": "formal RGB 30k endpoint followed by a fresh fully-unfrozen vanilla 3DGS optimization pass on thermal images",
       "initialization": "retain every RGB checkpoint Gaussian value and active SH degree",
       "optimizer": "fresh full vanilla Adam",
-      "second_pass_local_updates": 30000,
+      "iteration_endpoint": 30000,
+      "optimizer_updates": 29999,
       "topology_updates": true
     },
     "rgb_sfm_t_3dgs": {
       "definition": "vanilla thermal 3DGS initialized only by the formal RGB-derived cameras and sparse points",
       "initialization": "formal RGB-SfM sparse point cloud",
       "optimizer": "fresh full vanilla Adam",
-      "updates": 30000
+      "iteration_endpoint": 30000,
+      "optimizer_updates": 29999
     },
     "t_only_sfm_3dgs": {
       "definition": "independent CUDA COLMAP SfM and vanilla 3DGS using only canonical thermal observations",
       "input_boundary": "fixed-range Hot-Iron is rendered from pre-RGB-undistortion float32 temperature maps",
       "sfm": "COLMAP exhaustive matching plus incremental mapper; all formal image IDs must register",
       "optimizer": "fresh full vanilla Adam",
-      "updates": 30000
+      "iteration_endpoint": 30000,
+      "optimizer_updates": 29999
     }
   },
   "optimizer_defaults": {
@@ -60,5 +63,6 @@
   ],
   "resolution_argument": -1,
   "schema": "uav-tgs-aaai27-vanilla-ablation-protocol-v1",
+  "save_semantics": "original 3DGS final endpoint convention: iteration labels run from 1 through 30000 and the optimizer is not stepped after the final labeled iteration",
   "split": "hold-8-v2"
 }
