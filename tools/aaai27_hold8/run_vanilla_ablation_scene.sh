@@ -155,6 +155,7 @@ prepare_t_only_dataset() {
   local source="$METHOD_ROOT/t_only_source" ud="$METHOD_ROOT/t_only_temperature_ud"
   local dataset="$METHOD_ROOT/t_only_dataset"
   local cache="${UAV_TGS_T_ONLY_CACHE:-}"
+  local distorted_model
   if [[ -f "$dataset/PREPARED" ]]; then
     test "$(tr -d '\r\n' < "$dataset/PREPARED")" = passed
     printf '%s\n' "$dataset"
@@ -172,24 +173,64 @@ prepare_t_only_dataset() {
     printf '%s\n' "$dataset"
     return
   fi
-  test ! -e "$source" -a ! -e "$ud" -a ! -e "$dataset"
-  mkdir -p "$source/input" "$dataset/images" "$dataset/sparse/0" "$LOG_ROOT"
-  "$PY" "$CODE/tools/thermal_radiometry/render_canonical_palette.py" \
-    --temperature-root "$TEMP_SOURCE" --output-root "$source/input" \
-    --range-manifest "$RANGE" --manifest "$METHOD_ROOT/t_only_source_canonical.json"
-  test "$(find "$source/input" -maxdepth 1 -type f -name '*.png' | wc -l)" -eq "$TOTAL"
-  "$PY" "$CODE/convert_uavfgs.py" -s "$source" \
-    --colmap_executable "$COLMAP" --exiftool_executable exiftool \
-    --required_colmap_version 4.1.0 --required_colmap_sha256 "$COLMAP_SHA" \
-    --database_policy reset --camera SIMPLE_RADIAL --matching exhaustive \
-    --colmap_gpu_index 0 --sfm_mapper incremental --mapper_multiple_models 1 \
-    --min_model_size "$TOTAL" --init_min_num_inliers 100 --abs_pose_min_num_inliers 30 \
-    --require_cuda_colmap --no_use_model_aligner \
-    2>&1 | tee "$LOG_ROOT/t_only_colmap.log"
+  if [[ ! -f "$source/distorted/conversion_completion_manifest.json" ]]; then
+    test ! -e "$source" -a ! -e "$ud" -a ! -e "$dataset"
+    mkdir -p "$source/input" "$dataset/images" "$dataset/sparse/0" "$LOG_ROOT"
+    "$PY" "$CODE/tools/thermal_radiometry/render_canonical_palette.py" \
+      --temperature-root "$TEMP_SOURCE" --output-root "$source/input" \
+      --range-manifest "$RANGE" --manifest "$METHOD_ROOT/t_only_source_canonical.json"
+    test "$(find "$source/input" -maxdepth 1 -type f -name '*.png' | wc -l)" -eq "$TOTAL"
+    "$PY" "$CODE/convert_uavfgs.py" -s "$source" \
+      --colmap_executable "$COLMAP" --exiftool_executable exiftool \
+      --required_colmap_version 4.1.0 --required_colmap_sha256 "$COLMAP_SHA" \
+      --database_policy reset --camera SIMPLE_RADIAL --matching exhaustive \
+      --colmap_gpu_index 0 --sfm_mapper incremental --mapper_multiple_models 1 \
+      --min_model_size "$TOTAL" --init_min_num_inliers 100 --abs_pose_min_num_inliers 30 \
+      --require_cuda_colmap --no_use_model_aligner \
+      2>&1 | tee "$LOG_ROOT/t_only_colmap.log"
+  else
+    echo "Reusing completed T-only SfM conversion: $source"
+    test "$(find "$source/input" -maxdepth 1 -type f -name '*.png' | wc -l)" -eq "$TOTAL"
+  fi
   require_file "$source/distorted/sparse/0/cameras.bin"
   require_file "$source/sparse/0/cameras.bin"
+  distorted_model="$("$PY" - "$CODE" "$source/distorted/sparse" "$source/sparse/0" <<'PY'
+import sys
+from pathlib import Path
+
+code, candidates_root, output_model = map(Path, sys.argv[1:])
+sys.path.insert(0, str(code))
+from scene.colmap_loader import read_extrinsics_binary
+
+expected = {
+    image.name
+    for image in read_extrinsics_binary(str(output_model / "images.bin")).values()
+}
+matches = []
+for candidate in sorted(candidates_root.iterdir(), key=lambda path: path.name):
+    images_bin = candidate / "images.bin"
+    if not images_bin.is_file():
+        continue
+    names = {
+        image.name
+        for image in read_extrinsics_binary(str(images_bin)).values()
+    }
+    if names == expected:
+        matches.append(candidate)
+if len(matches) != 1:
+    raise SystemExit(
+        f"Expected exactly one distorted COLMAP model matching the undistorted "
+        f"image set, found {len(matches)}: {[str(path) for path in matches]}"
+    )
+print(matches[0])
+PY
+)"
+  if [[ -e "$ud" && ! -f "$ud/manifest.json" ]]; then
+    rm -rf -- "$ud"
+  fi
+  mkdir -p "$dataset/images" "$dataset/sparse/0" "$LOG_ROOT"
   "$PY" "$CODE/tools/thermal_radiometry/undistort_temperature.py" \
-    --temperature-root "$TEMP_SOURCE" --input-model "$source/distorted/sparse/0" \
+    --temperature-root "$TEMP_SOURCE" --input-model "$distorted_model" \
     --output-model "$source/sparse/0" --input-model-format bin --output-model-format bin \
     --output-root "$ud"
   "$PY" "$CODE/tools/thermal_radiometry/render_canonical_palette.py" \
