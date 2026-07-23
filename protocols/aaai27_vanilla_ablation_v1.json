@@ -1,0 +1,64 @@
+{
+  "evaluation_protocol": "aaai27_hold8_v2_native",
+  "experiment_id": "aaai27_hold8_v2_native_vanilla_ablation",
+  "methods": {
+    "naive_two_pass_3dgs": {
+      "definition": "formal RGB 30k endpoint followed by a fresh fully-unfrozen vanilla 3DGS optimization pass on thermal images",
+      "initialization": "retain every RGB checkpoint Gaussian value and active SH degree",
+      "optimizer": "fresh full vanilla Adam",
+      "second_pass_local_updates": 30000,
+      "topology_updates": true
+    },
+    "rgb_sfm_t_3dgs": {
+      "definition": "vanilla thermal 3DGS initialized only by the formal RGB-derived cameras and sparse points",
+      "initialization": "formal RGB-SfM sparse point cloud",
+      "optimizer": "fresh full vanilla Adam",
+      "updates": 30000
+    },
+    "t_only_sfm_3dgs": {
+      "definition": "independent CUDA COLMAP SfM and vanilla 3DGS using only canonical thermal observations",
+      "input_boundary": "fixed-range Hot-Iron is rendered from pre-RGB-undistortion float32 temperature maps",
+      "sfm": "COLMAP exhaustive matching plus incremental mapper; all formal image IDs must register",
+      "optimizer": "fresh full vanilla Adam",
+      "updates": 30000
+    }
+  },
+  "optimizer_defaults": {
+    "densification_interval": 100,
+    "densify_from_iter": 500,
+    "densify_grad_threshold": 0.0002,
+    "densify_until_iter": 15000,
+    "feature_lr": 0.0025,
+    "lambda_dssim": 0.2,
+    "opacity_lr": 0.025,
+    "opacity_reset_interval": 3000,
+    "percent_dense": 0.01,
+    "position_lr_delay_mult": 0.01,
+    "position_lr_final": 1.6e-06,
+    "position_lr_init": 0.00016,
+    "position_lr_max_steps": 30000,
+    "rotation_lr": 0.001,
+    "scaling_lr": 0.005,
+    "sh_degree": 3
+  },
+  "prohibited_modules": [
+    "SCSP",
+    "strict geometry freeze",
+    "thermal SH cold restart",
+    "thermal auxiliary structure loss",
+    "temperature loss",
+    "thermal scale clamp",
+    "OGS"
+  ],
+  "representative_scenes": [
+    "Building",
+    "InternalRoad",
+    "PVpanel",
+    "TransmissionTower",
+    "Urban20K",
+    "Orchard"
+  ],
+  "resolution_argument": -1,
+  "schema": "uav-tgs-aaai27-vanilla-ablation-protocol-v1",
+  "split": "hold-8-v2"
+}

@@ -641,6 +641,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
     thermal_freeze_mode = str(getattr(args, "thermal_freeze_mode", "legacy"))
+    checkpoint_restart_mode = str(
+        getattr(args, "checkpoint_restart_mode", "none")
+    )
     rgb_continuation_recipe = str(
         getattr(args, "rgb_continuation_recipe", "legacy")
     )
@@ -674,6 +677,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         )
 
     first_iter = 0
+    checkpoint_source_iteration = None
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     # The fixed sequence manifest is keyed to Scene(shuffle=False) camera
@@ -776,6 +780,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # 2.6+ defaults to weights_only=True, which rejects that established
         # checkpoint format before thermal fine-tuning can start.
         (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
+        checkpoint_source_iteration = int(first_iter)
         optimizer_restore_mode = (
             str(getattr(args, "rgb_optimizer_state", "restore"))
             if rgb_continuation
@@ -824,6 +829,46 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     f"expected={expected_checkpoint_groups} actual={checkpoint_groups}"
                 )
         gaussians.restore(model_params, opt, optimizer_restore_mode=optimizer_restore_mode)
+        if checkpoint_restart_mode == "vanilla_full":
+            if optimizer_restore_mode != "fresh":
+                raise RuntimeError("Vanilla checkpoint restart requires a fresh optimizer")
+            for parameter in (
+                gaussians._xyz,
+                gaussians._features_dc,
+                gaussians._features_rest,
+                gaussians._opacity,
+                gaussians._scaling,
+                gaussians._rotation,
+                gaussians._exposure,
+            ):
+                parameter.requires_grad_(True)
+            # Recreate the full vanilla optimizer after loading the checkpoint.
+            # This deliberately preserves Gaussian values/SH degree while
+            # dropping RGB Adam moments and all previous densification state.
+            gaussians.training_setup(opt)
+            gaussians.max_radii2D = torch.zeros(
+                (gaussians.get_xyz.shape[0],),
+                dtype=gaussians.get_xyz.dtype,
+                device=gaussians.get_xyz.device,
+            )
+            first_iter = 0
+            optimizer_groups = tuple(
+                group.get("name") for group in gaussians.optimizer.param_groups
+            )
+            expected_groups = (
+                "xyz", "f_dc", "f_rest", "opacity", "scaling", "rotation"
+            )
+            if optimizer_groups != expected_groups or gaussians.optimizer.state:
+                raise RuntimeError(
+                    "Vanilla checkpoint restart optimizer mismatch: "
+                    f"groups={optimizer_groups} state_entries={len(gaussians.optimizer.state)}"
+                )
+            print(
+                "[INFO] VanillaCheckpointRestart: local_iteration=0 "
+                f"gaussians={gaussians.get_xyz.shape[0]} "
+                f"active_sh_degree={gaussians.active_sh_degree} "
+                f"optimizer_groups={list(optimizer_groups)}"
+            )
         if rgb_continuation and not rgb_appearance_refit:
             restored_steps = _validate_restored_rgb_optimizer(
                 gaussians, rgb_optimizer_summary
@@ -900,6 +945,63 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 )
             print("[INFO] FreshOptimizerRestore: state_entries=0 step_entries=0")
     start_iteration = int(first_iter)
+    if checkpoint_restart_mode == "vanilla_full":
+        restart_protocol = {
+            "schema": "uav-tgs-vanilla-checkpoint-restart-v1",
+            "mode": "vanilla_full",
+            "source_checkpoint": str(checkpoint),
+            "source_checkpoint_sha256": _file_sha256(checkpoint),
+            "source_checkpoint_iteration": int(checkpoint_source_iteration),
+            "local_start_iteration": int(start_iteration),
+            "local_final_iteration": int(opt.iterations),
+            "parameter_initialization": "retain_all_checkpoint_values",
+            "active_sh_degree": int(gaussians.active_sh_degree),
+            "optimizer_initialization": "fresh_full_vanilla_adam",
+            "trainable_fields": [
+                "xyz", "f_dc", "f_rest", "opacity", "scaling", "rotation"
+            ],
+            "densification_statistics": "reset",
+            "topology_fixed": False,
+            "densification": {
+                "from_iteration": int(opt.densify_from_iter),
+                "until_iteration": int(opt.densify_until_iter),
+                "interval": int(opt.densification_interval),
+                "gradient_threshold": float(opt.densify_grad_threshold),
+                "percent_dense": float(opt.percent_dense),
+            },
+            "opacity_reset_interval": int(opt.opacity_reset_interval),
+            "objective": {
+                "lambda_dssim": float(opt.lambda_dssim),
+                "thermal_structure_gradient_weight": float(
+                    getattr(args, "t_struct_grad_w", 0.0)
+                ),
+                "temperature_loss_mode": str(
+                    getattr(args, "temperature_loss_mode", "none")
+                ),
+            },
+            "learning_rates": {
+                "position_lr_init": float(opt.position_lr_init),
+                "position_lr_final": float(opt.position_lr_final),
+                "position_lr_delay_mult": float(opt.position_lr_delay_mult),
+                "position_lr_max_steps": int(opt.position_lr_max_steps),
+                "feature_lr": float(opt.feature_lr),
+                "opacity_lr": float(opt.opacity_lr),
+                "scaling_lr": float(opt.scaling_lr),
+                "rotation_lr": float(opt.rotation_lr),
+            },
+        }
+        protocol_path = os.path.join(
+            scene.model_path, "vanilla_checkpoint_restart_protocol.json"
+        )
+        temporary_path = protocol_path + f".tmp-{os.getpid()}"
+        with open(temporary_path, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(
+                restart_protocol, handle, indent=2, sort_keys=True, allow_nan=False
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, protocol_path)
     if getattr(args, "ss_prune_before_thermal", False) and checkpoint and not topology_frozen:
         if not getattr(args, "ss_enable", False):
             print("[WARN] ss_prune_before_thermal set but ss_enable=False; skipping prune.")
@@ -2359,6 +2461,17 @@ if __name__ == "__main__":
         help="Thermal checkpoint optimizer state (default: restore). fresh starts a new Adam state."
     )
     parser.add_argument(
+        "--checkpoint_restart_mode",
+        choices=["none", "vanilla_full"],
+        default="none",
+        help=(
+            "Restart a checkpoint as a new local optimization pass. vanilla_full "
+            "retains all Gaussian parameter values, resets Adam/densification "
+            "statistics and the iteration clock, and trains the full vanilla 3DGS "
+            "parameter set."
+        ),
+    )
+    parser.add_argument(
         "--thermal_recipe",
         choices=["legacy", "aaai_strict", "geometry_frozen_opacity_adaptive"],
         default="legacy",
@@ -2498,6 +2611,48 @@ if __name__ == "__main__":
         parser.error("--thermal_max_sh_degree requires --start_checkpoint")
     if args.thermal_optimizer_state == "fresh" and not args.start_checkpoint:
         parser.error("--thermal_optimizer_state fresh requires --start_checkpoint")
+    if args.checkpoint_restart_mode == "vanilla_full":
+        if not args.start_checkpoint:
+            parser.error("--checkpoint_restart_mode vanilla_full requires --start_checkpoint")
+        if args.thermal_optimizer_state != "fresh":
+            parser.error(
+                "--checkpoint_restart_mode vanilla_full requires "
+                "--thermal_optimizer_state fresh"
+            )
+        if args.thermal_recipe != "legacy" or args.thermal_freeze_mode != "legacy":
+            parser.error(
+                "--checkpoint_restart_mode vanilla_full requires the legacy/no-freeze "
+                "Stage-2 mode"
+            )
+        if args.rgb_continuation_recipe != "legacy":
+            parser.error(
+                "--checkpoint_restart_mode vanilla_full cannot be combined with an RGB continuation"
+            )
+        forbidden_restart_options = []
+        if args.thermal_reset_features:
+            forbidden_restart_options.append("--thermal_reset_features")
+        if args.thermal_max_sh_degree is not None:
+            forbidden_restart_options.append("--thermal_max_sh_degree")
+        if args.baseline_modules_off or args.baseline_restore_ssp or args.baseline_restore_stt:
+            forbidden_restart_options.append("baseline module flags")
+        if args.ss_enable or args.ss_prune_before_thermal:
+            forbidden_restart_options.append("Stage-2 sparse support")
+        if args.clamp_scale_max is not None or args.clamp_scale_after_densify:
+            forbidden_restart_options.append("scale clamp")
+        if args.t_struct_grad_w != 0.0 or args.temperature_loss_mode != "none":
+            forbidden_restart_options.append("thermal auxiliary loss")
+        if args.optimizer_type != "default":
+            forbidden_restart_options.append("non-default optimizer")
+        if forbidden_restart_options:
+            parser.error(
+                "--checkpoint_restart_mode vanilla_full rejects: "
+                + ", ".join(forbidden_restart_options)
+            )
+        args.ss_enable = False
+        args.ss_prune_before_thermal = False
+        args.ss_prune_after_rgb = False
+        args.thermal_scale_clamp = "off"
+        args.sgf_disable = True
     if args.temperature_loss_mode == "none":
         extra_temperature_options = [
             token.split("=", 1)[0]
