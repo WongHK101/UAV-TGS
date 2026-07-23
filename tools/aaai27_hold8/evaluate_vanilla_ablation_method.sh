@@ -39,7 +39,7 @@ EXP="$ROOT/experiments/$ABLATION_EXPERIMENT/$SCENE"
 METHOD_ROOT="$EXP/$METHOD"; MODEL="$METHOD_ROOT/model"; ITERATION=30000
 EVAL_ROOT="$EXP/evaluation/$METHOD"
 LOG_ROOT="$ROOT/logs/experiments/$ABLATION_EXPERIMENT/$SCENE/evaluation/$METHOD"
-BINDING="$FORMAL_EXP/protocol/formal_radiometry_evaluation_binding.json"
+BINDING="$ROOT/experiments/aaai27_hold8_v2/$SCENE/protocol/formal_radiometry_evaluation_binding.json"
 
 sha() { sha256sum "$1" | awk '{print $1}'; }
 test -x "$PY"; test -z "$(git -C "$CODE" status --porcelain=v1 --untracked-files=all)"
