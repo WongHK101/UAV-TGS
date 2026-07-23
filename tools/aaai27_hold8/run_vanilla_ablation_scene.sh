@@ -270,7 +270,11 @@ run_training() {
     echo "$SCENE/$METHOD/$STAGE already passed"
     return
   fi
-  test ! -e "$METHOD_ROOT"
+  if [[ -e "$METHOD_ROOT" ]]; then
+    test "$METHOD" = t_only_sfm_3dgs
+    test -f "$METHOD_ROOT/t_only_source/distorted/conversion_completion_manifest.json"
+    test ! -e "$MODEL"
+  fi
   mkdir -p "$METHOD_ROOT" "$LOG_ROOT"
   local source train_list test_list train_sha test_sha
   if [[ "$METHOD" == t_only_sfm_3dgs ]]; then
