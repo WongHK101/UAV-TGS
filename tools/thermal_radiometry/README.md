@@ -277,3 +277,38 @@ Use the same generated float (or boolean) tree for L, C3, and F3.  Because the
 threshold has already been applied by the combiner, formal evaluator calls use
 `--mask-root DERIVED/formal_support/Building/float --alpha-threshold 0` with
 `--require-support`; do not rebuild support from each thermal model.
+
+## Palette-neutral display export
+
+Formal models and metrics remain in the fixed canonical representation.  To
+change only the visualization palette, project a canonical render onto the
+repository's 256-entry canonical LUT, retain the resulting scalar index and
+apparent-temperature sidecars, and map that index through an exact DJI TSDK
+palette LUT:
+
+```powershell
+python tools/thermal_radiometry/tsdk_palette_display.py `
+  --input-root OUTPUT/test/ours_60000/renders `
+  --output-root OUTPUT/palette_display `
+  --range-manifest DERIVED/radiometry/range_manifest.json `
+  --tsdk-root D:/path/to/dji_thermal_sdk `
+  --reference-rjpeg DATASET/raw/frame.JPG `
+  --palette hot_iron `
+  --palette rainbow2 `
+  --save-off-lut-map
+```
+
+The output is always outside the source-render tree and contains:
+
+- `temperature_index/*.npy`, the nearest canonical LUT indices;
+- `apparent_temperature_c/*.npy`, fixed-scene-range apparent temperatures;
+- `palettes/<name>/*.png`, lossless displays using exact TSDK LUT entries;
+- an optional off-LUT distance map and a provenance manifest.
+
+The scene `Tmin/Tmax` are fixed and shared by all methods.  A TSDK palette
+change therefore does not alter the model, temperature range, or formal
+metrics.  The palette output is exactly reversible to the projected scalar
+index because every accepted TSDK LUT must contain 256 unique RGB entries.
+Projection of an off-LUT model render onto the canonical LUT is deterministic
+but is not described as lossless; the manifest records its mean, P95, maximum,
+and exact-pixel fraction.
